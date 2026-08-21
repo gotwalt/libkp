@@ -1,0 +1,206 @@
+{
+  "description": "Kemper SysEx/NRPN builders and parsers.",
+  "request_string": [
+    {
+      "product": 0,
+      "device": 127,
+      "page": 0,
+      "number": 1,
+      "hex": "f0002033007f43000001f7"
+    },
+    {
+      "product": 2,
+      "device": 127,
+      "page": 10,
+      "number": 0,
+      "hex": "f0002033027f43000a00f7"
+    }
+  ],
+  "request_single": [
+    {
+      "product": 0,
+      "device": 127,
+      "page": 10,
+      "number": 4,
+      "hex": "f0002033007f41000a04f7"
+    }
+  ],
+  "request_multi": [
+    {
+      "product": 2,
+      "device": 127,
+      "page": 52,
+      "number": 0,
+      "hex": "f0002033027f42003400f7"
+    }
+  ],
+  "set_single": [
+    {
+      "product": 0,
+      "device": 127,
+      "page": 61,
+      "number": 3,
+      "value": 1,
+      "hex": "f0002033007f01003d030001f7"
+    },
+    {
+      "product": 0,
+      "device": 127,
+      "page": 61,
+      "number": 3,
+      "value": 0,
+      "hex": "f0002033007f01003d030000f7"
+    },
+    {
+      "product": 0,
+      "device": 127,
+      "page": 10,
+      "number": 4,
+      "value": 8192,
+      "hex": "f0002033007f01000a044000f7"
+    }
+  ],
+  "request_rendered_string": [
+    {
+      "product": 2,
+      "device": 127,
+      "page": 60,
+      "number": 53,
+      "value": 8192,
+      "hex": "f0002033027f7c003c354000f7"
+    }
+  ],
+  "beacon": [
+    {
+      "init": true,
+      "tuner": true,
+      "lease_secs": 30,
+      "param_set": 2,
+      "product": 2,
+      "hex": "f0002033027f7e004002230ff7"
+    },
+    {
+      "init": false,
+      "tuner": false,
+      "lease_secs": 20,
+      "param_set": 2,
+      "product": 0,
+      "hex": "f0002033007f7e004002020af7"
+    }
+  ],
+  "control_change": [
+    {
+      "channel": 0,
+      "controller": 50,
+      "value": 1,
+      "hex": "b03201"
+    },
+    {
+      "channel": 15,
+      "controller": 47,
+      "value": 0,
+      "hex": "bf2f00"
+    }
+  ],
+  "header_parse": [
+    {
+      "hex": "f0002033000002007c4e0000f7",
+      "product": 0,
+      "device": 0,
+      "function": 2,
+      "instance": 0,
+      "page": 124,
+      "number": 78,
+      "values": "0000"
+    },
+    {
+      "hex": "f0002033007f43000001f7",
+      "product": 0,
+      "device": 127,
+      "function": 67,
+      "instance": 0,
+      "page": 0,
+      "number": 1,
+      "values": ""
+    }
+  ],
+  "multi_values": [
+    {
+      "number": 4,
+      "values": "400000007f7f",
+      "pairs": [
+        [
+          4,
+          8192
+        ],
+        [
+          5,
+          0
+        ],
+        [
+          6,
+          16383
+        ]
+      ]
+    },
+    {
+      "number": 0,
+      "values": "010207",
+      "pairs": [
+        [
+          0,
+          130
+        ]
+      ]
+    }
+  ],
+  "ext_decode": [
+    {
+      "bytes": "0000000001",
+      "value": 1
+    },
+    {
+      "bytes": "0000000a00",
+      "value": 1280
+    },
+    {
+      "bytes": "121a154f09",
+      "value": 4886718345
+    }
+  ],
+  "parse_extended_string": [
+    {
+      "hex": "f00020330200070000000000014143333000f7",
+      "expected": {
+        "address": 1,
+        "text": "AC30"
+      }
+    },
+    {
+      "hex": "f0002033020007000000000a004a434d38303000f7",
+      "expected": {
+        "address": 1280,
+        "text": "JCM800"
+      }
+    },
+    {
+      "hex": "f0002033007f010000010001f7",
+      "expected": null
+    }
+  ],
+  "parse_rendered_string": [
+    {
+      "hex": "f0002033027f3c003c3540003c302e303e00f7",
+      "expected": {
+        "page": 60,
+        "number": 53,
+        "value": 8192,
+        "text": "<0.0>"
+      }
+    },
+    {
+      "hex": "f0002033007f01003c354000f7",
+      "expected": null
+    }
+  ]
+}

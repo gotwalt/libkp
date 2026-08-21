@@ -1,0 +1,45 @@
+{
+  "description": "MIDI3 stream framing: unframe a stream into MIDI messages, and frame a message.",
+  "unframe": [
+    {
+      "stream": "14f00020143302001406000014000620140500001400001015f70000",
+      "messages": [
+        "f00020330200060000000620050000000010f7"
+      ],
+      "pending": 0
+    },
+    {
+      "stream": "14f0002014330200170102f7",
+      "messages": [
+        "f000203302000102f7"
+      ],
+      "pending": 0
+    },
+    {
+      "stream": "14f0002017f7000014aa",
+      "messages": [
+        "f00020f70000"
+      ],
+      "pending": 2
+    }
+  ],
+  "frame": [
+    {
+      "message": "f0002033027f7e004002230ff7",
+      "framed": "14f000201433027f147e00401402230f15f70000"
+    },
+    {
+      "message": "f0002033f7",
+      "framed": "14f000201633f700"
+    },
+    {
+      "message": "f000203301f7",
+      "framed": "14f00020173301f7"
+    },
+    {
+      "message": "f0002033007f01003d030001f7",
+      "framed": "14f000201433007f1401003d1403000115f70000"
+    }
+  ],
+  "note": "frame(msg) then unframe() must round-trip to [msg] with pending 0."
+}

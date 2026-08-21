@@ -1,0 +1,35 @@
+{
+  "description": "14-bit value split into (MSB, LSB) 7-bit bytes, and rejoined.",
+  "cases": [
+    {
+      "value": 0,
+      "msb": 0,
+      "lsb": 0
+    },
+    {
+      "value": 1,
+      "msb": 0,
+      "lsb": 1
+    },
+    {
+      "value": 130,
+      "msb": 1,
+      "lsb": 2
+    },
+    {
+      "value": 6925,
+      "msb": 54,
+      "lsb": 13
+    },
+    {
+      "value": 8192,
+      "msb": 64,
+      "lsb": 0
+    },
+    {
+      "value": 16383,
+      "msb": 127,
+      "lsb": 127
+    }
+  ]
+}

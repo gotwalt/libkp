@@ -1,0 +1,85 @@
+{
+  "description": "Apply a sequence of decoded MIDI messages to a fresh DeviceState; assert fields.",
+  "cases": [
+    {
+      "name": "rig name",
+      "messages": [
+        "f000203300000300000141433330f7"
+      ],
+      "expect": {
+        "rig_name": "AC30"
+      }
+    },
+    {
+      "name": "effect REV type+on",
+      "messages": [
+        "f0002033000001003d000133f7",
+        "f0002033000001003d030001f7"
+      ],
+      "expect": {
+        "effect": {
+          "slot": "REV",
+          "kind": 179,
+          "on": true,
+          "type_name": "Easy Reverb"
+        }
+      }
+    },
+    {
+      "name": "meter block",
+      "messages": [
+        "f0002033000002007c4e00640148022c3e405d60270846281f2000002e700000f7"
+      ],
+      "expect": {
+        "status_raw": [
+          100,
+          200,
+          300,
+          8000,
+          12000,
+          5000,
+          9000,
+          4000,
+          0,
+          6000,
+          0
+        ]
+      }
+    },
+    {
+      "name": "tempo + rig volume",
+      "messages": [
+        "f00020330000010004003c00f7",
+        "f00020330000010004014628f7"
+      ],
+      "expect": {
+        "tempo_bpm": 120,
+        "rig_volume": 9000
+      }
+    },
+    {
+      "name": "amp on + gain",
+      "messages": [
+        "f0002033000001000a020001f7",
+        "f0002033000001000a04360df7"
+      ],
+      "expect": {
+        "amp_on": true,
+        "amp_gain": 6925
+      }
+    },
+    {
+      "name": "morph + tuner note + main vol",
+      "messages": [
+        "f000203300000100000b2000f7",
+        "f0002033000001007d540009f7",
+        "f0002033000001007f005d60f7"
+      ],
+      "expect": {
+        "morph": 4096,
+        "tuner_note": 9,
+        "main_volume": 12000
+      }
+    }
+  ]
+}

@@ -1,0 +1,243 @@
+{
+  "description": "Control op -> raw MIDI bytes. Each impl maps op names to its Control API; values are masked to 7 bits, load_slot clamps to 1..=5, effect_button to 1..=4.",
+  "cases": [
+    {
+      "op": "gain",
+      "params": {
+        "value": 64
+      },
+      "channel": 0,
+      "hex": "b04840"
+    },
+    {
+      "op": "gain",
+      "params": {
+        "value": 64
+      },
+      "channel": 15,
+      "hex": "bf4840"
+    },
+    {
+      "op": "wah_pedal",
+      "params": {
+        "value": 200
+      },
+      "channel": 0,
+      "hex": "b00148"
+    },
+    {
+      "op": "delay_mix",
+      "params": {
+        "value": 10
+      },
+      "channel": 0,
+      "hex": "b0440a"
+    },
+    {
+      "op": "monitor_volume",
+      "params": {
+        "value": 100
+      },
+      "channel": 0,
+      "hex": "b04964"
+    },
+    {
+      "op": "tap_tempo",
+      "params": {},
+      "channel": 0,
+      "hex": "b01e01"
+    },
+    {
+      "op": "tuner_mode",
+      "params": {
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b01f01"
+    },
+    {
+      "op": "tuner_mode",
+      "params": {
+        "on": false
+      },
+      "channel": 0,
+      "hex": "b01f00"
+    },
+    {
+      "op": "toggle_all_modules",
+      "params": {},
+      "channel": 0,
+      "hex": "b01001"
+    },
+    {
+      "op": "up",
+      "params": {},
+      "channel": 0,
+      "hex": "b03001"
+    },
+    {
+      "op": "down",
+      "params": {},
+      "channel": 0,
+      "hex": "b03101"
+    },
+    {
+      "op": "bank_preselect",
+      "params": {
+        "value": 3
+      },
+      "channel": 0,
+      "hex": "b02f03"
+    },
+    {
+      "op": "rotary_fast",
+      "params": {
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b02101"
+    },
+    {
+      "op": "delay_infinity",
+      "params": {
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b02201"
+    },
+    {
+      "op": "freeze",
+      "params": {
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b02301"
+    },
+    {
+      "op": "morph_button",
+      "params": {
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b05001"
+    },
+    {
+      "op": "morph_button",
+      "params": {
+        "on": false
+      },
+      "channel": 0,
+      "hex": "b05000"
+    },
+    {
+      "op": "load_slot",
+      "params": {
+        "n": 3
+      },
+      "channel": 0,
+      "hex": "b03401"
+    },
+    {
+      "op": "load_slot",
+      "params": {
+        "n": 0
+      },
+      "channel": 0,
+      "hex": "b03201"
+    },
+    {
+      "op": "load_slot",
+      "params": {
+        "n": 99
+      },
+      "channel": 0,
+      "hex": "b03601"
+    },
+    {
+      "op": "effect_button",
+      "params": {
+        "n": 4
+      },
+      "channel": 0,
+      "hex": "b04e01"
+    },
+    {
+      "op": "effect_button",
+      "params": {
+        "n": 0
+      },
+      "channel": 0,
+      "hex": "b04b01"
+    },
+    {
+      "op": "slot_enable",
+      "params": {
+        "slot": "REV",
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b01d01"
+    },
+    {
+      "op": "slot_enable",
+      "params": {
+        "slot": "DLY",
+        "on": false
+      },
+      "channel": 0,
+      "hex": "b01b00"
+    },
+    {
+      "op": "slot_enable",
+      "params": {
+        "slot": "A",
+        "on": true
+      },
+      "channel": 0,
+      "hex": "b01101"
+    },
+    {
+      "op": "slot_enable",
+      "params": {
+        "slot": "MOD",
+        "on": false
+      },
+      "channel": 0,
+      "hex": "b01800"
+    },
+    {
+      "op": "program_change",
+      "params": {
+        "program": 5
+      },
+      "channel": 0,
+      "hex": "c005"
+    },
+    {
+      "op": "program_change",
+      "params": {
+        "program": 200
+      },
+      "channel": 0,
+      "hex": "c048"
+    },
+    {
+      "op": "bank_select",
+      "params": {
+        "msb": 0,
+        "lsb": 3
+      },
+      "channel": 0,
+      "hex": "b00000b02003"
+    },
+    {
+      "op": "bank_select",
+      "params": {
+        "msb": 130,
+        "lsb": 129
+      },
+      "channel": 0,
+      "hex": "b00002b02001"
+    }
+  ]
+}
