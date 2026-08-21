@@ -1,0 +1,41 @@
+# The realtime status / meter block: eleven 14-bit values the streaming protocol
+# auto-pushes at ~20 Hz as a Multi Parameter Change (function $02, page 0x7C,
+# starting number 0x4E = 78) — NRPN addresses 0x7C/78 .. 0x7C/88.
+#
+# Provenance: the block layout follows the documented Multi Parameter Change
+# format; the field identities below were established by observed experimentation
+# (knob-sweep correlation against the self-labeling parameter stream). See
+# docs/07-realtime-status.md.
+
+[block]
+page = 0x7C
+first_number = 0x4E   # 78
+count = 11
+# full scale (16383) is the shared 14-bit maximum in protocol.toml [sysex].
+update_rate_hz = 20
+
+# The eleven fields v0..v10 in NRPN order. `render` hints how a UI presents each:
+#   strobe  = tuner strobe component (v0..v3)
+#   bar     = level meter bar
+#   extra   = redundant/derived or unused; hidden unless a raw view is requested
+fields = [
+  { index = 0,  number = 78, id = "strobe_seg_low",  name = "Tuner Strobe Segment (phase-low)",  render = "strobe" },
+  { index = 1,  number = 79, id = "strobe_seg_mid",  name = "Tuner Strobe Segment (phase-mid)",  render = "strobe" },
+  { index = 2,  number = 80, id = "strobe_seg_high", name = "Tuner Strobe Segment (phase-high)", render = "strobe" },
+  { index = 3,  number = 81, id = "strobe_phase",    name = "Tuner Strobe Phase",                render = "strobe" },
+  { index = 4,  number = 82, id = "stack_level",     name = "Stack Level (pre-rig-volume)",      render = "bar" },
+  { index = 5,  number = 83, id = "stack_power",     name = "Stack Power",                       render = "extra" },
+  { index = 6,  number = 84, id = "rig_out_level",   name = "Rig Output Level (post-rig-volume)", render = "bar" },
+  { index = 7,  number = 85, id = "rig_out_power",   name = "Rig Output Power",                  render = "extra" },
+  { index = 8,  number = 86, id = "unused_v8",       name = "(unused)",                          render = "extra" },
+  { index = 9,  number = 87, id = "loudness",        name = "Loudness (slow RMS)",               render = "bar" },
+  { index = 10, number = 88, id = "unused_v10",      name = "(unused)",                          render = "extra" },
+]
+
+[strobe]
+# v3 is a wrapping phase on a 0..16383 circle rotating at a rate proportional to
+# pitch deviance (stationary = in tune). v0/v1/v2 are its display-segment
+# drivers, fired by phase position. The whole group reads 0 when no pitch is
+# tracked. Absolute deviance is the separate parameter 0x7C/15 (8192 = in tune).
+phase_index = 3
+segment_indices = [0, 1, 2]
