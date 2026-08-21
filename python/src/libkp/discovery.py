@@ -201,10 +201,8 @@ async def discover(options: DiscoveryOptions | None = None) -> list[Reply]:
             window = min(deadline, next_poll) - now
             if window > 0:
                 try:
-                    payload, addr = await asyncio.wait_for(
-                        loop.sock_recvfrom(sock, 2048), window
-                    )
-                except asyncio.TimeoutError:
+                    payload, addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 2048), window)
+                except TimeoutError:
                     payload, addr = b"", None
                 except OSError as exc:
                     raise DiscoverError(f"failed while receiving replies: {exc}") from exc

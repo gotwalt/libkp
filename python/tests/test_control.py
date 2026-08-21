@@ -23,9 +23,7 @@ def test_tuner_mode_open_is_cc31_value_1():
     assert c.TunerMode(False).message(0) == bytes([0xB0, 31, 0])
 
 
-@pytest.mark.parametrize(
-    "n,controller", [(3, 52), (1, 50), (5, 54), (0, 50), (99, 54)]
-)
+@pytest.mark.parametrize("n,controller", [(3, 52), (1, 50), (5, 54), (0, 50), (99, 54)])
 def test_load_slot_maps_to_cc50_plus_and_clamps(n, controller):
     assert c.LoadSlot(n).message(0) == bytes([0xB0, controller, 1])
 

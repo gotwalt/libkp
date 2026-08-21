@@ -66,9 +66,7 @@ def test_program_change_bytes():
 
 
 def test_builds_request_multi():
-    assert nrpn.request_multi(0x02, 0x7F, 0x34, 0x00) == bytes.fromhex(
-        "f0002033027f42003400f7"
-    )
+    assert nrpn.request_multi(0x02, 0x7F, 0x34, 0x00) == bytes.fromhex("f0002033027f42003400f7")
 
 
 def test_builds_request_rendered_string():

@@ -95,7 +95,7 @@ class TagStream:
     fields: list[bytes] = field(default_factory=list)
 
     @classmethod
-    def parse(cls, buf: bytes) -> "TagStream":
+    def parse(cls, buf: bytes) -> TagStream:
         """Best-effort parse of a received payload.
 
         If the first four bytes are printable ASCII and the fifth is a plausible
@@ -115,9 +115,7 @@ class TagStream:
             start = off + 1
             end = start + (length - 1)
             if end > len(buf):
-                raise FieldOverrunError(
-                    offset=off, length=length, remaining=len(buf) - off - 1
-                )
+                raise FieldOverrunError(offset=off, length=length, remaining=len(buf) - off - 1)
             fields.append(buf[start:end])
             off = end
 

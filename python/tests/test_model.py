@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from fake_device import FakeDevice, wait_for
 
 from libkp import _generated as gen
@@ -23,9 +22,7 @@ def meter_message(values: list[int]) -> bytes:
     payload = bytearray()
     for v in values:
         payload.extend(u14_split(v))
-    return sysex(
-        0x00, 0x00, 0x02, gen.PAGE_REALTIME, gen.METER_BLOCK_NUMBER, bytes(payload)
-    )
+    return sysex(0x00, 0x00, 0x02, gen.PAGE_REALTIME, gen.METER_BLOCK_NUMBER, bytes(payload))
 
 
 def run(coro):
@@ -237,9 +234,7 @@ def test_set_tempo_clamps_to_the_fourteen_bit_maximum():
                 await model.close()
             return device.received[0]
 
-    assert run(scenario()) == set_single(
-        0x00, 0x7F, gen.PAGE_RIG_SETTINGS, 0, gen.FULL_SCALE
-    )
+    assert run(scenario()) == set_single(0x00, 0x7F, gen.PAGE_RIG_SETTINGS, 0, gen.FULL_SCALE)
 
 
 def test_actions_emit_control_changes():
@@ -320,9 +315,7 @@ def test_device_hangup_marks_the_model_disconnected():
 def test_close_is_idempotent_and_usable_as_a_context_manager():
     async def scenario():
         async with FakeDevice() as device:
-            async with await DeviceModel.connect(
-                "127.0.0.1", device.port, sync=False
-            ) as model:
+            async with await DeviceModel.connect("127.0.0.1", device.port, sync=False) as model:
                 assert model.connected
             await model.close()
             return model.connected

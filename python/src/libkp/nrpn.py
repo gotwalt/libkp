@@ -198,9 +198,7 @@ def set_single(product: int, device: int, page: int, number: int, value: int) ->
     return sysex(product, device, FUNCTION_SINGLE_PARAM, page, number, bytes([msb, lsb]))
 
 
-def request_rendered_string(
-    product: int, device: int, page: int, number: int, value: int
-) -> bytes:
+def request_rendered_string(product: int, device: int, page: int, number: int, value: int) -> bytes:
     """Request a parameter value rendered to a string (function ``$7C``).
 
     The device replies with a ``$3C`` message carrying the rendered ASCII (e.g.
@@ -209,9 +207,7 @@ def request_rendered_string(
     occupies the instance slot of the standard header.
     """
     msb, lsb = u14_split(value)
-    return sysex(
-        product, device, FUNCTION_REQUEST_RENDERED_STRING, page, number, bytes([msb, lsb])
-    )
+    return sysex(product, device, FUNCTION_REQUEST_RENDERED_STRING, page, number, bytes([msb, lsb]))
 
 
 def control_change(channel: int, controller: int, value: int) -> bytes:
@@ -236,7 +232,7 @@ class NrpnHeader:
     number: int
 
     @classmethod
-    def parse(cls, msg: bytes) -> tuple["NrpnHeader", bytes] | None:
+    def parse(cls, msg: bytes) -> tuple[NrpnHeader, bytes] | None:
         """Parse the fixed header of a Kemper SysEx.
 
         Returns ``(header, value_bytes)``, where the value bytes are everything

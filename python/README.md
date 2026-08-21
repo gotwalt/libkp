@@ -6,6 +6,8 @@ the CC control vocabulary, and an observable async device model.
 
 - **Python 3.11+**, `asyncio`.
 - **Standard library only** at runtime — no third-party dependencies.
+- Two example front-ends: a zero-dependency ANSI `meters`, and an optional
+  **Textual** TUI `meters_tui` (installed via the `tui` extra).
 - `pytest` for the test suite, including the shared cross-language conformance
   vectors and replay-capture fixtures in [`../spec`](../spec).
 
@@ -55,21 +57,67 @@ Flags: `--ip` (optional; discovery runs when it is omitted), `--port`, `--all`
 (show all eleven raw meter fields), `--width`, `--fps`, `--discover-timeout`.
 Ctrl-C restores the cursor and exits.
 
+## The Textual TUI example
+
+`meters_tui` is a richer, widget-based terminal UI (rounded panels, colored
+gauges, an effect-block grid, a live tuner strobe) built on
+[Textual](https://textual.textualize.io/). It needs the optional `tui` extra
+(Textual); the library itself stays dependency-free. Run it with `uv` (below),
+or `pip install -e '.[tui]'` then `libkp-meters-tui`. Same core flags as the
+ANSI example; press `q` to quit and `a` to toggle the raw fields.
+
+## Running the examples with uv
+
+[uv](https://docs.astral.sh/uv/) runs either example without a manual
+virtualenv — it resolves the package (and any extras) on the fly. From `python/`:
+
+```sh
+# Zero-dependency ANSI meters
+uv run libkp-meters --help
+uv run libkp-meters --ip 10.0.0.1 --all
+
+# Textual TUI — the `--extra tui` pulls in Textual just for this run
+uv run --extra tui libkp-meters-tui
+uv run --extra tui libkp-meters-tui --ip 10.0.0.1
+```
+
+The console scripts above come from `pyproject.toml`; the equivalent module form
+works too:
+
+```sh
+uv run python -m libkp.examples.meters
+uv run --extra tui python -m libkp.examples.meters_tui
+```
+
+Pin the interpreter (anything 3.11+) when you want a specific one, and
+materialize the environment once for repeated runs or editor tooling:
+
+```sh
+uv run --python 3.14 --extra tui libkp-meters-tui   # choose the interpreter
+uv sync --extra tui                                 # create .venv with Textual
+uv run libkp-meters-tui                             #   then reuse it
+```
+
+Only the Textual example needs the `tui` extra; `uv run libkp-meters` needs
+nothing beyond the standard library.
+
 ## Quick start
 
 ```python
 import asyncio
 from libkp import DeviceModel, find_first
 
+
 async def main():
-    reply = await find_first()                     # UDP broadcast discovery
+    reply = await find_first()  # UDP broadcast discovery
     async with await DeviceModel.connect(reply.ip) as model:
-        snapshots = model.subscribe()              # coalesced state snapshots
+        snapshots = model.subscribe()  # coalesced state snapshots
         state = await snapshots.get()
         print(state.rig.name, state.amp.name, state.status.loudness)
 
-        await model.set_effect_enabled("REV", False)   # a tracked parameter
-        await model.tap_tempo()                        # a momentary action
+        await model.set_effect_enabled("REV", False)  # a tracked parameter
+        await model.tap_tempo()  # a momentary action
+
 
 asyncio.run(main())
 ```

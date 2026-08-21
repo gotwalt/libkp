@@ -7,13 +7,11 @@ outputs every implementation of the protocol is held to.
 from __future__ import annotations
 
 import pytest
-
 from conftest import VECTORS_DIR, vector
 
 from libkp import _generated as gen
 from libkp import control, midi3, nrpn, params, protocol
 from libkp.state import DeviceState
-
 
 # ---------------------------------------------------------------------------
 # The vector set itself

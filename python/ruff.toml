@@ -1,0 +1,11 @@
+# Ruff configuration for the libkp Python package.
+# The generated data module is excluded — it is emitted by codegen and must match
+# the generator byte-for-byte, so neither the linter nor the formatter may touch it.
+line-length = 100
+extend-exclude = ["src/libkp/_generated.py"]
+
+[lint]
+select = ["E", "F", "I", "W", "UP"]
+# `str, Enum` is intentional (stable __str__ semantics the code relies on); keep
+# it rather than switching to StrEnum.
+ignore = ["UP042"]

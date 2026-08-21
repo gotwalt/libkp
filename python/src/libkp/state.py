@@ -85,7 +85,7 @@ class RealtimeStatus:
     raw: tuple[int, ...] = (0,) * gen.METER_COUNT
 
     @classmethod
-    def from_values(cls, vals: bytes) -> "RealtimeStatus":
+    def from_values(cls, vals: bytes) -> RealtimeStatus:
         """Decode an 11x14-bit value block (MSB/LSB pairs) into a status frame.
 
         Missing trailing values default to 0; extra bytes are ignored.
@@ -363,17 +363,17 @@ class ApplyOutcome:
     slow_changed: bool = False
 
     @classmethod
-    def empty(cls) -> "ApplyOutcome":
+    def empty(cls) -> ApplyOutcome:
         """An empty outcome: nothing happened, no slow change."""
         return cls()
 
     @classmethod
-    def fast(cls, event: DeviceEvent) -> "ApplyOutcome":
+    def fast(cls, event: DeviceEvent) -> ApplyOutcome:
         """One event that changed no slow field (FAST lane or untracked generic)."""
         return cls(events=[event], slow_changed=False)
 
     @classmethod
-    def slow(cls, events: list[DeviceEvent]) -> "ApplyOutcome":
+    def slow(cls, events: list[DeviceEvent]) -> ApplyOutcome:
         """Events that changed a slow (snapshot-visible) field."""
         return cls(events=events, slow_changed=True)
 
@@ -435,7 +435,7 @@ class DeviceState:
                 return e
         return None
 
-    def snapshot(self) -> "DeviceState":
+    def snapshot(self) -> DeviceState:
         """An independent copy of this state, safe to hand to another consumer."""
         return copy.deepcopy(self)
 
@@ -592,9 +592,7 @@ class DeviceState:
         if parsed is None:
             return ApplyOutcome.empty()
         page, number, value, text = parsed
-        return ApplyOutcome.fast(
-            RenderedString(page=page, number=number, value=value, text=text)
-        )
+        return ApplyOutcome.fast(RenderedString(page=page, number=number, value=value, text=text))
 
     def _apply_multi(self, page: int, number: int, vals: bytes) -> ApplyOutcome:
         """Route a ``$02`` multi-param message: the meter block, or a rig-load dump."""

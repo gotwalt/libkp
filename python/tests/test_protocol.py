@@ -10,12 +10,7 @@ from libkp.protocol import PORT, TagStream, build_poll_request, push_field
 
 def test_poll_request_is_exactly_34_bytes():
     built = build_poll_request("00:00:00:00:00:00")
-    assert built == (
-        b"DSCV"
-        b"\x16MAC#00:00:00:00:00:00"
-        b"\x07POLL:)"
-        b"\x00"
-    )
+    assert built == (b"DSCV\x16MAC#00:00:00:00:00:00\x07POLL:)\x00")
     assert len(built) == 34
 
 

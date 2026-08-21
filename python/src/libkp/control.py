@@ -211,7 +211,7 @@ class ModuleSlot(str, Enum):
     REV = "REV"
 
     @classmethod
-    def parse(cls, name: "str | ModuleSlot") -> "ModuleSlot":
+    def parse(cls, name: str | ModuleSlot) -> ModuleSlot:
         """Resolve a slot name case-insensitively (``"rev"``, ``"Dly"``, …)."""
         if isinstance(name, cls):
             return name

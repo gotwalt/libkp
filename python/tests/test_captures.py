@@ -10,7 +10,6 @@ the way through :class:`libkp.state.DeviceState`.
 from __future__ import annotations
 
 import pytest
-
 from conftest import CAPTURES_DIR, load_json
 
 from libkp import _generated as gen
@@ -47,9 +46,7 @@ def test_manifest_lists_existing_fixtures():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "entry", _fixtures_of("discovery"), ids=_ids(_fixtures_of("discovery"))
-)
+@pytest.mark.parametrize("entry", _fixtures_of("discovery"), ids=_ids(_fixtures_of("discovery")))
 def test_discovery_reply_decodes(entry):
     fixture = _load(entry)
     stream = TagStream.parse(bytes.fromhex(fixture["raw"]))

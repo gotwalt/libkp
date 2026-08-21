@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
 from fake_device import FakeDevice
 
 from libkp.errors import ConnectError, ProtocolRejectedError, TimeoutErrorLibKP

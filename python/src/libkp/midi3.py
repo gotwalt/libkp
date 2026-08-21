@@ -119,9 +119,4 @@ def frame(msg: bytes) -> bytes:
 
 def is_kemper_sysex(msg: bytes) -> bool:
     """True if ``msg`` is a Kemper SysEx (``F0 00 20 33 … F7``)."""
-    return (
-        len(msg) >= 5
-        and msg[0] == 0xF0
-        and msg[1:4] == _MANUFACTURER
-        and msg[-1] == 0xF7
-    )
+    return len(msg) >= 5 and msg[0] == 0xF0 and msg[1:4] == _MANUFACTURER and msg[-1] == 0xF7
