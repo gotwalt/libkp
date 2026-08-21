@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from libkp import control as c
+from libkp.errors import UnknownSlotError
 
 
 def test_continuous_controller_bytes():
@@ -108,3 +109,15 @@ def test_default_channel_is_zero():
 
 def test_distinct_control_types_do_not_compare_equal():
     assert c.Gain(64) != c.DelayMix(64)
+
+
+def test_unknown_slot_raises_a_libkp_error():
+    """Every slot-name entry point rejects a bad name the same way."""
+    for call in (
+        lambda: c.slot_enable_cc("nope"),
+        lambda: c.ModuleSlot.parse("nope"),
+        lambda: c.SlotEnable("nope", True).message(0),
+        lambda: c.control_from_op("slot_enable", slot="nope", on=True).message(0),
+    ):
+        with pytest.raises(UnknownSlotError):
+            call()

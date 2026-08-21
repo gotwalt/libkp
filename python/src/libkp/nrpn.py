@@ -112,10 +112,22 @@ def sysex(
 
     ``F0 00 20 33 <product> <device> <function> <instance=0> <page> <number>
     <values…> F7``
+
+    Every header byte is a 7-bit SysEx data byte. An out-of-range one raises
+    :class:`ValueError` rather than being masked: masking would silently
+    retarget the message at a different address (``page=0x80`` would become
+    page 0, the string/morph page) instead of surfacing the mistake.
     """
+    header = (product, device, function, page, number)
+    if any(not 0 <= byte <= 0x7F for byte in header):
+        names = ("product", "device", "function", "page", "number")
+        bad = ", ".join(
+            f"{n}={v}" for n, v in zip(names, header, strict=True) if not 0 <= v <= 0x7F
+        )
+        raise ValueError(f"SysEx header bytes must be 7-bit (0-127): {bad}")
     out = bytearray([0xF0])
     out.extend(MANUFACTURER_ID)
-    out.extend([product & 0x7F, device & 0x7F, function & 0x7F, 0x00, page & 0x7F, number & 0x7F])
+    out.extend([product, device, function, 0x00, page, number])
     out.extend(bytes(values))
     out.append(0xF7)
     return bytes(out)
