@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  codegen-drift:
+    name: Generated modules match the spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check generated modules are not stale
+        run: python3 codegen/generate.py --check
+      - name: Check conformance vectors are not stale
+        run: |
+          python3 codegen/gen_vectors.py
+          git diff --exit-code spec/vectors || {
+            echo "spec/vectors is stale; run codegen/gen_vectors.py and commit"; exit 1; }
+
+  spec-version:
+    name: Spec version is consistent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: All generated modules report the same SPEC_VERSION
+        run: |
+          set -euo pipefail
+          spec=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' spec/version.toml | head -1 | tr -d '"')
+          echo "spec version: $spec"
+          grep -q "\"$spec\"" rust/src/generated.rs
+          grep -q "\"$spec\"" python/src/libkp/_generated.py
+          grep -q "\"$spec\"" swift/Sources/LibKP/Generated.swift
+          echo "all three generated modules carry $spec"
+
+  rust:
+    name: Rust build + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --all-targets
+      - run: cargo test
+      - run: cargo build --example meters
+
+  python:
+    name: Python test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+
+  swift:
+    name: Swift build + test
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: swift
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build
+      - run: swift test
+      - run: swift build --product meters
