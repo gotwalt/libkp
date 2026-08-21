@@ -12,7 +12,7 @@ swift build --product meters # just the example
 swift test                   # unit tests + the shared conformance suite
 ```
 
-Requires Swift 5.9 or newer and macOS 12+.
+Requires Swift 6.0 or newer and macOS 13+.
 
 ## Layout
 
