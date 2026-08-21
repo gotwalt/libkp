@@ -1,0 +1,27 @@
+[package]
+name = "libkp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Kemper Profiler network protocol: discovery, session, MIDI3/SysEx, control, and an observable device model."
+license = "MIT"
+repository = "https://github.com/agotwalt/libkp"
+keywords = ["kemper", "midi", "profiler", "protocol"]
+categories = ["network-programming", "multimedia::audio"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
+thiserror = "2"
+socket2 = "0.6"
+if-addrs = "0.13"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[[example]]
+name = "meters"
+path = "examples/meters.rs"
