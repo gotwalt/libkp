@@ -29,6 +29,17 @@ def test_every_vector_file_is_covered():
     assert present == covered, f"uncovered vector files: {sorted(present - covered)}"
 
 
+def test_no_vector_case_list_is_empty():
+    """An emptied case list would make its ``parametrize`` collect nothing and pass."""
+    empty: list[str] = []
+    for path in sorted(VECTORS_DIR.glob("*.json")):
+        document = vector(path.stem)
+        for key, value in document.items():
+            if isinstance(value, list) and not value:
+                empty.append(f"{path.stem}.{key}")
+    assert empty == [], f"empty vector case lists: {empty}"
+
+
 # ---------------------------------------------------------------------------
 # u14.json
 # ---------------------------------------------------------------------------
