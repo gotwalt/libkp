@@ -13,9 +13,9 @@ numbers — the full name map for those lives in :func:`libkp.params.param_name`
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
 
 from . import _generated as gen
 from . import params

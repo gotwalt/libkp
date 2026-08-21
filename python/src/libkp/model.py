@@ -39,13 +39,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 from . import _generated as gen
 from . import control as control_mod
 from . import midi3, nrpn, params
 from .control import Control
 from .errors import DisconnectedError, SessionError, UnknownSlotError
+from .protocol import PORT
 from .session import PROTOCOL_MIDI3_STREAM, Session
 from .state import (
     ApplyOutcome,
@@ -56,7 +57,6 @@ from .state import (
     Disconnected,
     RealtimeStatus,
 )
-from .protocol import PORT
 
 __all__ = ["DeviceModel", "RealtimeStatus", "DeviceEvent", "ApplyOutcome", "DeviceState"]
 
@@ -152,7 +152,7 @@ class DeviceModel:
         port: int = PORT,
         protocol: str = PROTOCOL_MIDI3_STREAM,
         sync: bool = True,
-    ) -> "DeviceModel":
+    ) -> DeviceModel:
         """Connect to ``ip:port``, open the streaming protocol, spawn the ingest
         and writer tasks, and kick off a read-only initial sync.
 
@@ -196,7 +196,7 @@ class DeviceModel:
         await self._session.close()
         self._disconnect()
 
-    async def __aenter__(self) -> "DeviceModel":
+    async def __aenter__(self) -> DeviceModel:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:

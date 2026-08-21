@@ -8,7 +8,6 @@ import re
 import sys
 
 import pytest
-
 from fake_device import FakeDevice
 
 from libkp import _generated as gen

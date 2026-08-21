@@ -123,16 +123,12 @@ class Session:
     # -- lifecycle ---------------------------------------------------------
 
     @classmethod
-    async def connect(
-        cls, ip: str, port: int = PORT, timeout: float = CONNECT_TIMEOUT
-    ) -> "Session":
+    async def connect(cls, ip: str, port: int = PORT, timeout: float = CONNECT_TIMEOUT) -> Session:
         """Connect to ``ip:port`` with an explicit connect timeout."""
         peer = (ip, port)
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout
-            )
-        except asyncio.TimeoutError as exc:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        except TimeoutError as exc:
             raise TimeoutErrorLibKP("connect", timeout) from exc
         except OSError as exc:
             raise ConnectError(peer, exc) from exc
@@ -159,7 +155,7 @@ class Session:
         except (OSError, ConnectionError):  # pragma: no cover - teardown races
             pass
 
-    async def __aenter__(self) -> "Session":
+    async def __aenter__(self) -> Session:
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -177,7 +173,7 @@ class Session:
         while True:
             try:
                 chunk = await asyncio.wait_for(self._reader.read(4096), idle)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break  # idle gap — nothing more for now
             except OSError as exc:
                 raise SessionError(f"i/o error during read: {exc}") from exc
@@ -200,7 +196,7 @@ class Session:
         """
         try:
             chunk = await asyncio.wait_for(self._reader.read(max_bytes), wait)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return b""
         except OSError as exc:
             raise SessionError(f"i/o error during read: {exc}") from exc

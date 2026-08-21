@@ -200,9 +200,7 @@ def test_meter_block_tolerates_a_short_value_block():
 def test_strobe_active_tracks_the_first_four_fields():
     assert not RealtimeStatus().strobe_active
     assert RealtimeStatus.from_values(meter_block([0, 0, 0, 5])).strobe_active
-    assert not RealtimeStatus.from_values(
-        meter_block([0, 0, 0, 0, 9000])
-    ).strobe_active
+    assert not RealtimeStatus.from_values(meter_block([0, 0, 0, 0, 9000])).strobe_active
 
 
 def test_beat_pulse_is_fast_and_touches_nothing():
@@ -263,9 +261,7 @@ def test_morph_sets_the_position():
 
 def test_tuner_deviance_is_fast():
     state = DeviceState()
-    out = state.apply(
-        set_single(0x00, 0x00, gen.PAGE_REALTIME, gen.TUNER_DEVIANCE_NUMBER, 8192)
-    )
+    out = state.apply(set_single(0x00, 0x00, gen.PAGE_REALTIME, gen.TUNER_DEVIANCE_NUMBER, 8192))
     assert out.events == [TunerDeviance(8192)]
     assert not out.slow_changed
     assert state.tuner.deviance == 8192
@@ -292,9 +288,12 @@ def test_rig_load_dump_routes_multiple_values():
     values = bytes(
         [
             *u14_split(33),  # number 0: Type = Green Scream
-            0x10, 0x00,      # number 1
-            0x20, 0x00,      # number 2
-            0x00, 0x01,      # number 3: On/Off = 1
+            0x10,
+            0x00,  # number 1
+            0x20,
+            0x00,  # number 2
+            0x00,
+            0x01,  # number 3: On/Off = 1
         ]
     )
     out = state.apply(sysex(0x00, 0x00, FN_MULTI, 0x32, 0, values))

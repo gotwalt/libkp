@@ -8,9 +8,7 @@ from libkp.midi3 import TAG_CONT, Unframer, frame, is_kemper_sysex
 
 
 def test_unframes_a_19_byte_sysex():
-    raw = bytes.fromhex(
-        "14f00020" "14330200" "14060000" "14000620" "14050000" "14000010" "15f70000"
-    )
+    raw = bytes.fromhex("14f00020143302001406000014000620140500001400001015f70000")
     unframer = Unframer()
     messages = unframer.push(raw)
     assert messages == [bytes.fromhex("f00020330200060000000620050000000010f7")]
@@ -43,9 +41,7 @@ def test_reassembles_across_chunk_boundaries():
 
 def test_pending_counts_partial_frames():
     unframer = Unframer()
-    assert unframer.push(bytes.fromhex("14f0002017f7000014aa")) == [
-        bytes.fromhex("f00020f70000")
-    ]
+    assert unframer.push(bytes.fromhex("14f0002017f7000014aa")) == [bytes.fromhex("f00020f70000")]
     assert unframer.pending() == 2
 
 

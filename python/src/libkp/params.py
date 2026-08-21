@@ -35,9 +35,7 @@ __all__ = [
 ]
 
 #: The eight effect slots in signal-chain order: ``(short name, address page)``.
-EFFECT_SLOTS: tuple[tuple[str, int], ...] = tuple(
-    (name, page) for name, page in gen.EFFECT_SLOTS
-)
+EFFECT_SLOTS: tuple[tuple[str, int], ...] = tuple((name, page) for name, page in gen.EFFECT_SLOTS)
 
 #: Just the slot short names, in signal-chain order.
 EFFECT_SLOT_NAMES: tuple[str, ...] = tuple(name for name, _ in EFFECT_SLOTS)

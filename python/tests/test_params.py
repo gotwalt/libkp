@@ -51,10 +51,7 @@ def test_realtime_page_addresses():
     assert params.param_name(0x7C, 88) == "Meter: (unused v10)"
     assert params.param_name(0x7C, 0) == "Tempo/Beat Pulse"
     assert params.param_name(0x7C, 15) == "Tuner Deviance"
-    assert (
-        params.describe(0x7C, 0x4E)
-        == "Realtime/Meters: Tuner Strobe Segment (phase-low)"
-    )
+    assert params.describe(0x7C, 0x4E) == "Realtime/Meters: Tuner Strobe Segment (phase-low)"
 
 
 def test_undocumented_addresses():

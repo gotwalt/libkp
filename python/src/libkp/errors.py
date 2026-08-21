@@ -50,8 +50,7 @@ class FieldOverrunError(ParseError):
 
     def __init__(self, offset: int, length: int, remaining: int) -> None:
         super().__init__(
-            f"field at offset {offset} claims length {length} "
-            f"but only {remaining} bytes remain"
+            f"field at offset {offset} claims length {length} but only {remaining} bytes remain"
         )
         self.offset = offset
         self.length = length

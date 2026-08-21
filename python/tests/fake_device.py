@@ -26,7 +26,9 @@ class FakeDevice:
         push_messages: list[bytes] | None = None,
         close_after_handshake: bool = False,
     ) -> None:
-        self.offered = offered if offered is not None else [PROTOCOL_RESERVED, PROTOCOL_MIDI3_STREAM]
+        self.offered = (
+            offered if offered is not None else [PROTOCOL_RESERVED, PROTOCOL_MIDI3_STREAM]
+        )
         self.accept = accept
         self.tail_messages = tail_messages or []
         self.push_messages = push_messages or []
@@ -48,7 +50,7 @@ class FakeDevice:
         assert self._server is not None
         return self._server.sockets[0].getsockname()[1]
 
-    async def start(self) -> "FakeDevice":
+    async def start(self) -> FakeDevice:
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
         return self
 
@@ -58,7 +60,7 @@ class FakeDevice:
             await self._server.wait_closed()
             self._server = None
 
-    async def __aenter__(self) -> "FakeDevice":
+    async def __aenter__(self) -> FakeDevice:
         return await self.start()
 
     async def __aexit__(self, *exc_info: object) -> None:

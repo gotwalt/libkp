@@ -145,9 +145,7 @@ class MeterView:
         elif isinstance(event, BeatPulse):
             self.last_pulse = (now, event.on)
         elif isinstance(event, ParamChanged):
-            self.last_param = (
-                f"{params.describe_numeric(event.page, event.number)} = {event.value}"
-            )
+            self.last_param = f"{params.describe_numeric(event.page, event.number)} = {event.value}"
         elif isinstance(event, TempoBpm):
             self.last_param = f"Rig Settings: Tempo bpm = {event.bpm}"
         elif isinstance(event, RenderedString):
@@ -293,9 +291,7 @@ def render(view: MeterView, state: DeviceState) -> str:
     rig = state.rig
     tempo = f"{rig.tempo_bpm} BPM" if rig.tempo_bpm is not None else "-- BPM"
     pulse = view.last_pulse
-    lit = (
-        pulse is not None and pulse[1] and (_clock() - pulse[0]) < PULSE_FLASH_SECS
-    )
+    lit = pulse is not None and pulse[1] and (_clock() - pulse[0]) < PULSE_FLASH_SECS
     beat = f"{AMBER}♪{RESET}" if lit else f"{DIM}♪{RESET}"
 
     line(
@@ -306,10 +302,7 @@ def render(view: MeterView, state: DeviceState) -> str:
     line(f"  {BOLD}RIG{RESET}  {BOLD}{rig.name or '(unknown)'}{RESET}   {beat} {tempo}")
     author = rig.author or "—"
     line(f"  {DIM}by {author}{RESET}")
-    line(
-        f"  AMP  {_pad(state.amp.name or '—', 24)}"
-        f"CAB  {state.cabinet.name or '—'}"
-    )
+    line(f"  AMP  {_pad(state.amp.name or '—', 24)}CAB  {state.cabinet.name or '—'}")
     line()
     for row in effect_block_rows(state, view.width):
         line(row)
@@ -334,10 +327,7 @@ def render(view: MeterView, state: DeviceState) -> str:
 
     line()
     line(f"  last param: {view.last_param or '(none)'}")
-    line(
-        f"  {DIM}(play into the device — Ctrl-C to quit; "
-        f"--all shows every raw field){RESET}"
-    )
+    line(f"  {DIM}(play into the device — Ctrl-C to quit; --all shows every raw field){RESET}")
     return HOME + "\n".join(lines) + "\n" + CLEAR_EOS
 
 
@@ -361,7 +351,7 @@ async def run(args: argparse.Namespace) -> int:
             print("no device found; pass --ip <addr>", file=sys.stderr)
             return 1
         name = reply.name
-        print(f'Discovered {name or "a device"} at {reply.ip}', file=sys.stderr)
+        print(f"Discovered {name or 'a device'} at {reply.ip}", file=sys.stderr)
         ip = reply.ip
 
     width = min(max(args.width, 8), 512)
@@ -385,7 +375,7 @@ async def run(args: argparse.Namespace) -> int:
                     break
                 try:
                     event = await asyncio.wait_for(events.get(), remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
                 view.on_event(event)
             view.decay()
@@ -411,9 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
             "effect blocks, the tuner strobe, and the realtime level meters."
         ),
     )
-    parser.add_argument(
-        "--ip", help="device IPv4 address; if omitted, discovery finds one"
-    )
+    parser.add_argument("--ip", help="device IPv4 address; if omitted, discovery finds one")
     parser.add_argument(
         "--port",
         type=int,
@@ -431,9 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_default_width(),
         help="bar width in characters (default: fits the terminal)",
     )
-    parser.add_argument(
-        "--fps", type=float, default=FPS, help=f"render rate (default: {FPS:g})"
-    )
+    parser.add_argument("--fps", type=float, default=FPS, help=f"render rate (default: {FPS:g})")
     parser.add_argument(
         "--discover-timeout",
         type=float,
