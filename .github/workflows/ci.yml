@@ -38,7 +38,7 @@ jobs:
           echo "all three generated modules carry $spec"
 
   rust:
-    name: Rust build + test
+    name: Rust lint + test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -46,12 +46,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --all-targets
       - run: cargo test
       - run: cargo build --example meters
 
   python:
-    name: Python test
+    name: Python lint + test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -62,16 +66,19 @@ jobs:
         with:
           python-version: "3.14"
       - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
       - run: python -m pytest -q
 
   swift:
-    name: Swift build + test
+    name: Swift lint + test
     runs-on: macos-15
     defaults:
       run:
         working-directory: swift
     steps:
       - uses: actions/checkout@v4
+      - run: swift format lint --strict --recursive --configuration .swift-format Sources Tests
       - run: swift build
       - run: swift test
       - run: swift build --product meters
