@@ -19,3 +19,8 @@ build/
 
 # macOS
 .DS_Store
+
+# Editors
+.vscode/
+.idea/
+
