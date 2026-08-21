@@ -1,8 +1,8 @@
 [package]
 name = "libkp"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 description = "Kemper Profiler network protocol: discovery, session, MIDI3/SysEx, control, and an observable device model."
 license = "MIT"
 repository = "https://github.com/agotwalt/libkp"
@@ -13,14 +13,14 @@ categories = ["network-programming", "multimedia::audio"]
 tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 thiserror = "2"
 socket2 = "0.6"
-if-addrs = "0.13"
+if-addrs = "0.15"
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [[example]]
 name = "meters"

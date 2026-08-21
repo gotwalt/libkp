@@ -33,7 +33,7 @@ use crossterm::terminal::{
 use crossterm::{execute, ExecutableCommand};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
