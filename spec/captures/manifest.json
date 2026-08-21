@@ -1,0 +1,22 @@
+{
+  "description": "Replay-capture fixtures for the cross-platform test harness. Each entry names a fixture file and its kind. See README.md for the harness contract.",
+  "spec_version_note": "These fixtures track wire behavior, not the generated tables; they are validated by every implementation's conformance suite.",
+  "fixtures": [
+    {
+      "file": "discovery-reply.json",
+      "kind": "discovery"
+    },
+    {
+      "file": "stream-status.json",
+      "kind": "midi3_stream"
+    },
+    {
+      "file": "meter-stream.json",
+      "kind": "midi3_stream"
+    },
+    {
+      "file": "rig-load.json",
+      "kind": "midi3_stream"
+    }
+  ]
+}

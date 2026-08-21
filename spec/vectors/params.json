@@ -1,0 +1,123 @@
+{
+  "description": "Offline name lookups. null means no mapping.",
+  "param_name": [
+    {
+      "page": 9,
+      "number": 3,
+      "name": "Noise Gate Intensity"
+    },
+    {
+      "page": 10,
+      "number": 4,
+      "name": "Gain"
+    },
+    {
+      "page": 127,
+      "number": 0,
+      "name": "Main Output Volume"
+    },
+    {
+      "page": 125,
+      "number": 88,
+      "name": "Looper Record/Playback/Overdub"
+    },
+    {
+      "page": 0,
+      "number": 1,
+      "name": "Rig Name"
+    },
+    {
+      "page": 50,
+      "number": 0,
+      "name": "Type"
+    },
+    {
+      "page": 61,
+      "number": 4,
+      "name": "Mix"
+    },
+    {
+      "page": 124,
+      "number": 84,
+      "name": "Meter: Rig Output Level"
+    },
+    {
+      "page": 118,
+      "number": 5,
+      "name": "User Scale 1 Step"
+    },
+    {
+      "page": 4,
+      "number": 5,
+      "name": null
+    },
+    {
+      "page": 125,
+      "number": 112,
+      "name": null
+    }
+  ],
+  "effect_type_name": [
+    {
+      "value": 0,
+      "name": "empty"
+    },
+    {
+      "value": 32,
+      "name": "Kemper Drive"
+    },
+    {
+      "value": 193,
+      "name": "Spring Reverb"
+    },
+    {
+      "value": 5,
+      "name": null
+    }
+  ],
+  "page_name": [
+    {
+      "page": 124,
+      "name": "Realtime/Meters"
+    },
+    {
+      "page": 10,
+      "name": "Amplifier"
+    },
+    {
+      "page": 153,
+      "name": null
+    }
+  ],
+  "string_tag_name": [
+    {
+      "number": 1,
+      "name": "Rig Name"
+    },
+    {
+      "number": 32,
+      "name": "Cabinet Name"
+    },
+    {
+      "number": 99,
+      "name": null
+    }
+  ],
+  "describe": [
+    {
+      "page": 9,
+      "number": 3,
+      "text": "Input Section: Noise Gate Intensity"
+    },
+    {
+      "page": 124,
+      "number": 78,
+      "text": "Realtime/Meters: Tuner Strobe Segment (phase-low)"
+    },
+    {
+      "page": 153,
+      "number": 5,
+      "text": "page 0x99 #5 (0x05)"
+    }
+  ]
+}
