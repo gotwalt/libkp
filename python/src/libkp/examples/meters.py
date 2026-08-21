@@ -77,6 +77,11 @@ PEAK_FALL_SECS = 1.25
 PULSE_FLASH_SECS = 0.15
 #: Label column width in the meter rows.
 LABEL_WIDTH = 19
+#: Columns a meter row spends on everything except the bar itself: the two-space
+#: indent, the space after the label, the bar's two brackets, two spaces, the
+#: five-column value, two more spaces, and the 17-column ``range …`` readout.
+#: Added to :data:`LABEL_WIDTH` this is the full non-bar width of a row.
+ROW_CHROME = 2 + 1 + 2 + 2 + 5 + 2 + 17
 
 FULL_SCALE = float(gen.FULL_SCALE)
 PHASE_SPAN = gen.FULL_SCALE + 1
@@ -357,14 +362,16 @@ async def run(args: argparse.Namespace) -> int:
     width = min(max(args.width, 8), 512)
     print(f"Connecting to {ip}...", file=sys.stderr)
 
-    model = await DeviceModel.connect(ip, args.port)
-    view = MeterView(ip=ip, width=width, show_all=args.all)
-    events = model.events()
-
     out = sys.stdout
-    out.write(CLEAR + HIDE_CURSOR)
-    out.flush()
+    model = await DeviceModel.connect(ip, args.port)
+    # Everything past the connect goes through the try, so a failure while
+    # setting up the terminal still closes the socket and the ingest tasks.
     try:
+        view = MeterView(ip=ip, width=width, show_all=args.all)
+        events = model.events()
+
+        out.write(CLEAR + HIDE_CURSOR)
+        out.flush()
         frame_time = 1.0 / max(args.fps, 1.0)
         loop = asyncio.get_running_loop()
         while True:
@@ -431,12 +438,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _default_width() -> int:
-    """A bar width that fits the terminal, with a sane fallback when piped."""
+    """A bar width that fits the terminal, with a sane fallback when piped.
+
+    A meter row is ``LABEL_WIDTH + ROW_CHROME`` columns wide before the bar, so
+    the bar has to stop one column short of that to leave the right margin
+    clear — otherwise every row wraps and the full-screen frame tears.
+    """
     try:
         columns = os.get_terminal_size().columns
     except OSError:
         columns = 100
-    return min(max(columns - LABEL_WIDTH - 26, 12), 60)
+    return min(max(columns - LABEL_WIDTH - ROW_CHROME - 1, 12), 60)
 
 
 def main(argv: list[str] | None = None) -> int:

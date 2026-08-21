@@ -54,6 +54,7 @@ from .errors import (
     ParseError,
     ProtocolRejectedError,
     SessionError,
+    TimeoutErrorLibKP,
     TooShortError,
     UnknownSlotError,
 )
@@ -214,6 +215,7 @@ __all__ = [
     "ConnectError",
     "ConnectionClosedError",
     "ProtocolRejectedError",
+    "TimeoutErrorLibKP",
     "CommandError",
     "DisconnectedError",
     "UnknownSlotError",

@@ -134,6 +134,29 @@ def test_parse_extended_string_recovers_address_and_text():
     assert nrpn.parse_extended_string(nrpn.set_single(0x00, 0x7F, 0x00, 0x01, 1)) is None
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"page": 0x80},
+        {"number": 128},
+        {"page": -1},
+        {"function": 0xFF},
+        {"product": 200},
+        {"device": 0x80},
+    ],
+)
+def test_sysex_rejects_an_out_of_range_header_byte(kwargs):
+    """Masking would silently retarget the message at a different address."""
+    args = {"product": 0x00, "device": 0x7F, "function": 0x01, "page": 0x0A, "number": 0x04}
+    args.update(kwargs)
+    with pytest.raises(ValueError, match="7-bit"):
+        nrpn.sysex(**args)
+
+
+def test_sysex_accepts_the_whole_seven_bit_range():
+    assert nrpn.sysex(0x00, 0x7F, 0x01, 0x7F, 0x7F)[8:10] == bytes([0x7F, 0x7F])
+
+
 def test_parses_a_status_header():
     message = bytes.fromhex("f0002033000002007c4e0000f7")
     header, values = NrpnHeader.parse(message)
