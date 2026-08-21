@@ -72,14 +72,16 @@ final class ConformanceTests: XCTestCase {
             var unframer = Midi3.Unframer()
             let messages = unframer.push(stream)
             let expected = (entry["messages"] as? [String]) ?? []
-            XCTAssertEqual(messages.map { Fmt.hex($0) }, expected, "unframe \(entry.string("stream"))")
+            XCTAssertEqual(
+                messages.map { Fmt.hex($0) }, expected, "unframe \(entry.string("stream"))")
             XCTAssertEqual(unframer.pending, entry.int("pending"), "pending")
         }
 
         for entry in vector.cases("frame") {
             let message = try hex(entry.string("message"))
             let framed = Midi3.frame(message)
-            XCTAssertEqual(Fmt.hex(framed), entry.string("framed"), "frame \(entry.string("message"))")
+            XCTAssertEqual(
+                Fmt.hex(framed), entry.string("framed"), "frame \(entry.string("message"))")
             XCTAssertEqual(framed.count % 4, 0)
 
             // Round-trip: frame then unframe yields exactly the input message.
@@ -333,7 +335,8 @@ final class ConformanceTests: XCTestCase {
         }
     }
 
-    private func assertState(_ state: DeviceState, matches expect: [String: Any], caseName: String) {
+    private func assertState(_ state: DeviceState, matches expect: [String: Any], caseName: String)
+    {
         if let rigName = expect["rig_name"] as? String {
             XCTAssertEqual(state.rig.name, rigName, "\(caseName): rig_name")
         }
@@ -365,10 +368,12 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(state.tuner.note, note.uint8Value, "\(caseName): tuner_note")
         }
         if let deviance = expect["tuner_deviance"] as? NSNumber {
-            XCTAssertEqual(state.tuner.deviance, deviance.uint16Value, "\(caseName): tuner_deviance")
+            XCTAssertEqual(
+                state.tuner.deviance, deviance.uint16Value, "\(caseName): tuner_deviance")
         }
         if let mainVolume = expect["main_volume"] as? NSNumber {
-            XCTAssertEqual(state.output.mainVolume, mainVolume.uint16Value, "\(caseName): main_volume")
+            XCTAssertEqual(
+                state.output.mainVolume, mainVolume.uint16Value, "\(caseName): main_volume")
         }
         if let monitorVolume = expect["monitor_volume"] as? NSNumber {
             XCTAssertEqual(

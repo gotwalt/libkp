@@ -207,10 +207,11 @@ mod tests {
         assert_eq!(s.effects[0].page, 0x32);
         assert_eq!(s.effects[7].slot, "REV");
         assert_eq!(s.effects[7].page, 0x3D);
-        assert!(s
-            .effects
-            .iter()
-            .all(|e| e.kind.is_none() && e.on.is_none() && e.mix.is_none()));
+        assert!(
+            s.effects
+                .iter()
+                .all(|e| e.kind.is_none() && e.on.is_none() && e.mix.is_none())
+        );
         assert_eq!(s, DeviceState::default());
     }
 

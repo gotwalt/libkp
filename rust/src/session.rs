@@ -88,7 +88,7 @@ impl Session {
                 return Err(SessionError::Timeout {
                     phase: "connect",
                     ms: dur.as_millis() as u64,
-                })
+                });
             }
         };
         // The device is latency-sensitive for live control; disable Nagle.
@@ -127,7 +127,7 @@ impl Session {
                     return Err(SessionError::Io {
                         phase: "read",
                         source,
-                    })
+                    });
                 }
                 Err(_) => break, // idle timeout — treat as "nothing more for now"
             }

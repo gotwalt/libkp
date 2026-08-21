@@ -63,7 +63,8 @@ public struct Effect: Sendable, Equatable {
     /// Dry/wet Mix (effect number 4, 14-bit), if known.
     public var mix: UInt16?
 
-    public init(slot: String, page: UInt8, kind: UInt16? = nil, on: Bool? = nil, mix: UInt16? = nil) {
+    public init(slot: String, page: UInt8, kind: UInt16? = nil, on: Bool? = nil, mix: UInt16? = nil)
+    {
         self.slot = slot
         self.page = page
         self.kind = kind
@@ -285,13 +286,14 @@ extension DeviceState {
             return applyString(number: header.number, values: values)
         case Generated.fnSingleParam:
             guard values.count >= 2 else { return .empty }
-            return routeParam(page: header.page, number: header.number, value: Nrpn.u14(values[0], values[1]))
+            return routeParam(
+                page: header.page, number: header.number, value: Nrpn.u14(values[0], values[1]))
         case Generated.fnMultiParam:
             return applyMulti(page: header.page, number: header.number, values: values)
         case Generated.fnRenderedStringReply:
             return applyRenderedString(msg)
         default:
-            return .empty // $06 extended, and anything else, ignored.
+            return .empty  // $06 extended, and anything else, ignored.
         }
     }
 
@@ -349,10 +351,13 @@ extension DeviceState {
         }
         // Effect Type / On-Off / Mix: fold into the slot (SLOW).
         if Params.isEffectPage(page),
-           number == Generated.effectParamType
-            || number == Generated.effectParamState
-            || number == Generated.effectParamMix {
-            guard let slot = applyEffect(page: page, number: number, value: value) else { return .empty }
+            number == Generated.effectParamType
+                || number == Generated.effectParamState
+                || number == Generated.effectParamMix
+        {
+            guard let slot = applyEffect(page: page, number: number, value: value) else {
+                return .empty
+            }
             return .slow([.effectChanged(slot: slot)])
         }
         // Amplifier On/Off and Gain (SLOW).

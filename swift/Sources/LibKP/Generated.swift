@@ -1,4 +1,5 @@
 // GENERATED FILE — DO NOT EDIT. Edit spec/*.toml and run codegen/generate.py.
+// swift-format-ignore-file
 import Foundation
 
 public enum Generated {

@@ -76,12 +76,12 @@ use crate::error::SessionError;
 use crate::generated;
 use crate::midi3::{self, Unframer};
 use crate::nrpn::{
-    self, multi_values, request_rendered_string, request_single, request_string, set_single, u14,
-    NrpnHeader, FUNCTION_EXT_STRING_PARAM, FUNCTION_MULTI_PARAM, FUNCTION_RENDERED_STRING_REPLY,
-    FUNCTION_SINGLE_PARAM, FUNCTION_STRING_PARAM, PAGE_STRINGS,
+    self, FUNCTION_EXT_STRING_PARAM, FUNCTION_MULTI_PARAM, FUNCTION_RENDERED_STRING_REPLY,
+    FUNCTION_SINGLE_PARAM, FUNCTION_STRING_PARAM, NrpnHeader, PAGE_STRINGS, multi_values,
+    request_rendered_string, request_single, request_string, set_single, u14,
 };
 use crate::params::{self, EFFECT_PARAM_MIX, EFFECT_PARAM_STATE, EFFECT_PARAM_TYPE};
-use crate::session::{Session, PROTOCOL_MIDI3_STREAM};
+use crate::session::{PROTOCOL_MIDI3_STREAM, Session};
 use crate::state::{Connection, DeviceState, Effect};
 
 /// Volatile realtime page (meter block, beat pulse, tuner deviance).

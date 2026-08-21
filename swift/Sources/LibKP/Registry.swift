@@ -81,7 +81,7 @@ public enum Registry {
     public static func descriptor(page: UInt8, number: UInt8) -> ParamDescriptor? {
         if Params.isEffectPage(page) {
             guard commonEffectNumbers.contains(number),
-                  let name = Params.paramName(page: page, number: number)
+                let name = Params.paramName(page: page, number: number)
             else { return nil }
             let kind = derivedKind(for: name)
             var lookup: (@Sendable (UInt16) -> String?)?
@@ -97,7 +97,7 @@ public enum Registry {
             )
         }
         guard commonPages.contains(page),
-              let name = Params.paramName(page: page, number: number)
+            let name = Params.paramName(page: page, number: number)
         else { return nil }
         return ParamDescriptor(page: page, number: number, name: name, kind: derivedKind(for: name))
     }

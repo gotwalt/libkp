@@ -43,28 +43,42 @@ public enum Nrpn {
 
     /// Request a string parameter (function `$43`). The device replies with a
     /// `$03` string message. Read-only — it does not change device state.
-    public static func requestString(product: UInt8, device: UInt8, page: UInt8, number: UInt8) -> [UInt8] {
-        sysex(product: product, device: device, function: Generated.fnRequestString, page: page, number: number)
+    public static func requestString(
+        product: UInt8, device: UInt8, page: UInt8, number: UInt8
+    ) -> [UInt8] {
+        sysex(
+            product: product, device: device, function: Generated.fnRequestString, page: page,
+            number: number)
     }
 
     /// Request a single numeric parameter (function `$41`). The reply arrives
     /// as `$01`. Read-only — a nonexistent address is silently ignored.
-    public static func requestSingle(product: UInt8, device: UInt8, page: UInt8, number: UInt8) -> [UInt8] {
-        sysex(product: product, device: device, function: Generated.fnRequestSingle, page: page, number: number)
+    public static func requestSingle(
+        product: UInt8, device: UInt8, page: UInt8, number: UInt8
+    ) -> [UInt8] {
+        sysex(
+            product: product, device: device, function: Generated.fnRequestSingle, page: page,
+            number: number)
     }
 
     /// Request all numeric parameters of a unit (function `$42`). The reply
     /// arrives as a `$02` Multi Parameter Change; decode its value block with
     /// ``multiValues(number:values:)``. The request must address the *first*
     /// controller number of the unit or the device ignores it.
-    public static func requestMulti(product: UInt8, device: UInt8, page: UInt8, number: UInt8) -> [UInt8] {
-        sysex(product: product, device: device, function: Generated.fnRequestMulti, page: page, number: number)
+    public static func requestMulti(
+        product: UInt8, device: UInt8, page: UInt8, number: UInt8
+    ) -> [UInt8] {
+        sysex(
+            product: product, device: device, function: Generated.fnRequestMulti, page: page,
+            number: number)
     }
 
     /// Set a single numeric parameter (function `$01`, Single Parameter
     /// Change). **Mutating.** `value` is 14-bit; for a switch parameter use
     /// 1 (on) / 0 (off).
-    public static func setSingle(product: UInt8, device: UInt8, page: UInt8, number: UInt8, value: UInt16) -> [UInt8] {
+    public static func setSingle(
+        product: UInt8, device: UInt8, page: UInt8, number: UInt8, value: UInt16
+    ) -> [UInt8] {
         let (msb, lsb) = u14Split(value)
         return sysex(
             product: product, device: device, function: Generated.fnSingleParam,
@@ -107,7 +121,7 @@ public enum Nrpn {
     ) -> [UInt8] {
         var flags: UInt8 = 0
         if isInit { flags |= Generated.beaconFlagInit }
-        flags |= Generated.beaconFlagSysex // always on
+        flags |= Generated.beaconFlagSysex  // always on
         if tuner { flags |= Generated.beaconFlagTunemode }
 
         var msg: [UInt8] = [0xF0]
@@ -116,7 +130,7 @@ public enum Nrpn {
             product,
             Generated.deviceOmni,
             Generated.beaconFunction,
-            0x00, // instance
+            0x00,  // instance
             Generated.beaconSubcommand,
             paramSet,
             flags,
@@ -143,7 +157,9 @@ public enum Nrpn {
     /// **consecutive addresses** starting at `number`, each a 14-bit MSB/LSB
     /// pair. Returns `(number + i, value)` for each pair; a trailing odd byte is
     /// ignored.
-    public static func multiValues(number: UInt8, values: [UInt8]) -> [(number: UInt8, value: UInt16)] {
+    public static func multiValues(
+        number: UInt8, values: [UInt8]
+    ) -> [(number: UInt8, value: UInt16)] {
         var out = [(number: UInt8, value: UInt16)]()
         out.reserveCapacity(values.count / 2)
         var i = 0
@@ -180,10 +196,10 @@ public enum Nrpn {
     public static func parseExtendedString(_ msg: [UInt8]) -> (address: UInt32, text: String)? {
         // F0 + mfr(3) + prod + dev + fn + inst + 5-byte addr + NUL + F7 = 14 min.
         guard msg.count >= 14,
-              msg[0] == 0xF0,
-              Array(msg[1..<4]) == Generated.manufacturerId,
-              msg[6] == Generated.fnExtStringParam,
-              msg[msg.count - 1] == 0xF7
+            msg[0] == 0xF0,
+            Array(msg[1..<4]) == Generated.manufacturerId,
+            msg[6] == Generated.fnExtStringParam,
+            msg[msg.count - 1] == 0xF7
         else { return nil }
         let address = UInt32(truncatingIfNeeded: extDecode(Array(msg[8..<13])))
         return (address, Fmt.textUntilNul(msg[13..<(msg.count - 1)]))
@@ -199,8 +215,8 @@ public enum Nrpn {
         _ msg: [UInt8]
     ) -> (page: UInt8, number: UInt8, value: UInt16, text: String)? {
         guard let (header, values) = NrpnHeader.parse(msg),
-              header.function == Generated.fnRenderedStringReply,
-              values.count >= 2
+            header.function == Generated.fnRenderedStringReply,
+            values.count >= 2
         else { return nil }
         let value = u14(values[0], values[1])
         return (header.page, header.number, value, Fmt.textUntilNul(values[2...]))
@@ -216,7 +232,9 @@ public struct NrpnHeader: Equatable, Sendable {
     public let page: UInt8
     public let number: UInt8
 
-    public init(product: UInt8, device: UInt8, function: UInt8, instance: UInt8, page: UInt8, number: UInt8) {
+    public init(
+        product: UInt8, device: UInt8, function: UInt8, instance: UInt8, page: UInt8, number: UInt8
+    ) {
         self.product = product
         self.device = device
         self.function = function

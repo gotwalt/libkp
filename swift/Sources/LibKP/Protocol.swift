@@ -33,7 +33,7 @@ public enum KemperProtocol {
         out.append(contentsOf: discoveryHeader)
         pushField(&out, Array((Generated.pollMacPrefix + mac).utf8))
         pushField(&out, Array(Generated.pollPayload.utf8))
-        out.append(0x00) // stream terminator
+        out.append(0x00)  // stream terminator
         return out
     }
 
@@ -71,7 +71,7 @@ public struct TagStream: Equatable, Sendable {
 
         while off < buf.count {
             let len = Int(buf[off])
-            if len == 0 { break } // terminator / empty field
+            if len == 0 { break }  // terminator / empty field
             let contentStart = off + 1
             let end = contentStart + (len - 1)
             guard end <= buf.count else {
@@ -89,7 +89,9 @@ public struct TagStream: Equatable, Sendable {
     /// Fields whose first four bytes are not printable are skipped.
     public func keyValues() -> [(key: String, value: [UInt8])] {
         fields.compactMap { field in
-            guard field.count >= 4, field[0..<4].allSatisfy({ Fmt.isGraphic($0) }) else { return nil }
+            guard field.count >= 4, field[0..<4].allSatisfy({ Fmt.isGraphic($0) }) else {
+                return nil
+            }
             let key = String(decoding: field[0..<4], as: UTF8.self)
             return (key, Array(field[4...]))
         }

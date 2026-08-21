@@ -92,6 +92,9 @@ def emit_rust(d: dict) -> str:
     w = out.append
     w(f"//! {BANNER}")
     w("#![allow(clippy::all)]")
+    # Skip the whole generated file: `cargo fmt` must not reformat it, or it
+    # would diverge from this generator's output and trip the drift check.
+    w("#![cfg_attr(rustfmt, rustfmt::skip)]")
     w("")
     w(f'pub const SPEC_VERSION: &str = {q(d["version"]["spec_version"])};')
     w("")
@@ -416,6 +419,9 @@ def emit_swift(d: dict) -> str:
     out: list[str] = []
     w = out.append
     w(f"// {BANNER}")
+    # Keep swift-format off this file so it stays byte-identical to the generator
+    # output (otherwise the drift check fails).
+    w("// swift-format-ignore-file")
     w("import Foundation")
     w("")
     w("public enum Generated {")
