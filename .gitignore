@@ -1,0 +1,21 @@
+# Rust
+/rust/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+dist/
+build/
+
+# Swift
+/swift/.build/
+/swift/.swiftpm/
+*.xcodeproj
+
+# macOS
+.DS_Store
