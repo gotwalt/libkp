@@ -1,0 +1,115 @@
+# Transport, discovery, handshake, and framing constants for the Kemper
+# Profiler network protocol.
+#
+# Provenance: the transport envelope (ports, the DSCV discovery TagStream, the
+# GUID handshake, the MIDI3 framing, and the session preamble) is documented
+# from observed experimentation. The MIDI/SysEx manufacturer id and message
+# grammar carried inside the envelope follow the official Kemper MIDI Parameter
+# Documentation, cross-checked against PySwitch.
+
+[transport]
+# One port serves both UDP discovery and the TCP session (0x165f).
+port = 5727
+# TCP connect timeout and socket read timeout, in seconds.
+connect_timeout_secs = 5
+socket_timeout_secs = 15
+
+[discovery]
+# UDP broadcast discovery. The client broadcasts a fixed 34-byte poll; Profilers
+# on the LAN reply on the same port with a DSCV TagStream of key/value fields.
+header = "DSCV"                       # 4-byte ASCII header, no length prefix
+poll_interval_ms = 500
+# The poll payload is: "DSCV" <len>"MAC#<mac>" <len>"POLL:)" 0x00, where each
+# length byte is inclusive of itself. The MAC is the client's own; an all-zero
+# placeholder "00:00:00:00:00:00" is accepted.
+poll_mac_prefix = "MAC#"
+poll_payload = "POLL:)"
+poll_placeholder_mac = "00:00:00:00:00:00"
+# TagStream encoding: an optional 4-byte ASCII header, then length-prefixed
+# fields [len][content], len inclusive of the length byte, terminated by 0x00.
+# Reply fields are themselves [4-char key][value]; known reply keys:
+reply_keys = [
+  { key = "NAME", meaning = "device display name" },
+  { key = "SWVS", meaning = "software build number" },
+  { key = "VSTR", meaning = "full version string" },
+  { key = "MAC#", meaning = "device MAC, no separators" },
+  { key = "OWNR", meaning = "owner name" },
+  { key = "APPR", meaning = "appliance / product class" },
+  { key = "TYPE", meaning = "product / model type id" },
+  { key = "SER#", meaning = "serial number" },
+  { key = "MGR#", meaning = "manager / session GUID" },
+  { key = "DEF#", meaning = "device-definition (DDF) GUID" },
+  { key = "MGR2", meaning = "secondary manager GUID" },
+  { key = "FSET", meaning = "feature-set token" },
+  { key = "LICN", meaning = "license level" },
+  { key = "SYNL", meaning = "sync-layer available flag" },
+]
+
+[handshake]
+# On TCP connect the device sends first: a list of supported protocol GUIDs,
+# one per CRLF line, ending with a line containing only ".". The client writes
+# "<GUID>\r\n"; the device replies "+<GUID>\r\n" (accept) or "-NO\r\n" (reject).
+terminator = "\r\n"
+list_end_marker = "."
+accept_prefix = "+"
+reject_prefix = "-"
+# After acceptance of the streaming protocol the client writes 8 zero bytes to
+# open the session, then the framed stream begins.
+session_preamble_len = 8
+
+[protocols]
+# The protocol GUIDs the device offers. Only the MIDI3 stream is implemented in
+# libkp; the CBOR channel is documented (docs/06) but not implemented.
+midi3_stream    = "{369F50E7-750B-459A-BAEE-85ADD3F3798D}"  # bidirectional MIDI3: meters + request/reply/control
+request_response = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}" # accepts; sends an 11-byte token on open
+cbor_control    = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"  # native CBOR (Protocol3) — experimental, not implemented
+reserved        = "{77DB6B28-785E-4641-B840-42F0F06A11FC}"  # offered but rejects the handshake (-NO)
+
+[midi3]
+# The streaming protocol carries MIDI as 4-byte frames [tag][b0 b1 b2].
+# 0x14 = continuation (3 valid bytes, more follow); 0x15/0x16/0x17 = final
+# group with 1/2/3 valid bytes. Concatenated valid bytes form a raw MIDI
+# message (typically a Kemper SysEx F0 00 20 33 ... F7).
+tag_continuation = 0x14
+tag_final_1 = 0x15
+tag_final_2 = 0x16
+tag_final_3 = 0x17
+
+[sysex]
+# Kemper MIDI manufacturer id and the fixed SysEx header shape:
+# F0 <mfr:3> <product> <device> <function> <instance=0> <page> <number> <values..> F7
+manufacturer_id = [0x00, 0x20, 0x33]
+product_profiler = 0x00     # original Profiler
+product_player = 0x02       # Profiler Player class
+device_omni = 0x7F
+full_scale = 16383          # maximum 14-bit NRPN value
+
+# SysEx function codes (Kemper MIDI Parameter Documentation, Table 5).
+[sysex.functions]
+single_param = 0x01              # Single Parameter Change (set / $01 reply)
+multi_param = 0x02               # Multi Parameter Change (consecutive addrs; $42 reply)
+string_param = 0x03              # String Parameter (set / $43 reply)
+blob = 0x04                      # binary object
+ext_param = 0x06                 # extended param (5-byte address/value)
+ext_string_param = 0x07          # extended string (5-byte address)
+morphed_multi_param = 0x08       # morphed multi-parameter
+rendered_string_reply = 0x3C     # reply to a rendered-string request
+request_single = 0x41            # request a single numeric parameter (reply $01)
+request_multi = 0x42             # request all params of a unit (reply $02)
+request_string = 0x43            # request a string parameter (reply $03)
+request_ext_string = 0x47        # request an extended string
+request_rendered_string = 0x7C   # request a value rendered to display text (reply $3C)
+beacon = 0x7E                    # bidirectional beacon (PySwitch; undocumented in the PDF)
+
+[beacon]
+# The bidirectional beacon asks the device to stream a selected parameter set
+# and send a "sense" status roughly every 500 ms; it must be re-sent within the
+# lease. Layout: F0 <mfr> <product> 7F 7E 00 40 <param_set> <flags> <lease/2> F7.
+# Credited to PySwitch.
+function = 0x7E
+subcommand = 0x40
+default_param_set = 0x02
+# Flag bits: 0 init, 1 sysex, 2 echo, 3 nofe, 4 noctr, 5 tunemode.
+flag_init = 0x01
+flag_sysex = 0x02
+flag_tunemode = 0x20

@@ -1,0 +1,5 @@
+# The protocol-spec version. Every libkp implementation embeds this value and
+# asserts it in its conformance suite; CI cross-checks that all three languages
+# report the same number. Bump it whenever spec/ changes in a way that alters
+# generated data or wire behavior.
+spec_version = "0.1.0"

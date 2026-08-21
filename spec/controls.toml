@@ -1,0 +1,71 @@
+# MIDI Control Change (CC) vocabulary the Profiler responds to — the 7-bit
+# channel-voice surface, distinct from the 14-bit NRPN-over-SysEx traffic.
+#
+# Provenance: documented CC numbers from the Kemper MIDI Parameter Documentation
+# (Continuous Controllers, Table 1; Switches, Table 2), cross-checked against
+# PySwitch.
+
+# Named CC numbers.
+cc = [
+  # Continuous controllers (Table 1)
+  { name = "wah_pedal",       cc = 1,  kind = "continuous", note = "Wah Pedal" },
+  { name = "pitch_pedal",     cc = 4,  kind = "continuous", note = "Pitch Pedal" },
+  { name = "volume_pedal",    cc = 7,  kind = "continuous", note = "Volume Pedal" },
+  { name = "panorama",        cc = 10, kind = "continuous", note = "Panorama" },
+  { name = "morph_pedal",     cc = 11, kind = "continuous", note = "Morph Pedal" },
+  { name = "delay_mix",       cc = 68, kind = "continuous", note = "Delay Mix" },
+  { name = "delay_feedback",  cc = 69, kind = "continuous", note = "Delay Feedback" },
+  { name = "reverb_mix",      cc = 70, kind = "continuous", note = "Reverb Mix" },
+  { name = "reverb_time",     cc = 71, kind = "continuous", note = "Reverb Time" },
+  { name = "gain",            cc = 72, kind = "continuous", note = "Gain" },
+  { name = "monitor_volume",  cc = 73, kind = "continuous", note = "Monitor (Output) Volume" },
+  # Switches (Table 2)
+  { name = "toggle_all_modules", cc = 16, kind = "switch", note = "toggle all modules A-REV" },
+  { name = "module_a",         cc = 17, kind = "switch", note = "module A on/off" },
+  { name = "module_b",         cc = 18, kind = "switch", note = "module B on/off" },
+  { name = "module_c",         cc = 19, kind = "switch", note = "module C on/off" },
+  { name = "module_d",         cc = 20, kind = "switch", note = "module D on/off" },
+  { name = "module_x",         cc = 22, kind = "switch", note = "module X on/off" },
+  { name = "module_mod",       cc = 24, kind = "switch", note = "module MOD on/off" },
+  { name = "module_dly_no_spill", cc = 26, kind = "switch", note = "module DLY off, no spillover" },
+  { name = "module_dly",       cc = 27, kind = "switch", note = "module DLY on/off, with spillover" },
+  { name = "module_rev_no_spill", cc = 28, kind = "switch", note = "module REV off, no spillover" },
+  { name = "module_rev",       cc = 29, kind = "switch", note = "module REV on/off, with spillover" },
+  { name = "tap_tempo",        cc = 30, kind = "switch", note = "Tap Tempo" },
+  { name = "tuner_mode",       cc = 31, kind = "switch", note = "Tuner Mode (1 open / 0 close)" },
+  { name = "rotary_speed",     cc = 33, kind = "switch", note = "Rotary speaker speed (1 fast / 0 slow)" },
+  { name = "delay_infinity",   cc = 34, kind = "switch", note = "Delay Infinity" },
+  { name = "freeze",           cc = 35, kind = "switch", note = "Delay + Reverb Freeze" },
+  { name = "bank_preselect",   cc = 47, kind = "switch", note = "Bank/Performance preselect (value = bank - 1)" },
+  { name = "up",               cc = 48, kind = "switch", note = "Performance/Rig up" },
+  { name = "down",             cc = 49, kind = "switch", note = "Performance/Rig down" },
+  { name = "load_slot_1",      cc = 50, kind = "switch", note = "load Slot 1 (value 1)" },
+  { name = "load_slot_2",      cc = 51, kind = "switch", note = "load Slot 2 (value 1)" },
+  { name = "load_slot_3",      cc = 52, kind = "switch", note = "load Slot 3 (value 1)" },
+  { name = "load_slot_4",      cc = 53, kind = "switch", note = "load Slot 4 (value 1)" },
+  { name = "load_slot_5",      cc = 54, kind = "switch", note = "load Slot 5 (value 1)" },
+  { name = "effect_button_i",   cc = 75, kind = "switch", note = "Effect Button I" },
+  { name = "effect_button_ii",  cc = 76, kind = "switch", note = "Effect Button II" },
+  { name = "effect_button_iii", cc = 77, kind = "switch", note = "Effect Button III" },
+  { name = "effect_button_iiii", cc = 78, kind = "switch", note = "Effect Button IIII" },
+  { name = "morph_button",     cc = 80, kind = "switch", note = "Morph button (1 rise / 0 fall)" },
+  # Bank Select (standard MIDI, used with Program Change for rig selection)
+  { name = "bank_select_msb",  cc = 0,  kind = "select", note = "Bank Select MSB" },
+  { name = "bank_select_lsb",  cc = 32, kind = "select", note = "Bank Select LSB / rig-index part 1" },
+]
+
+# The on/off CC per effect slot. DLY/REV use their with-spillover CCs (27/29).
+slot_enable_cc = [
+  { slot = "A",   cc = 17 },
+  { slot = "B",   cc = 18 },
+  { slot = "C",   cc = 19 },
+  { slot = "D",   cc = 20 },
+  { slot = "X",   cc = 22 },
+  { slot = "MOD", cc = 24 },
+  { slot = "DLY", cc = 27 },
+  { slot = "REV", cc = 29 },
+]
+
+[status]
+program_change = 0xC0    # Program Change status nibble (| channel)
+control_change = 0xB0    # Control Change status nibble (| channel)

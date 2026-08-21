@@ -1,0 +1,374 @@
+# Parameter address maps for the Kemper Profiler.
+#
+# Provenance: transcribed from the official Kemper MIDI Parameter Documentation
+# (page/number → name, effect types, string tags, SysEx functions), plus a few
+# addresses credited to PySwitch: the Fixed-FX page (0x05), the tuner / tempo /
+# meter addresses on pages 0x7C / 0x7D / 0x7F, and the numeric morph-state
+# parameter on page 0. Meter-field identities (page 0x7C, numbers 78–88) were
+# established by observed experimentation (see docs/07-realtime-status.md).
+#
+# Addressing: a parameter is (page, number). Effect modules A..REV share one
+# parameter map. Page 0 is dual-use: string tags via $03/$43, numeric params
+# (morph) via $01/$41.
+
+# SysEx function code → short name (Kemper MIDI doc, Table 5).
+functions = [
+  { code = 0x01, name = "single-param" },
+  { code = 0x02, name = "multi-param" },
+  { code = 0x03, name = "string-param" },
+  { code = 0x04, name = "blob" },
+  { code = 0x06, name = "ext-param" },
+  { code = 0x07, name = "ext-string-param" },
+  { code = 0x08, name = "morphed-multi-param" },
+  { code = 0x3C, name = "rendered-string-reply" },
+  { code = 0x41, name = "request-single" },
+  { code = 0x42, name = "request-multi" },
+  { code = 0x43, name = "request-string" },
+  { code = 0x47, name = "request-ext-string" },
+  { code = 0x7C, name = "request-rendered-string" },
+  { code = 0x7E, name = "beacon" },
+]
+
+# Address page (section) names.
+pages = [
+  { page = 0x00, name = "String Tags" },
+  { page = 0x04, name = "Rig Settings" },
+  { page = 0x05, name = "Fixed FX" },
+  { page = 0x09, name = "Input Section" },
+  { page = 0x0A, name = "Amplifier" },
+  { page = 0x0B, name = "Amplifier EQ" },
+  { page = 0x0C, name = "Cabinet" },
+  { page = 0x32, name = "Effect A" },
+  { page = 0x33, name = "Effect B" },
+  { page = 0x34, name = "Effect C" },
+  { page = 0x35, name = "Effect D" },
+  { page = 0x38, name = "Effect X" },
+  { page = 0x3A, name = "Effect MOD" },
+  { page = 0x3C, name = "Effect DLY" },
+  { page = 0x3D, name = "Effect REV" },
+  { page = 0x76, name = "User Scales" },
+  { page = 0x7C, name = "Realtime/Meters" },
+  { page = 0x7D, name = "Looper/Freeze" },
+  { page = 0x7F, name = "System/Global" },
+]
+
+# The eight effect slots in signal-chain order: (short name, address page).
+effect_slots = [
+  { slot = "A",   page = 0x32 },
+  { slot = "B",   page = 0x33 },
+  { slot = "C",   page = 0x34 },
+  { slot = "D",   page = 0x35 },
+  { slot = "X",   page = 0x38 },
+  { slot = "MOD", page = 0x3A },
+  { slot = "DLY", page = 0x3C },
+  { slot = "REV", page = 0x3D },
+]
+
+# Shared parameter map for all eight effect modules. Where the Kemper doc
+# overloads one number across effect types, the full slash-separated name is
+# kept so nothing is lost.
+effect_params = [
+  { number = 0,  name = "Type" },
+  { number = 3,  name = "On/Off" },
+  { number = 4,  name = "Mix" },
+  { number = 6,  name = "Volume" },
+  { number = 7,  name = "Stereo" },
+  { number = 8,  name = "Wah Manual / Freq Shifter Delay Pitch" },
+  { number = 9,  name = "Wah Peak" },
+  { number = 10, name = "Wah Pedal Range" },
+  { number = 12, name = "Wah Pedal Mode" },
+  { number = 13, name = "Wah Touch Attack / Fuzz Impedance LP" },
+  { number = 14, name = "Wah Touch Release" },
+  { number = 15, name = "Wah Touch Boost / Delay Cross Feedback" },
+  { number = 16, name = "Distortion Drive / Reverb Formant Mix" },
+  { number = 17, name = "Distortion Tone / Reverb Mid Frequency" },
+  { number = 18, name = "Fuzz Octa / Compressor Intensity / Noise Gate Threshold / Auto Swell Compressor" },
+  { number = 19, name = "Compressor Attack / Legacy Delay Bandwidth / Legacy Reverb Bandwidth" },
+  { number = 20, name = "Fuzz Transistor Shape / Modulation Rate / Auto Swell / Widener Tune" },
+  { number = 21, name = "Drive Definition / Fuzz Transistor Tone / Modulation Depth / Micro Pitch Detune / Double Tracker Looseness / Widener Intensity" },
+  { number = 22, name = "Modulation Feedback / Formant Reverb Vowel" },
+  { number = 23, name = "Drive Slim Down / Fuzz Definition / Modulation Crossover / Octaver Low Cut" },
+  { number = 24, name = "Modulation Hyper Chorus Amount" },
+  { number = 25, name = "Modulation Manual / Reverb Formant Offset / Spring Reverb Spectral Balance" },
+  { number = 26, name = "Modulation Peak Spread / Wah Phaser Peak Spread / Reverb Formant Peak" },
+  { number = 27, name = "Modulation Stages / Wah Phaser Stages / Legacy Reverb Room Size" },
+  { number = 30, name = "Rotary Speed (Slow/Fast)" },
+  { number = 31, name = "Rotary Distance" },
+  { number = 32, name = "Rotary Low-High-Balance" },
+  { number = 33, name = "Compressor Squash / Legacy Delay Frequency / Legacy Reverb Mid Frequency" },
+  { number = 34, name = "Graphic EQ Gain 80 Hz" },
+  { number = 35, name = "Graphic EQ Gain 160 Hz" },
+  { number = 36, name = "Graphic EQ Gain 320 Hz" },
+  { number = 37, name = "Graphic EQ Gain 640 Hz" },
+  { number = 38, name = "Graphic EQ Gain 1250 Hz" },
+  { number = 39, name = "Graphic EQ Gain 2500 Hz" },
+  { number = 40, name = "Graphic EQ Gain 5000 Hz" },
+  { number = 41, name = "Graphic EQ Gain 10000 Hz" },
+  { number = 42, name = "Studio/Metal EQ / Metal DS Low Gain / Acoustic Sim Body" },
+  { number = 43, name = "Studio EQ Low Frequency" },
+  { number = 44, name = "Studio/Metal EQ / Metal DS High Gain / Acoustic Sim Sparkle" },
+  { number = 45, name = "Studio EQ High Frequency" },
+  { number = 46, name = "Studio EQ Mid1 / Metal EQ/DS Middle Gain / Acoustic Sim Bronze" },
+  { number = 47, name = "Studio EQ Mid1 / Metal EQ/DS Middle Frequency" },
+  { number = 48, name = "Studio EQ Mid1 Q-Factor" },
+  { number = 49, name = "Studio EQ Mid2 Gain / Acoustic Sim Pickup" },
+  { number = 50, name = "Studio EQ Mid2 Frequency" },
+  { number = 51, name = "Studio EQ Mid2 Q-Factor" },
+  { number = 52, name = "Wah Peak Range" },
+  { number = 53, name = "Ducking" },
+  { number = 54, name = "Mix 2 (Pitch/Octaver/Delay Serial/Crystal Mix / Space Intensity)" },
+  { number = 55, name = "Voice Balance / Delay Balance" },
+  { number = 56, name = "Voice 1 Pitch / Toe Pitch / Transpose Pitch / Quad Voice Pitch 4 / Crystal 1 Pitch" },
+  { number = 57, name = "Voice 2 Pitch / Heel Pitch / Quad Voice Pitch 3 / Wah Formant Pitch Shift / Crystal 2 Pitch" },
+  { number = 58, name = "Pitch Detune" },
+  { number = 60, name = "Smooth Chords" },
+  { number = 61, name = "Pure Tuning" },
+  { number = 62, name = "Voice 1 Interval / Quad Voice 4 Interval" },
+  { number = 63, name = "Voice 2 Interval / Quad Voice 3 Interval" },
+  { number = 64, name = "Key" },
+  { number = 65, name = "Formant Shift Freeze" },
+  { number = 66, name = "Formant Shift Offset" },
+  { number = 67, name = "Equalizer Low Cut" },
+  { number = 68, name = "Equalizer High Cut / Reverb High Cut" },
+  { number = 69, name = "Mix 3 (delay/reverb)" },
+  { number = 70, name = "Mix Pre/Post" },
+  { number = 71, name = "Delay 1 Time / Reverb Room Size / Reverb Attack / Spring Size" },
+  { number = 72, name = "Delay 2 Time / Reverb Predelay Time" },
+  { number = 73, name = "Delay 2 Ratio / Quad Delay 3 Ratio / Rate Flanger/Phaser Oneway" },
+  { number = 74, name = "Quad Delay 2 Ratio / Delay Ratio Serial" },
+  { number = 75, name = "Quad Delay 1 Ratio" },
+  { number = 76, name = "Delay Note Value 1 / Quad Note Value 4" },
+  { number = 77, name = "Delay Note Value 2 / Quad Note Value 3 / Reverb Predelay Note Value" },
+  { number = 78, name = "Quad Note Value 2 / Note Value Serial" },
+  { number = 79, name = "Quad Note Value 1" },
+  { number = 80, name = "To Tempo / Equalizer Steep Low" },
+  { number = 81, name = "Delay Volume 4" },
+  { number = 82, name = "Delay Volume 3" },
+  { number = 83, name = "Delay Volume 2" },
+  { number = 84, name = "Delay Volume 1" },
+  { number = 85, name = "Delay Panorama 4" },
+  { number = 86, name = "Delay Panorama 3" },
+  { number = 87, name = "Delay Panorama 2" },
+  { number = 88, name = "Delay Panorama 1" },
+  { number = 89, name = "Voice Pitch 2 / Crystal Pitch" },
+  { number = 90, name = "Voice Pitch 1" },
+  { number = 91, name = "Voice 3 Interval" },
+  { number = 92, name = "Voice 4 Interval" },
+  { number = 93, name = "Delay Feedback 1 / Reverb Decay Time" },
+  { number = 94, name = "Infinity Feedback" },
+  { number = 95, name = "Infinity" },
+  { number = 96, name = "Feedback 2/Serial / Reverb Low Boost / Echo Reverb Feedback / Ionosphere Buildup" },
+  { number = 97, name = "Delay Feedback Sync" },
+  { number = 98, name = "Delay Low Cut / Reverb Low Decay/Damp" },
+  { number = 99, name = "Delay High Cut / Reverb High Decay/Damp / Fuzz True Impedance" },
+  { number = 100, name = "Delay Cut More / Equalizer Steep High / Full OC HP/LP / Effect Loop (Stage)" },
+  { number = 101, name = "Modulation (delay/reverb)" },
+  { number = 102, name = "Delay Chorus" },
+  { number = 103, name = "Delay Flutter Intensity / Reverb Modulation" },
+  { number = 104, name = "Delay Flutter Rate / Reverb Early Diffusion / Spring Dripstone" },
+  { number = 105, name = "Delay Grit / Reverb Brass / Spring Distortion (Dwell)" },
+  { number = 106, name = "Reverse Mix" },
+  { number = 107, name = "Input Swell" },
+  { number = 108, name = "Smear" },
+  { number = 109, name = "Ducking Pre/Post" },
+]
+
+# Non-effect parameter maps, keyed by page. Each entry is (page, number, name).
+non_effect_params = [
+  # Rig Settings (0x04)
+  { page = 0x04, number = 0,  name = "Tempo bpm" },
+  { page = 0x04, number = 1,  name = "Rig Volume" },
+  { page = 0x04, number = 2,  name = "Tempo Enable" },
+  { page = 0x04, number = 3,  name = "Panorama" },
+  { page = 0x04, number = 4,  name = "Transpose" },
+  { page = 0x04, number = 64, name = "Stomps Section On/Off" },
+  { page = 0x04, number = 65, name = "Stack Section On/Off" },
+  { page = 0x04, number = 66, name = "Effects Section On/Off" },
+  { page = 0x04, number = 68, name = "Volume Pedal Location" },
+  { page = 0x04, number = 69, name = "Volume Pedal Range" },
+  { page = 0x04, number = 71, name = "Parallel Path Enable" },
+  { page = 0x04, number = 72, name = "Parallel Path Mix" },
+  { page = 0x04, number = 73, name = "Rig Spillover Off" },
+  { page = 0x04, number = 74, name = "DLY+REV Routing" },
+  # Fixed FX (0x05, PySwitch). Numbers step by 5; only the on/off member known.
+  { page = 0x05, number = 1,  name = "Fixed Transpose On/Off" },
+  { page = 0x05, number = 6,  name = "Fixed Noise Gate On/Off" },
+  { page = 0x05, number = 11, name = "Fixed Compressor On/Off" },
+  { page = 0x05, number = 16, name = "Fixed Boost On/Off" },
+  { page = 0x05, number = 21, name = "Fixed Wah On/Off" },
+  { page = 0x05, number = 26, name = "Fixed Vintage Chorus On/Off" },
+  { page = 0x05, number = 36, name = "Fixed Air Chorus On/Off" },
+  { page = 0x05, number = 41, name = "Fixed Double Tracker On/Off" },
+  # Input Section (0x09)
+  { page = 0x09, number = 3, name = "Noise Gate Intensity" },
+  { page = 0x09, number = 4, name = "Clean Sense" },
+  { page = 0x09, number = 5, name = "Distortion Sense" },
+  # Amplifier (0x0A)
+  { page = 0x0A, number = 0,  name = "Amp Model" },
+  { page = 0x0A, number = 2,  name = "On/Off" },
+  { page = 0x0A, number = 3,  name = "Amp Volume" },
+  { page = 0x0A, number = 4,  name = "Gain" },
+  { page = 0x0A, number = 5,  name = "Clean Compensation" },
+  { page = 0x0A, number = 6,  name = "Definition" },
+  { page = 0x0A, number = 7,  name = "Clarity" },
+  { page = 0x0A, number = 8,  name = "Power Sagging" },
+  { page = 0x0A, number = 9,  name = "Pick" },
+  { page = 0x0A, number = 10, name = "Compressor" },
+  { page = 0x0A, number = 11, name = "Tube Shape" },
+  { page = 0x0A, number = 12, name = "Tube Bias" },
+  { page = 0x0A, number = 15, name = "Direct Mix" },
+  { page = 0x0A, number = 21, name = "Bright Cap Intensity" },
+  # Amplifier EQ (0x0B)
+  { page = 0x0B, number = 4, name = "Bass" },
+  { page = 0x0B, number = 5, name = "Middle" },
+  { page = 0x0B, number = 6, name = "Treble" },
+  { page = 0x0B, number = 7, name = "Presence" },
+  { page = 0x0B, number = 8, name = "Position Pre/Post" },
+  # Cabinet (0x0C)
+  { page = 0x0C, number = 2,  name = "On/Off" },
+  { page = 0x0C, number = 4,  name = "High Shift" },
+  { page = 0x0C, number = 5,  name = "Low Shift" },
+  { page = 0x0C, number = 6,  name = "Character" },
+  { page = 0x0C, number = 7,  name = "Pure Cabinet" },
+  { page = 0x0C, number = 8,  name = "Kone Imprint Select" },
+  { page = 0x0C, number = 9,  name = "Low Cut" },
+  { page = 0x0C, number = 10, name = "High Cut" },
+  # Realtime / Meters (0x7C). Meter identities from observed experimentation.
+  { page = 0x7C, number = 0,  name = "Tempo/Beat Pulse" },
+  { page = 0x7C, number = 15, name = "Tuner Deviance" },
+  { page = 0x7C, number = 78, name = "Tuner Strobe Segment (phase-low)" },
+  { page = 0x7C, number = 79, name = "Tuner Strobe Segment (phase-mid)" },
+  { page = 0x7C, number = 80, name = "Tuner Strobe Segment (phase-high)" },
+  { page = 0x7C, number = 81, name = "Tuner Strobe Phase" },
+  { page = 0x7C, number = 82, name = "Meter: Stack Level (pre-vol)" },
+  { page = 0x7C, number = 83, name = "Meter: Stack Power" },
+  { page = 0x7C, number = 84, name = "Meter: Rig Output Level" },
+  { page = 0x7C, number = 85, name = "Meter: Rig Output Power" },
+  { page = 0x7C, number = 86, name = "Meter: (unused v8)" },
+  { page = 0x7C, number = 87, name = "Meter: Loudness (RMS)" },
+  { page = 0x7C, number = 88, name = "Meter: (unused v10)" },
+  # Looper / Freeze (0x7D)
+  { page = 0x7D, number = 84,  name = "Tuner Note" },
+  { page = 0x7D, number = 88,  name = "Looper Record/Playback/Overdub" },
+  { page = 0x7D, number = 89,  name = "Looper Stop" },
+  { page = 0x7D, number = 90,  name = "Looper Trigger" },
+  { page = 0x7D, number = 91,  name = "Looper Reverse" },
+  { page = 0x7D, number = 92,  name = "Looper Half Speed" },
+  { page = 0x7D, number = 93,  name = "Looper Cancel/Reactivate Overdub" },
+  { page = 0x7D, number = 94,  name = "Looper Erase Loop" },
+  { page = 0x7D, number = 107, name = "Module A Freeze" },
+  { page = 0x7D, number = 108, name = "Module B Freeze" },
+  { page = 0x7D, number = 109, name = "Module C Freeze" },
+  { page = 0x7D, number = 110, name = "Module D Freeze" },
+  { page = 0x7D, number = 111, name = "Module X Freeze" },
+  { page = 0x7D, number = 113, name = "Module MOD Freeze" },
+  { page = 0x7D, number = 114, name = "Module DLY Freeze" },
+  { page = 0x7D, number = 115, name = "Module REV Freeze" },
+  # System / Global (0x7F)
+  { page = 0x7F, number = 0,   name = "Main Output Volume" },
+  { page = 0x7F, number = 1,   name = "Headphone Output Volume" },
+  { page = 0x7F, number = 2,   name = "Monitor Output Volume" },
+  { page = 0x7F, number = 3,   name = "Direct Output / Send 1 Volume" },
+  { page = 0x7F, number = 4,   name = "S/PDIF Output Volume" },
+  { page = 0x7F, number = 8,   name = "Monitor Cab. Off" },
+  { page = 0x7F, number = 12,  name = "Main Output EQ Bass" },
+  { page = 0x7F, number = 13,  name = "Main Output EQ Middle" },
+  { page = 0x7F, number = 14,  name = "Main Output EQ Treble" },
+  { page = 0x7F, number = 15,  name = "Main Output EQ Presence" },
+  { page = 0x7F, number = 16,  name = "Output Filter Low Cut" },
+  { page = 0x7F, number = 17,  name = "Monitor Output EQ Bass" },
+  { page = 0x7F, number = 18,  name = "Monitor Output EQ Middle" },
+  { page = 0x7F, number = 19,  name = "Monitor Output EQ Treble" },
+  { page = 0x7F, number = 20,  name = "Monitor Output EQ Presence" },
+  { page = 0x7F, number = 21,  name = "Output Filter High Cut" },
+  { page = 0x7F, number = 32,  name = "Aux In >Main" },
+  { page = 0x7F, number = 33,  name = "Aux In >Monitor" },
+  { page = 0x7F, number = 34,  name = "Aux In >Headphone" },
+  { page = 0x7F, number = 36,  name = "Space Intensity" },
+  { page = 0x7F, number = 37,  name = "Space Routing" },
+  { page = 0x7F, number = 38,  name = "Kone Mode" },
+  { page = 0x7F, number = 39,  name = "Kone Bass Boost" },
+  { page = 0x7F, number = 40,  name = "Kone Imprint Select" },
+  { page = 0x7F, number = 41,  name = "Kone Directivity" },
+  { page = 0x7F, number = 42,  name = "Kone Sweetening" },
+  { page = 0x7F, number = 44,  name = "Input Source" },
+  { page = 0x7F, number = 50,  name = "Pure Cabinet Enable" },
+  { page = 0x7F, number = 51,  name = "Pure Cabinet Level (Global)" },
+  { page = 0x7F, number = 52,  name = "Looper Volume" },
+  { page = 0x7F, number = 53,  name = "Looper Location" },
+  { page = 0x7F, number = 59,  name = "Aux >Mono" },
+  { page = 0x7F, number = 126, name = "Tuner Mode State" },
+]
+
+# Range-based parameter names (expanded into non_effect_params by the generator).
+param_ranges = [
+  { page = 0x76, start = 0,  end = 11, name = "User Scale 1 Step" },
+  { page = 0x76, start = 12, end = 23, name = "User Scale 2 Step" },
+]
+
+# Page-0 string tags (function $03 / $43), Appendix C.
+string_tags = [
+  { number = 1,  name = "Rig Name" },
+  { number = 2,  name = "Rig Author" },
+  { number = 3,  name = "Rig Creation Date" },
+  { number = 4,  name = "Rig Comment" },
+  { number = 10, name = "Amp Name" },
+  { number = 11, name = "Amp Author" },
+  { number = 14, name = "Amp Location" },
+  { number = 15, name = "Amp Manufacturer" },
+  { number = 16, name = "Amp Comment" },
+  { number = 18, name = "Amp Model" },
+  { number = 19, name = "Amp Channel" },
+  { number = 20, name = "Pickup Type" },
+  { number = 21, name = "Year of Production" },
+  { number = 32, name = "Cabinet Name" },
+  { number = 33, name = "Cabinet Author" },
+  { number = 36, name = "Cabinet Location" },
+  { number = 37, name = "Cabinet Manufacturer" },
+  { number = 38, name = "Microphone Model" },
+  { number = 39, name = "Cabinet Comment" },
+  { number = 40, name = "Microphone Position" },
+  { number = 41, name = "Speaker Configuration" },
+  { number = 42, name = "Cabinet Model" },
+  { number = 44, name = "Speaker Manufacturer" },
+  { number = 45, name = "Speaker Model" },
+]
+
+# Page 0 is dual-use: numeric params (function $01 / $41) instead of string tags.
+page0_numeric = [
+  { number = 0x0B, name = "Morph State" },  # PySwitch
+]
+
+# Common effect-slot parameter numbers (within any effect page).
+[effect_param_numbers]
+type = 0     # effect Type (value → effect-types.toml)
+state = 3    # On/Off (1 = on, 0 = off)
+mix = 4      # dry/wet Mix (0–16383)
+volume = 6   # Volume
+
+# Well-known addresses referenced by the DeviceModel decode/sync logic. These
+# name the constants each implementation's state layer keys on.
+[well_known]
+page_strings = 0x00
+string_rig_name = 0x01
+page_realtime = 0x7C
+meter_block_number = 0x4E     # first NRPN number of the 11-value status block
+beat_pulse_number = 0x00
+tuner_deviance_number = 0x0F
+page_rig_settings = 0x04
+tempo_number = 0x00
+tempo_bpm_scale = 64          # wire value = bpm * 64
+rig_volume_number = 0x01
+amp_page = 0x0A
+amp_on_number = 0x02
+gain_number = 0x04
+system_page = 0x7F
+main_volume_number = 0x00
+monitor_volume_number = 0x02
+page_morph = 0x00
+morph_number = 0x0B
+page_tuner_note = 0x7D
+tuner_note_number = 0x54
+tuner_in_tune_center = 8192
+tuner_in_tune_window = 350
+meter_count = 11
