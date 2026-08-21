@@ -104,6 +104,20 @@ def _short_label(label: str) -> str:
     return label.replace("_", " ")
 
 
+#: Width of the meters table's label column. Derived from the widest label the
+#: table can ever show — the ``--all`` set carries a ``vN`` prefix, so a fixed
+#: guess that fits the bar rows wraps the raw ones onto a second line.
+LABEL_WIDTH = max(len(_short_label(label)) for label, _ident in ALL_ROWS)
+
+#: Columns a meter row spends on everything except the bar itself: the label
+#: column, the 6-column value, the 17-column ``range …`` readout, the bar's two
+#: brackets, the three single-space gaps the grid puts between the four
+#: columns, and the panel's border plus horizontal padding. One extra column is
+#: left spare so a full-scale bar never reaches the right edge — Rich crops an
+#: over-wide cell with an ellipsis rather than wrapping it.
+METER_ROW_CHROME = LABEL_WIDTH + 6 + 17 + 2 + 3 + 4 + 1
+
+
 # --- the run loop ------------------------------------------------------------
 
 
@@ -290,7 +304,7 @@ def _build_app_class():
         # -- panel builders (pure over view + snapshot) --------------------
 
         def _bar_width(self) -> int:
-            return min(max(self.size.width - 34, 12), 72)
+            return min(max(self.size.width - METER_ROW_CHROME, 12), 72)
 
         def _rig(self, app: MetersApp) -> Group:
             state: DeviceState = self.view.snapshot
@@ -397,7 +411,7 @@ def _build_app_class():
             width = self._bar_width()
             rows = ALL_ROWS if view.show_all else BAR_ROWS
             table = Table.grid(padding=(0, 1))
-            table.add_column(justify="left", style="grey50", width=16)
+            table.add_column(justify="left", style="grey50", width=LABEL_WIDTH)
             table.add_column()
             table.add_column(justify="right", width=6)
             table.add_column(justify="left", style="grey37")

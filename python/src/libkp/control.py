@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Any, ClassVar
 
 from . import _generated as gen
+from .errors import UnknownSlotError
 from .nrpn import control_change, program_change
 
 __all__ = [
@@ -212,13 +213,18 @@ class ModuleSlot(str, Enum):
 
     @classmethod
     def parse(cls, name: str | ModuleSlot) -> ModuleSlot:
-        """Resolve a slot name case-insensitively (``"rev"``, ``"Dly"``, …)."""
+        """Resolve a slot name case-insensitively (``"rev"``, ``"Dly"``, …).
+
+        Raises :class:`~libkp.errors.UnknownSlotError` — a
+        :class:`~libkp.errors.LibKPError` — for a name outside the eight slots,
+        matching what :meth:`libkp.model.DeviceModel.set_effect_enabled` raises.
+        """
         if isinstance(name, cls):
             return name
         try:
             return cls(str(name).upper())
-        except ValueError as exc:  # pragma: no cover - defensive
-            raise ValueError(f"unknown effect slot {name!r}") from exc
+        except ValueError as exc:
+            raise UnknownSlotError(str(name)) from exc
 
 
 def slot_enable_cc(slot: str | ModuleSlot) -> int:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
 import sys
 
@@ -184,6 +185,24 @@ def test_render_shows_the_patch_header_blocks_and_bars():
     for label, _ident in meters.BAR_ROWS:
         assert label in text
     assert "last param:" in text
+
+
+@pytest.mark.parametrize("columns", [72, 80, 100, 120, 160])
+def test_default_width_keeps_every_row_inside_the_terminal(monkeypatch, columns):
+    """The default bar width must leave the right margin clear.
+
+    A meter row is ``LABEL_WIDTH + ROW_CHROME`` columns wide before the bar, so
+    an over-generous default makes every row wrap and the full-screen frame
+    tears apart.
+    """
+    monkeypatch.setattr(meters.os, "get_terminal_size", lambda *_a: os.terminal_size((columns, 40)))
+    view = meters.MeterView(ip="127.0.0.1", width=meters._default_width(), show_all=True)
+    view.on_event(Status(status([gen.FULL_SCALE] * gen.METER_COUNT)))
+
+    frame = plain(meters.render(view, DeviceState()))
+    rows = [line for line in frame.split("\n") if "range" in line]
+    assert len(rows) == gen.METER_COUNT
+    assert max(len(row) for row in rows) < columns
 
 
 def test_render_all_shows_every_raw_field():
