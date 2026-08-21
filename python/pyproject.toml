@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "libkp"
+version = "0.1.0"
+description = "Kemper Profiler network protocol: discovery, session, MIDI3/SysEx, control, and an observable device model."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Aaron Gotwalt" }]
+keywords = ["kemper", "midi", "profiler", "protocol"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+libkp-meters = "libkp.examples.meters:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/libkp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
