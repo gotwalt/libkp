@@ -87,16 +87,18 @@ public final class Session: @unchecked Sendable {
     /// Bring the connection to `.ready`, or throw.
     private func start(timeout: TimeInterval) async throws {
         let gate = ResumeOnce()
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
             connection.stateUpdateHandler = { [peer] state in
                 switch state {
                 case .ready:
                     gate.finish { continuation.resume() }
                 case let .failed(error):
                     gate.finish {
-                        continuation.resume(throwing: SessionError.connect(
-                            address: peer, detail: error.localizedDescription
-                        ))
+                        continuation.resume(
+                            throwing: SessionError.connect(
+                                address: peer, detail: error.localizedDescription
+                            ))
                     }
                 case .cancelled:
                     gate.finish { continuation.resume(throwing: SessionError.closed) }
@@ -107,9 +109,10 @@ public final class Session: @unchecked Sendable {
             connection.start(queue: queue)
             queue.asyncAfter(deadline: .now() + timeout) { [peer] in
                 gate.finish {
-                    continuation.resume(throwing: SessionError.timeout(
-                        phase: "connect", ms: UInt64(timeout * 1000)
-                    ))
+                    continuation.resume(
+                        throwing: SessionError.timeout(
+                            phase: "connect", ms: UInt64(timeout * 1000)
+                        ))
                 }
                 _ = peer
             }
@@ -127,7 +130,8 @@ public final class Session: @unchecked Sendable {
 
     /// Continuously drain the socket into the inbox.
     private func pump() {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) {
+            [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty { self.inbox.push([UInt8](data)) }
             if let error {
@@ -175,16 +179,20 @@ public final class Session: @unchecked Sendable {
     /// Write all `data` to the device.
     public func writeAll(_ data: [UInt8]) async throws {
         guard !data.isEmpty else { return }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: Data(data), completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: SessionError.io(
-                        phase: "write", detail: error.localizedDescription
-                    ))
-                } else {
-                    continuation.resume()
-                }
-            })
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(
+                content: Data(data),
+                completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(
+                            throwing: SessionError.io(
+                                phase: "write", detail: error.localizedDescription
+                            ))
+                    } else {
+                        continuation.resume()
+                    }
+                })
         }
     }
 
@@ -215,15 +223,17 @@ public final class Session: @unchecked Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw SessionError.protocolRejected(name: name, detail: detail)
         }
-        return response // '+' accept, or unknown — hand back for inspection.
+        return response  // '+' accept, or unknown — hand back for inspection.
     }
 
     /// Full handshake: read the greeting, pick the first `preferred` protocol
     /// the device offers (falling back to its first offered), and select it.
-    public func handshake(preferred: [String], idle: TimeInterval) async throws -> HandshakeOutcome {
+    public func handshake(preferred: [String], idle: TimeInterval) async throws -> HandshakeOutcome
+    {
         let greeting = try await readAvailable(idle: idle, max: 256)
         let offered = Session.parseProtocolList(greeting)
-        guard let selected = preferred.first(where: { offered.contains($0) }) ?? offered.first else {
+        guard let selected = preferred.first(where: { offered.contains($0) }) ?? offered.first
+        else {
             throw SessionError.noProtocolOffered
         }
         let response = try await selectProtocol(selected, idle: idle)

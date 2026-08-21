@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use libkp::control::{Control, ModuleSlot};
-use libkp::midi3::{frame, Unframer};
+use libkp::midi3::{Unframer, frame};
 use libkp::model::RealtimeStatus;
 use libkp::nrpn::{self, NrpnHeader};
 use libkp::params;
-use libkp::protocol::{build_poll_request, TagStream};
+use libkp::protocol::{TagStream, build_poll_request};
 use libkp::state::DeviceState;
-use libkp::{generated, PORT};
+use libkp::{PORT, generated};
 
 // ---------------------------------------------------------------------------
 // helpers

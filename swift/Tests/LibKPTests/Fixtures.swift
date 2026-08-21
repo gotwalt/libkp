@@ -5,10 +5,10 @@ import XCTest
 /// `swift/Tests/LibKPTests/Fixtures.swift` → up four levels is the repo root.
 enum Fixtures {
     static let repoRoot: URL = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent() // LibKPTests
-        .deletingLastPathComponent() // Tests
-        .deletingLastPathComponent() // swift
-        .deletingLastPathComponent() // <repo root>
+        .deletingLastPathComponent()  // LibKPTests
+        .deletingLastPathComponent()  // Tests
+        .deletingLastPathComponent()  // swift
+        .deletingLastPathComponent()  // <repo root>
 
     static var vectorsDirectory: URL { repoRoot.appendingPathComponent("spec/vectors") }
     static var capturesDirectory: URL { repoRoot.appendingPathComponent("spec/captures") }
@@ -48,7 +48,8 @@ enum Fixtures {
 
 /// Accessors that fail loudly rather than silently skipping a case.
 extension Dictionary where Key == String, Value == Any {
-    func cases(_ key: String, file: StaticString = #filePath, line: UInt = #line) -> [[String: Any]] {
+    func cases(_ key: String, file: StaticString = #filePath, line: UInt = #line) -> [[String: Any]]
+    {
         guard let list = self[key] as? [[String: Any]] else {
             XCTFail("missing array \"\(key)\"", file: file, line: line)
             return []

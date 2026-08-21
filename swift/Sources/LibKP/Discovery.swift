@@ -56,7 +56,9 @@ public struct DiscoveryOptions: Sendable {
 public enum Discovery {
     /// Broadcast the discovery poll and gather replies until the listen window
     /// ends. Returns one reply per distinct source address (last payload wins).
-    public static func discover(_ options: DiscoveryOptions = DiscoveryOptions()) async throws -> [DiscoveryReply] {
+    public static func discover(
+        _ options: DiscoveryOptions = DiscoveryOptions()
+    ) async throws -> [DiscoveryReply] {
         let collector = ReplyCollector()
         let poll = KemperProtocol.buildPollRequest(mac: options.mac)
         let targets = broadcastTargets(extra: options.extraTargets)
@@ -106,7 +108,8 @@ public enum Discovery {
             connection.start(queue: discoveryQueue)
             connection.receiveMessage { data, _, _, _ in
                 if let data, !data.isEmpty {
-                    collector.record(host: endpointHost(connection.endpoint), payload: [UInt8](data))
+                    collector.record(
+                        host: endpointHost(connection.endpoint), payload: [UInt8](data))
                 }
                 connection.cancel()
             }
@@ -151,8 +154,10 @@ public enum Discovery {
         switch endpoint {
         case let .hostPort(host, _):
             switch host {
-            case let .ipv4(address): return "\(address)".components(separatedBy: "%").first ?? "\(address)"
-            case let .ipv6(address): return "\(address)".components(separatedBy: "%").first ?? "\(address)"
+            case let .ipv4(address):
+                return "\(address)".components(separatedBy: "%").first ?? "\(address)"
+            case let .ipv6(address):
+                return "\(address)".components(separatedBy: "%").first ?? "\(address)"
             case let .name(name, _): return name
             @unknown default: return "\(host)"
             }
@@ -187,8 +192,8 @@ public enum Discovery {
             let flags = Int32(entry.pointee.ifa_flags)
             guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
             guard let rawAddress = entry.pointee.ifa_addr,
-                  rawAddress.pointee.sa_family == UInt8(AF_INET),
-                  let rawMask = entry.pointee.ifa_netmask
+                rawAddress.pointee.sa_family == UInt8(AF_INET),
+                let rawMask = entry.pointee.ifa_netmask
             else { continue }
 
             let address = rawAddress.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {

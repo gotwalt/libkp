@@ -189,10 +189,11 @@ public actor DeviceModel {
     /// Set an arbitrary numeric parameter — the escape hatch behind every
     /// parameter setter below.
     public func setParam(page: UInt8, number: UInt8, value: UInt16) async throws {
-        try await send(Nrpn.setSingle(
-            product: DeviceModel.product, device: DeviceModel.device,
-            page: page, number: number, value: value
-        ))
+        try await send(
+            Nrpn.setSingle(
+                product: DeviceModel.product, device: DeviceModel.device,
+                page: page, number: number, value: value
+            ))
     }
 
     /// Set the amp Gain, 0–16383 (NRPN `0x0A/4`).
@@ -202,17 +203,20 @@ public actor DeviceModel {
 
     /// Set the Rig Volume, 0–16383 (NRPN `0x04/1`).
     public func setRigVolume(_ value: UInt16) async throws {
-        try await setParam(page: Generated.pageRigSettings, number: Generated.rigVolumeNumber, value: value)
+        try await setParam(
+            page: Generated.pageRigSettings, number: Generated.rigVolumeNumber, value: value)
     }
 
     /// Set the Main Output Volume, 0–16383 (NRPN `0x7F/0`).
     public func setMainVolume(_ value: UInt16) async throws {
-        try await setParam(page: Generated.systemPage, number: Generated.mainVolumeNumber, value: value)
+        try await setParam(
+            page: Generated.systemPage, number: Generated.mainVolumeNumber, value: value)
     }
 
     /// Set the Monitor Output Volume, 0–16383 (NRPN `0x7F/2`).
     public func setMonitorVolume(_ value: UInt16) async throws {
-        try await setParam(page: Generated.systemPage, number: Generated.monitorVolumeNumber, value: value)
+        try await setParam(
+            page: Generated.systemPage, number: Generated.monitorVolumeNumber, value: value)
     }
 
     /// Turn an effect slot on or off via a `$01` write to number 3.
@@ -232,7 +236,8 @@ public actor DeviceModel {
     public func setTempoBpm(_ bpm: UInt16) async throws {
         let scaled = UInt32(bpm) * UInt32(Generated.tempoBpmScale)
         let value = UInt16(min(scaled, UInt32(DeviceModel.nrpnMax)))
-        try await setParam(page: Generated.pageRigSettings, number: Generated.tempoNumber, value: value)
+        try await setParam(
+            page: Generated.pageRigSettings, number: Generated.tempoNumber, value: value)
     }
 
     // MARK: - Read-only requests
@@ -243,20 +248,23 @@ public actor DeviceModel {
     public func refreshRig() async throws {
         // Rig Name, Author, Comment, Date, Amp Name, Cabinet Name.
         for tag in [1, 2, 4, 3, 10, 32] as [UInt8] {
-            try await send(Nrpn.requestString(
-                product: DeviceModel.product, device: DeviceModel.device,
-                page: Generated.pageStrings, number: tag
-            ))
+            try await send(
+                Nrpn.requestString(
+                    product: DeviceModel.product, device: DeviceModel.device,
+                    page: Generated.pageStrings, number: tag
+                ))
         }
         for slot in Params.effectSlots {
-            try await send(Nrpn.requestSingle(
-                product: DeviceModel.product, device: DeviceModel.device,
-                page: slot.page, number: Generated.effectParamType
-            ))
-            try await send(Nrpn.requestSingle(
-                product: DeviceModel.product, device: DeviceModel.device,
-                page: slot.page, number: Generated.effectParamState
-            ))
+            try await send(
+                Nrpn.requestSingle(
+                    product: DeviceModel.product, device: DeviceModel.device,
+                    page: slot.page, number: Generated.effectParamType
+                ))
+            try await send(
+                Nrpn.requestSingle(
+                    product: DeviceModel.product, device: DeviceModel.device,
+                    page: slot.page, number: Generated.effectParamState
+                ))
         }
     }
 
@@ -264,17 +272,19 @@ public actor DeviceModel {
     /// device answers with a `$01` message on the same stream, which the ingest
     /// loop folds into the snapshot. Read-only.
     public func requestParam(page: UInt8, number: UInt8) async throws {
-        try await send(Nrpn.requestSingle(
-            product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
-        ))
+        try await send(
+            Nrpn.requestSingle(
+                product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
+            ))
     }
 
     /// Request one string parameter (function `$43`), e.g. a page-0 string tag.
     /// Read-only.
     public func requestString(page: UInt8 = Generated.pageStrings, number: UInt8) async throws {
-        try await send(Nrpn.requestString(
-            product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
-        ))
+        try await send(
+            Nrpn.requestString(
+                product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
+            ))
     }
 
     /// Request a parameter value rendered to its exact display text (function
@@ -285,18 +295,22 @@ public actor DeviceModel {
     /// immediately. Watch ``events()`` for the matching
     /// ``DeviceEvent/renderedString(page:number:value:text:)``.
     public func requestRender(page: UInt8, number: UInt8, value: UInt16) async throws {
-        try await send(Nrpn.requestRenderedString(
-            product: DeviceModel.product, device: DeviceModel.device,
-            page: page, number: number, value: value
-        ))
+        try await send(
+            Nrpn.requestRenderedString(
+                product: DeviceModel.product, device: DeviceModel.device,
+                page: page, number: number, value: value
+            ))
     }
 
     /// Send the bidirectional beacon so the device starts streaming its selected
     /// parameter set. Re-send within half the lease to keep it alive.
-    public func sendBeacon(init isInit: Bool = true, tuner: Bool = true, leaseSecs: UInt8 = 30) async throws {
-        try await send(Nrpn.beacon(
-            init: isInit, tuner: tuner, leaseSecs: leaseSecs, product: DeviceModel.product
-        ))
+    public func sendBeacon(
+        init isInit: Bool = true, tuner: Bool = true, leaseSecs: UInt8 = 30
+    ) async throws {
+        try await send(
+            Nrpn.beacon(
+                init: isInit, tuner: tuner, leaseSecs: leaseSecs, product: DeviceModel.product
+            ))
     }
 
     // MARK: - Actions (CC, momentary, NOT stored in state)
@@ -321,15 +335,21 @@ public actor DeviceModel {
     /// Open (`true`) or close (`false`) the tuner (CC31).
     public func tunerMode(_ open: Bool) async throws { try await send(control: .tunerMode(open)) }
     /// Morph button (CC80): `rise` climbs to the morph target, else falls back.
-    public func morphButton(_ rise: Bool) async throws { try await send(control: .morphButton(rise)) }
+    public func morphButton(_ rise: Bool) async throws {
+        try await send(control: .morphButton(rise))
+    }
     /// Set the morph pedal position 0–127 (CC11).
-    public func morphPedal(_ value: UInt8) async throws { try await send(control: .morphPedal(value)) }
+    public func morphPedal(_ value: UInt8) async throws {
+        try await send(control: .morphPedal(value))
+    }
     /// Delay + Reverb Freeze (CC35).
     public func freeze(_ on: Bool) async throws { try await send(control: .freeze(on)) }
     /// Rotary speaker speed (CC33): `fast` or slow.
     public func rotaryFast(_ fast: Bool) async throws { try await send(control: .rotaryFast(fast)) }
     /// Delay Infinity (CC34).
-    public func delayInfinity(_ on: Bool) async throws { try await send(control: .delayInfinity(on)) }
+    public func delayInfinity(_ on: Bool) async throws {
+        try await send(control: .delayInfinity(on))
+    }
     /// Toggle every module A–REV on/off (CC16).
     public func toggleAllModules() async throws { try await send(control: .toggleAllModules) }
     /// Press Effect Button `n` (I–IIII, clamped to 1...4; CC75–78).
@@ -337,9 +357,13 @@ public actor DeviceModel {
     /// Set the wah pedal position 0–127 (CC1).
     public func wahPedal(_ value: UInt8) async throws { try await send(control: .wahPedal(value)) }
     /// Set the pitch pedal position 0–127 (CC4).
-    public func pitchPedal(_ value: UInt8) async throws { try await send(control: .pitchPedal(value)) }
+    public func pitchPedal(_ value: UInt8) async throws {
+        try await send(control: .pitchPedal(value))
+    }
     /// Set the volume pedal position 0–127 (CC7).
-    public func volumePedal(_ value: UInt8) async throws { try await send(control: .volumePedal(value)) }
+    public func volumePedal(_ value: UInt8) async throws {
+        try await send(control: .volumePedal(value))
+    }
     /// Set the panorama 0–127 (CC10).
     public func panorama(_ value: UInt8) async throws { try await send(control: .panorama(value)) }
 

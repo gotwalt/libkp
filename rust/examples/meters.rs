@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use crossterm::{execute, ExecutableCommand};
+use crossterm::{ExecutableCommand, execute};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -42,7 +42,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use libkp::generated;
 use libkp::model::{DeviceEvent, DeviceModel, RealtimeStatus};
 use libkp::state::DeviceState;
-use libkp::{params, PORT};
+use libkp::{PORT, params};
 
 /// Number of values in the realtime status block.
 const N: usize = generated::METER_COUNT;
@@ -423,7 +423,10 @@ impl View {
             meta.push(Span::raw("   "));
         }
         if let Some(bpm) = rig.tempo_bpm {
-            meta.push(Span::styled(format!("{bpm} BPM"), Style::default().fg(Color::Yellow)));
+            meta.push(Span::styled(
+                format!("{bpm} BPM"),
+                Style::default().fg(Color::Yellow),
+            ));
             meta.push(Span::raw("   "));
         }
         if let Some(m) = self.snapshot.morph {
@@ -497,10 +500,7 @@ impl View {
         ]);
 
         let block = Self::panel("SIGNAL CHAIN");
-        f.render_widget(
-            Paragraph::new(vec![amp_line, cab_line]).block(block),
-            area,
-        );
+        f.render_widget(Paragraph::new(vec![amp_line, cab_line]).block(block), area);
     }
 
     /// The eight effect blocks as a responsive grid: two rows of four compact
@@ -562,16 +562,8 @@ impl View {
 
         let verdict = self.verdict(strobe_rate);
         let (glyph, vstyle, marker_style) = match verdict {
-            Verdict::Idle => (
-                "idle",
-                Style::default().dim(),
-                Style::default().dim(),
-            ),
-            Verdict::Unknown => (
-                "…",
-                Style::default().dim(),
-                Style::default().dim(),
-            ),
+            Verdict::Idle => ("idle", Style::default().dim(), Style::default().dim()),
+            Verdict::Unknown => ("…", Style::default().dim(), Style::default().dim()),
             Verdict::InTune => (
                 "● in tune",
                 Style::default().fg(Color::Green).bold(),

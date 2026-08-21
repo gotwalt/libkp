@@ -22,7 +22,9 @@ public enum ModuleSlot: String, CaseIterable, Sendable, Hashable {
     /// Resolve a slot name case-insensitively (`"a"`, `"REV"`, `"dly"`…).
     public init?(name: String) {
         let upper = name.uppercased()
-        guard let match = ModuleSlot.allCases.first(where: { $0.rawValue == upper }) else { return nil }
+        guard let match = ModuleSlot.allCases.first(where: { $0.rawValue == upper }) else {
+            return nil
+        }
         self = match
     }
 

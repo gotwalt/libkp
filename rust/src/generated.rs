@@ -1,5 +1,6 @@
 //! GENERATED FILE — DO NOT EDIT. Edit spec/*.toml and run codegen/generate.py.
 #![allow(clippy::all)]
+#![cfg_attr(rustfmt, rustfmt::skip)]
 
 pub const SPEC_VERSION: &str = "0.1.0";
 

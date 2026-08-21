@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::time::{timeout, Instant};
+use tokio::time::{Instant, timeout};
 
 use crate::error::DiscoverError;
 use crate::generated;
-use crate::protocol::{build_poll_request, TagStream, DISCOVERY_PORT};
+use crate::protocol::{DISCOVERY_PORT, TagStream, build_poll_request};
 
 /// One raw reply from a candidate device.
 #[derive(Debug, Clone)]

@@ -8,10 +8,10 @@ import XCTest
 final class ProtocolTests: XCTestCase {
     func testPollRequestBytes() {
         let expected: [UInt8] = [
-            0x44, 0x53, 0x43, 0x56, // DSCV
+            0x44, 0x53, 0x43, 0x56,  // DSCV
             0x16, 0x4D, 0x41, 0x43, 0x23, 0x30, 0x30, 0x3A, 0x30, 0x30, 0x3A, 0x30,
-            0x30, 0x3A, 0x30, 0x30, 0x3A, 0x30, 0x30, 0x3A, 0x30, 0x30, // "MAC#00:…"
-            0x07, 0x50, 0x4F, 0x4C, 0x4C, 0x3A, 0x29, // "POLL:)"
+            0x30, 0x3A, 0x30, 0x30, 0x3A, 0x30, 0x30, 0x3A, 0x30, 0x30,  // "MAC#00:…"
+            0x07, 0x50, 0x4F, 0x4C, 0x4C, 0x3A, 0x29,  // "POLL:)"
             0x00,
         ]
         let built = KemperProtocol.buildPollRequest(mac: "00:00:00:00:00:00")
@@ -73,10 +73,12 @@ final class Midi3Tests: XCTestCase {
         var unframer = Midi3.Unframer()
         let messages = unframer.push(raw)
         XCTAssertEqual(messages.count, 1)
-        XCTAssertEqual(messages[0], [
-            0xF0, 0x00, 0x20, 0x33, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00,
-            0x06, 0x20, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0xF7,
-        ])
+        XCTAssertEqual(
+            messages[0],
+            [
+                0xF0, 0x00, 0x20, 0x33, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00,
+                0x06, 0x20, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0xF7,
+            ])
         XCTAssertTrue(Midi3.isKemperSysEx(messages[0]))
         XCTAssertEqual(unframer.pending, 0)
     }
@@ -120,11 +122,14 @@ final class Midi3Tests: XCTestCase {
 final class NrpnTests: XCTestCase {
     func testInitBeacon() {
         // init=1, sysex=1, tuner=1 → flags 0x23; lease 30 s → 15 (0x0F).
-        let beacon = Nrpn.beacon(init: true, tuner: true, leaseSecs: 30, paramSet: 0x02,
-                                 product: Generated.productPlayer)
-        XCTAssertEqual(beacon, [
-            0xF0, 0x00, 0x20, 0x33, 0x02, 0x7F, 0x7E, 0x00, 0x40, 0x02, 0x23, 0x0F, 0xF7,
-        ])
+        let beacon = Nrpn.beacon(
+            init: true, tuner: true, leaseSecs: 30, paramSet: 0x02,
+            product: Generated.productPlayer)
+        XCTAssertEqual(
+            beacon,
+            [
+                0xF0, 0x00, 0x20, 0x33, 0x02, 0x7F, 0x7E, 0x00, 0x40, 0x02, 0x23, 0x0F, 0xF7,
+            ])
     }
 
     func testBuildsRigNameRequest() {
@@ -143,9 +148,11 @@ final class NrpnTests: XCTestCase {
 
     func testBuildsEffectStateSet() {
         let on = Nrpn.setSingle(product: 0x00, device: 0x7F, page: 0x3D, number: 0x03, value: 1)
-        XCTAssertEqual(on, [
-            0xF0, 0x00, 0x20, 0x33, 0x00, 0x7F, 0x01, 0x00, 0x3D, 0x03, 0x00, 0x01, 0xF7,
-        ])
+        XCTAssertEqual(
+            on,
+            [
+                0xF0, 0x00, 0x20, 0x33, 0x00, 0x7F, 0x01, 0x00, 0x3D, 0x03, 0x00, 0x01, 0xF7,
+            ])
         let off = Nrpn.setSingle(product: 0x00, device: 0x7F, page: 0x3D, number: 0x03, value: 0)
         XCTAssertEqual(Array(off[10..<12]), [0x00, 0x00])
     }
@@ -171,9 +178,11 @@ final class NrpnTests: XCTestCase {
         let message = Nrpn.requestRenderedString(
             product: 0x02, device: 0x7F, page: 0x3C, number: 53, value: 8192
         )
-        XCTAssertEqual(message, [
-            0xF0, 0x00, 0x20, 0x33, 0x02, 0x7F, 0x7C, 0x00, 0x3C, 53, 0x40, 0x00, 0xF7,
-        ])
+        XCTAssertEqual(
+            message,
+            [
+                0xF0, 0x00, 0x20, 0x33, 0x02, 0x7F, 0x7C, 0x00, 0x3C, 53, 0x40, 0x00, 0xF7,
+            ])
     }
 
     func testParsesRenderedStringReply() {
@@ -246,9 +255,10 @@ final class NrpnTests: XCTestCase {
         XCTAssertEqual(parsedAmp?.text, "JCM800")
 
         // A wrong function is rejected.
-        XCTAssertNil(Nrpn.parseExtendedString(
-            Nrpn.setSingle(product: 0x00, device: 0x7F, page: 0x00, number: 0x01, value: 1)
-        ))
+        XCTAssertNil(
+            Nrpn.parseExtendedString(
+                Nrpn.setSingle(product: 0x00, device: 0x7F, page: 0x00, number: 0x01, value: 1)
+            ))
     }
 
     func testParsesStatusHeader() {
@@ -358,7 +368,8 @@ final class ControlTests: XCTestCase {
 final class ParamsTests: XCTestCase {
     func testKnownAddresses() {
         XCTAssertEqual(Params.paramName(page: 0x09, number: 0x03), "Noise Gate Intensity")
-        XCTAssertEqual(Params.describe(page: 0x09, number: 0x03), "Input Section: Noise Gate Intensity")
+        XCTAssertEqual(
+            Params.describe(page: 0x09, number: 0x03), "Input Section: Noise Gate Intensity")
         XCTAssertEqual(Params.paramName(page: 0x04, number: 0), "Tempo bpm")
         XCTAssertEqual(Params.paramName(page: 0x0A, number: 4), "Gain")
         XCTAssertEqual(Params.paramName(page: 0x7F, number: 0), "Main Output Volume")
@@ -385,7 +396,8 @@ final class ParamsTests: XCTestCase {
 
     func testRealtimePageAddresses() {
         XCTAssertEqual(Params.pageName(0x7C), "Realtime/Meters")
-        XCTAssertEqual(Params.paramName(page: 0x7C, number: 0x4E), "Tuner Strobe Segment (phase-low)")
+        XCTAssertEqual(
+            Params.paramName(page: 0x7C, number: 0x4E), "Tuner Strobe Segment (phase-low)")
         XCTAssertEqual(Params.paramName(page: 0x7C, number: 81), "Tuner Strobe Phase")
         XCTAssertEqual(Params.paramName(page: 0x7C, number: 84), "Meter: Rig Output Level")
         XCTAssertEqual(Params.paramName(page: 0x7C, number: 88), "Meter: (unused v10)")
@@ -549,45 +561,54 @@ final class StateTests: XCTestCase {
         XCTAssertTrue(authorOutcome.slowChanged)
         XCTAssertEqual(authorOutcome.events, [.stringTag(number: 2)])
 
-        state.apply(Nrpn.sysex(
-            product: 0x00, device: 0x7F, function: Generated.fnStringParam,
-            page: Generated.pageStrings, number: 10, values: Array("JCM".utf8)
-        ))
-        state.apply(Nrpn.sysex(
-            product: 0x00, device: 0x7F, function: Generated.fnStringParam,
-            page: Generated.pageStrings, number: 32, values: Array("412".utf8)
-        ))
+        state.apply(
+            Nrpn.sysex(
+                product: 0x00, device: 0x7F, function: Generated.fnStringParam,
+                page: Generated.pageStrings, number: 10, values: Array("JCM".utf8)
+            ))
+        state.apply(
+            Nrpn.sysex(
+                product: 0x00, device: 0x7F, function: Generated.fnStringParam,
+                page: Generated.pageStrings, number: 32, values: Array("412".utf8)
+            ))
         XCTAssertEqual(state.amp.name, "JCM")
         XCTAssertEqual(state.cabinet.name, "412")
 
         // An untracked string tag leaves the snapshot unchanged.
-        let untracked = state.apply(Nrpn.sysex(
-            product: 0x00, device: 0x7F, function: Generated.fnStringParam,
-            page: Generated.pageStrings, number: 99, values: Array("x".utf8)
-        ))
+        let untracked = state.apply(
+            Nrpn.sysex(
+                product: 0x00, device: 0x7F, function: Generated.fnStringParam,
+                page: Generated.pageStrings, number: 99, values: Array("x".utf8)
+            ))
         XCTAssertFalse(untracked.slowChanged)
         XCTAssertEqual(untracked.events, [.stringTag(number: 99)])
     }
 
     func testEffectTypeStateAndMixFoldIntoSlot() {
         var state = DeviceState()
-        var outcome = state.apply(Nrpn.setSingle(
-            product: 0x00, device: 0x7F, page: 0x3D, number: Generated.effectParamType, value: 179
-        ))
+        var outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0x00, device: 0x7F, page: 0x3D, number: Generated.effectParamType,
+                value: 179
+            ))
         XCTAssertEqual(outcome.events, [.effectChanged(slot: 7)])
         XCTAssertTrue(outcome.slowChanged)
         XCTAssertEqual(state.effects[7].kind, 179)
         XCTAssertEqual(state.effects[7].typeName, "Easy Reverb")
 
-        outcome = state.apply(Nrpn.setSingle(
-            product: 0x00, device: 0x7F, page: 0x3D, number: Generated.effectParamState, value: 1
-        ))
+        outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0x00, device: 0x7F, page: 0x3D, number: Generated.effectParamState,
+                value: 1
+            ))
         XCTAssertEqual(outcome.events, [.effectChanged(slot: 7)])
         XCTAssertEqual(state.effects[7].on, true)
 
-        outcome = state.apply(Nrpn.setSingle(
-            product: 0x00, device: 0x7F, page: 0x3D, number: Generated.effectParamMix, value: 8192
-        ))
+        outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0x00, device: 0x7F, page: 0x3D, number: Generated.effectParamMix,
+                value: 8192
+            ))
         XCTAssertEqual(outcome.events, [.effectChanged(slot: 7)])
         XCTAssertEqual(state.effect("rev")?.mix, 8192)
     }
@@ -618,74 +639,89 @@ final class StateTests: XCTestCase {
     func testBeatPulseIsFastAndTouchesNothing() {
         var state = DeviceState()
         let before = state
-        var outcome = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageRealtime,
-            number: Generated.beatPulseNumber, value: 16383
-        ))
+        var outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageRealtime,
+                number: Generated.beatPulseNumber, value: 16383
+            ))
         XCTAssertEqual(outcome.events, [.beatPulse(on: true)])
         XCTAssertFalse(outcome.slowChanged)
         XCTAssertEqual(state, before)
 
-        outcome = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageRealtime,
-            number: Generated.beatPulseNumber, value: 0
-        ))
+        outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageRealtime,
+                number: Generated.beatPulseNumber, value: 0
+            ))
         XCTAssertEqual(outcome.events, [.beatPulse(on: false)])
         XCTAssertFalse(outcome.slowChanged)
     }
 
     func testTempoAndRigVolume() {
         var state = DeviceState()
-        let tempo = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageRigSettings,
-            number: Generated.tempoNumber, value: 7680
-        ))
+        let tempo = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageRigSettings,
+                number: Generated.tempoNumber, value: 7680
+            ))
         XCTAssertEqual(tempo.events, [.tempoBpm(120)])
         XCTAssertTrue(tempo.slowChanged)
         XCTAssertEqual(state.rig.tempoBpm, 120)
 
-        let volume = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageRigSettings,
-            number: Generated.rigVolumeNumber, value: 4096
-        ))
+        let volume = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageRigSettings,
+                number: Generated.rigVolumeNumber, value: 4096
+            ))
         XCTAssertTrue(volume.slowChanged)
         XCTAssertEqual(state.rig.volume, 4096)
     }
 
     func testAmpAndOutputVolumes() {
         var state = DeviceState()
-        XCTAssertTrue(state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.ampPage,
-            number: Generated.ampOnNumber, value: 1
-        )).slowChanged)
+        XCTAssertTrue(
+            state.apply(
+                Nrpn.setSingle(
+                    product: 0, device: 0, page: Generated.ampPage,
+                    number: Generated.ampOnNumber, value: 1
+                )
+            ).slowChanged)
         XCTAssertEqual(state.amp.on, true)
 
-        let gain = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.ampPage,
-            number: Generated.gainNumber, value: 5000
-        ))
+        let gain = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.ampPage,
+                number: Generated.gainNumber, value: 5000
+            ))
         XCTAssertTrue(gain.slowChanged)
         XCTAssertEqual(state.amp.gain, 5000)
         XCTAssertEqual(gain.events, [.paramChanged(page: 0x0A, number: 4, value: 5000)])
 
-        XCTAssertTrue(state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.systemPage,
-            number: Generated.mainVolumeNumber, value: 9000
-        )).slowChanged)
+        XCTAssertTrue(
+            state.apply(
+                Nrpn.setSingle(
+                    product: 0, device: 0, page: Generated.systemPage,
+                    number: Generated.mainVolumeNumber, value: 9000
+                )
+            ).slowChanged)
         XCTAssertEqual(state.output.mainVolume, 9000)
 
-        XCTAssertTrue(state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.systemPage,
-            number: Generated.monitorVolumeNumber, value: 3000
-        )).slowChanged)
+        XCTAssertTrue(
+            state.apply(
+                Nrpn.setSingle(
+                    product: 0, device: 0, page: Generated.systemPage,
+                    number: Generated.monitorVolumeNumber, value: 3000
+                )
+            ).slowChanged)
         XCTAssertEqual(state.output.monitorVolume, 3000)
     }
 
     func testUntrackedGenericParamIsNotSlow() {
         var state = DeviceState()
-        let outcome = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: 0x09, number: 3, value: 5000
-        ))
+        let outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: 0x09, number: 3, value: 5000
+            ))
         XCTAssertFalse(outcome.slowChanged)
         XCTAssertEqual(outcome.events, [.paramChanged(page: 0x09, number: 3, value: 5000)])
     }
@@ -700,12 +736,14 @@ final class StateTests: XCTestCase {
         )
         let outcome = state.apply(message)
         XCTAssertTrue(outcome.slowChanged)
-        XCTAssertEqual(outcome.events, [
-            .effectChanged(slot: 0),
-            .paramChanged(page: 0x32, number: 1, value: Nrpn.u14(0x10, 0x00)),
-            .paramChanged(page: 0x32, number: 2, value: Nrpn.u14(0x20, 0x00)),
-            .effectChanged(slot: 0),
-        ])
+        XCTAssertEqual(
+            outcome.events,
+            [
+                .effectChanged(slot: 0),
+                .paramChanged(page: 0x32, number: 1, value: Nrpn.u14(0x10, 0x00)),
+                .paramChanged(page: 0x32, number: 2, value: Nrpn.u14(0x20, 0x00)),
+                .effectChanged(slot: 0),
+            ])
         XCTAssertEqual(state.effects[0].kind, 33)
         XCTAssertEqual(state.effects[0].typeName, "Green Scream")
         XCTAssertEqual(state.effects[0].on, true)
@@ -719,7 +757,8 @@ final class StateTests: XCTestCase {
 
     func testExtStringRecoversAmpName() {
         var state = DeviceState()
-        let outcome = state.apply(extString(page: Generated.pageStrings, number: 10, text: "JCM800"))
+        let outcome = state.apply(
+            extString(page: Generated.pageStrings, number: 10, text: "JCM800"))
         XCTAssertEqual(state.amp.name, "JCM800")
         XCTAssertTrue(outcome.slowChanged)
         XCTAssertEqual(outcome.events, [.stringTag(number: 10)])
@@ -727,9 +766,10 @@ final class StateTests: XCTestCase {
 
     func testExtStringRigNameSignalsRigChange() {
         var state = DeviceState()
-        let outcome = state.apply(extString(
-            page: Generated.pageStrings, number: Generated.stringRigName, text: "AC30"
-        ))
+        let outcome = state.apply(
+            extString(
+                page: Generated.pageStrings, number: Generated.stringRigName, text: "AC30"
+            ))
         XCTAssertEqual(state.rig.name, "AC30")
         XCTAssertEqual(outcome.events, [.stringTag(number: 1), .rigChanged])
     }
@@ -741,10 +781,11 @@ final class StateTests: XCTestCase {
 
     func testMorphSetsPosition() {
         var state = DeviceState()
-        let outcome = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageMorph,
-            number: Generated.morphNumber, value: 8192
-        ))
+        let outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageMorph,
+                number: Generated.morphNumber, value: 8192
+            ))
         XCTAssertEqual(outcome.events, [.morphChanged(8192)])
         XCTAssertTrue(outcome.slowChanged)
         XCTAssertEqual(state.morph, 8192)
@@ -752,18 +793,20 @@ final class StateTests: XCTestCase {
 
     func testTunerDevianceIsFastAndNoteIsSlow() {
         var state = DeviceState()
-        let deviance = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageRealtime,
-            number: Generated.tunerDevianceNumber, value: 8192
-        ))
+        let deviance = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageRealtime,
+                number: Generated.tunerDevianceNumber, value: 8192
+            ))
         XCTAssertEqual(deviance.events, [.tunerDeviance(8192)])
         XCTAssertFalse(deviance.slowChanged)
         XCTAssertEqual(state.tuner.inTune, true)
 
-        let note = state.apply(Nrpn.setSingle(
-            product: 0, device: 0, page: Generated.pageTunerNote,
-            number: Generated.tunerNoteNumber, value: 45
-        ))
+        let note = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageTunerNote,
+                number: Generated.tunerNoteNumber, value: 45
+            ))
         XCTAssertEqual(note.events, [.tunerNote(45)])
         XCTAssertTrue(note.slowChanged)
         XCTAssertEqual(state.tuner.note, 45)
@@ -778,9 +821,11 @@ final class StateTests: XCTestCase {
         )
         let outcome = state.apply(message)
         XCTAssertFalse(outcome.slowChanged)
-        XCTAssertEqual(outcome.events, [
-            .renderedString(page: 0x3C, number: 53, value: 8192, text: "<0.0>"),
-        ])
+        XCTAssertEqual(
+            outcome.events,
+            [
+                .renderedString(page: 0x3C, number: 53, value: 8192, text: "<0.0>")
+            ])
     }
 }
 

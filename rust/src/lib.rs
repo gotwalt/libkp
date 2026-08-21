@@ -55,17 +55,17 @@ pub const PORT: u16 = generated::PORT;
 /// The version of the shared protocol spec this crate was generated against.
 pub const SPEC_VERSION: &str = generated::SPEC_VERSION;
 
-pub use control::{program_change, slot_enable_cc, Control, ModuleSlot};
-pub use discovery::{discover, find_first, Options, Reply};
+pub use control::{Control, ModuleSlot, program_change, slot_enable_cc};
+pub use discovery::{Options, Reply, discover, find_first};
 pub use error::{DiscoverError, ParseError, SessionError};
 pub use midi3::Unframer;
 pub use model::{ApplyOutcome, CommandError, DeviceEvent, DeviceModel, RealtimeStatus};
 pub use nrpn::{
-    beacon, control_change, ext_decode, multi_values, parse_extended_string, parse_rendered_string,
-    request_multi, request_rendered_string, request_single, request_string, set_single, sysex, u14,
-    u14_split, NrpnHeader,
+    NrpnHeader, beacon, control_change, ext_decode, multi_values, parse_extended_string,
+    parse_rendered_string, request_multi, request_rendered_string, request_single, request_string,
+    set_single, sysex, u14, u14_split,
 };
-pub use protocol::{build_poll_request, TagStream, DISCOVERY_PORT, DSCV_HEADER};
-pub use registry::{descriptor, format_value, ParamDescriptor, ParamKind};
-pub use session::{HandshakeOutcome, Session, PROTOCOL_MIDI3_STREAM, PROTOCOL_REQUEST_RESPONSE};
+pub use protocol::{DISCOVERY_PORT, DSCV_HEADER, TagStream, build_poll_request};
+pub use registry::{ParamDescriptor, ParamKind, descriptor, format_value};
+pub use session::{HandshakeOutcome, PROTOCOL_MIDI3_STREAM, PROTOCOL_REQUEST_RESPONSE, Session};
 pub use state::{Amp, Cabinet, Connection, DeviceState, Effect, Output, Rig, Tuner};

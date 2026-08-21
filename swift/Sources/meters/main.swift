@@ -52,12 +52,12 @@ func parseArguments(_ arguments: [String]) -> ArgumentResult {
 }
 
 let usage = """
-usage: meters [--ip <addr>] [--all] [--width <n>]
+    usage: meters [--ip <addr>] [--all] [--width <n>]
 
-  --ip <addr>   device IPv4 address; discovery is used when omitted
-  --all         show all eleven raw meter fields, not just the level bars
-  --width <n>   bar width in characters (default 44)
-"""
+      --ip <addr>   device IPv4 address; discovery is used when omitted
+      --all         show all eleven raw meter fields, not just the level bars
+      --width <n>   bar width in characters (default 44)
+    """
 
 // MARK: - Terminal
 
@@ -173,8 +173,8 @@ actor MeterView {
         let cutoff = Date().addingTimeInterval(-0.4)
         phaseHistory.removeAll { $0.at < cutoff }
         guard phaseHistory.count >= 3,
-              let first = phaseHistory.first,
-              let last = phaseHistory.last
+            let first = phaseHistory.first,
+            let last = phaseHistory.last
         else { return nil }
         var total = 0.0
         for i in 1..<phaseHistory.count {
@@ -194,7 +194,7 @@ actor MeterView {
         let now = Date()
         let dt = min(now.timeIntervalSince(lastDecay), 0.5)
         lastDecay = now
-        let drop = MeterView.fullScale * 0.8 * dt // full-scale peak falls in ~1.25 s
+        let drop = MeterView.fullScale * 0.8 * dt  // full-scale peak falls in ~1.25 s
         for i in peaks.indices {
             peaks[i] = max(peaks[i] - drop, Double(values[i]))
         }
@@ -217,7 +217,8 @@ actor MeterView {
         let rigName = state.rig.name?.trimmed.nonEmpty ?? "—"
         let author = state.rig.author?.trimmed.nonEmpty
         let tempo = state.rig.tempoBpm.map { "\($0) BPM" }
-        let live = state.connection == .connected
+        let live =
+            state.connection == .connected
             ? "\(Term.green)●\(Term.reset)"
             : "\(Term.red)○\(Term.reset)"
 
@@ -298,8 +299,9 @@ actor MeterView {
             markerColor = Term.dim
         }
 
-        let position = Int(Double(values[Generated.strobePhaseIndex]) / MeterView.fullScale
-            * Double(width - 1))
+        let position = Int(
+            Double(values[Generated.strobePhaseIndex]) / MeterView.fullScale
+                * Double(width - 1))
         var strobe = "\(Term.dim)[\(Term.reset)"
         for i in 0..<width {
             if active && i == position {
@@ -323,7 +325,8 @@ actor MeterView {
             let peakFrac = peaks[field.index] / MeterView.fullScale
             out += "  \(pad(label(for: field), 19)) \(bar(frac, peakFrac))"
             out += "  \(pad(String(value), 5, right: true))"
-            out += "  \(Term.dim)range \(pad(String(low), 5, right: true))–\(pad(String(high), 5))\(Term.reset)"
+            out +=
+                "  \(Term.dim)range \(pad(String(low), 5, right: true))–\(pad(String(high), 5))\(Term.reset)"
             out += Term.clearLine + "\n"
         }
         return out
@@ -343,7 +346,8 @@ actor MeterView {
     ]
 
     private func label(for field: MeterField) -> String {
-        let short = MeterView.shortLabels[field.id] ?? field.id.replacingOccurrences(of: "_", with: " ")
+        let short =
+            MeterView.shortLabels[field.id] ?? field.id.replacingOccurrences(of: "_", with: " ")
         return showAll ? "v\(field.index) \(short)" : short
     }
 
@@ -366,7 +370,7 @@ actor MeterView {
         out += "  last param: \(lastParam ?? "(none)")" + Term.clearLine + "\n"
         out += "  \(Term.dim)(play into the device — Ctrl-C to quit; --all for raw fields)"
         out += "\(Term.reset)" + Term.clearLine + "\n"
-        out += "\u{1B}[J" // clear anything below
+        out += "\u{1B}[J"  // clear anything below
         return out
     }
 
@@ -401,7 +405,7 @@ actor MeterView {
 }
 
 /// Euclidean remainder, so a negative dividend still wraps forward.
-infix operator %%: MultiplicationPrecedence
+infix operator %% : MultiplicationPrecedence
 func %% (lhs: Int, rhs: Int) -> Int {
     let r = lhs % rhs
     return r < 0 ? r + rhs : r

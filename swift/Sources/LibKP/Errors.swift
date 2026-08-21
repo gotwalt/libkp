@@ -14,7 +14,8 @@ extension ParseError: CustomStringConvertible {
         case let .tooShort(need, got):
             return "payload too short: need at least \(need) bytes, got \(got)"
         case let .fieldOverrun(offset, len, remaining):
-            return "field at offset \(offset) claims length \(len) but only \(remaining) bytes remain"
+            return
+                "field at offset \(offset) claims length \(len) but only \(remaining) bytes remain"
         }
     }
 }
@@ -81,7 +82,8 @@ extension CommandError: CustomStringConvertible {
     public var description: String {
         switch self {
         case .disconnected: return "device model is disconnected; command channel closed"
-        case let .unknownSlot(name): return "unknown effect slot \"\(name)\"; use A B C D X MOD DLY REV"
+        case let .unknownSlot(name):
+            return "unknown effect slot \"\(name)\"; use A B C D X MOD DLY REV"
         }
     }
 }
