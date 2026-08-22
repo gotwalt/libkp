@@ -35,6 +35,9 @@ pub const FUNCTION_REQUEST_SINGLE: u8 = generated::FN_REQUEST_SINGLE;
 pub const FUNCTION_REQUEST_MULTI: u8 = generated::FN_REQUEST_MULTI;
 /// Request a string parameter (reply arrives as $03).
 pub const FUNCTION_REQUEST_STRING: u8 = generated::FN_REQUEST_STRING;
+/// Request an extended string parameter (function $47): 5-byte encoded address,
+/// reply arrives as $07 (or $03 below the 14-bit range).
+pub const FUNCTION_REQUEST_EXT_STRING: u8 = generated::FN_REQUEST_EXT_STRING;
 /// Request a parameter value rendered to a string (reply arrives as $3C).
 pub const FUNCTION_REQUEST_RENDERED_STRING: u8 = generated::FN_REQUEST_RENDERED_STRING;
 /// Reply function for a rendered-string request ([`FUNCTION_REQUEST_RENDERED_STRING`]).
@@ -254,6 +257,23 @@ pub fn parse_extended_string(msg: &[u8]) -> Option<(u32, String)> {
     Some((address, text))
 }
 
+/// Request an extended string parameter (function $47) at a flat address
+/// (`page * 128 + number`). The device replies with a $07 extended string — or a
+/// plain $03 when the address is below 16384. Read-only.
+///
+/// Layout mirrors $07 minus the payload:
+/// `F0 00 20 33 <prod> <dev> 47 <inst=00> <5-byte address> F7`. This is how the
+/// current bank's rig/amp/cabinet names are read on demand — the addresses are
+/// [`crate::params::bank_preview_address`] over [`generated::PAGE_BANK_PREVIEW`].
+pub fn request_extended_string(product: u8, device: u8, address: u32) -> Vec<u8> {
+    let mut msg = vec![0xF0];
+    msg.extend_from_slice(&MANUFACTURER_ID);
+    msg.extend_from_slice(&[product, device, FUNCTION_REQUEST_EXT_STRING, 0x00]);
+    msg.extend_from_slice(&ext_encode(address as u64, 5));
+    msg.push(0xF7);
+    msg
+}
+
 /// A 3-byte MIDI Control Change on `channel` (0–15).
 pub fn control_change(channel: u8, controller: u8, value: u8) -> [u8; 3] {
     [
@@ -361,6 +381,21 @@ mod tests {
                 0xF0, 0x00, 0x20, 0x33, 0x02, 0x7F, 0x42, 0x00, 0x34, 0x00, 0xF7
             ]
         );
+    }
+
+    #[test]
+    fn builds_request_extended_string() {
+        // Bank Preview page 0x96, rig-name slot 0: flat address 0x96*128 = 19200.
+        let addr = generated::PAGE_BANK_PREVIEW as u32 * 128;
+        let msg = request_extended_string(PRODUCT_PROFILER, DEVICE_OMNI, addr);
+        assert_eq!(
+            msg,
+            vec![
+                0xF0, 0x00, 0x20, 0x33, 0x00, 0x7F, 0x47, 0x00, 0x00, 0x00, 0x01, 0x16, 0x00, 0xF7
+            ]
+        );
+        // The 5-byte address round-trips back to the flat address.
+        assert_eq!(ext_decode(&msg[8..13]) as u32, addr);
     }
 
     #[test]

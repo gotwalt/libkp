@@ -34,6 +34,7 @@ __all__ = [
     "FUNCTION_REQUEST_SINGLE",
     "FUNCTION_REQUEST_MULTI",
     "FUNCTION_REQUEST_STRING",
+    "FUNCTION_REQUEST_EXT_STRING",
     "FUNCTION_REQUEST_RENDERED_STRING",
     "FUNCTION_BEACON",
     "NrpnHeader",
@@ -45,6 +46,7 @@ __all__ = [
     "request_string",
     "request_single",
     "request_multi",
+    "request_extended_string",
     "request_rendered_string",
     "set_single",
     "control_change",
@@ -83,6 +85,7 @@ FUNCTION_RENDERED_STRING_REPLY: int = gen.FN_RENDERED_STRING_REPLY
 FUNCTION_REQUEST_SINGLE: int = gen.FN_REQUEST_SINGLE
 FUNCTION_REQUEST_MULTI: int = gen.FN_REQUEST_MULTI
 FUNCTION_REQUEST_STRING: int = gen.FN_REQUEST_STRING
+FUNCTION_REQUEST_EXT_STRING: int = gen.FN_REQUEST_EXT_STRING
 FUNCTION_REQUEST_RENDERED_STRING: int = gen.FN_REQUEST_RENDERED_STRING
 FUNCTION_BEACON: int = gen.FN_BEACON
 
@@ -199,6 +202,24 @@ def request_multi(product: int, device: int, page: int, number: int) -> bytes:
     number of the unit or the device ignores it.
     """
     return sysex(product, device, FUNCTION_REQUEST_MULTI, page, number)
+
+
+def request_extended_string(product: int, device: int, address: int) -> bytes:
+    """Request an extended string parameter (function ``$47``) at a flat address
+    (``page * 128 + number``); the device replies with ``$07`` (or ``$03`` below
+    the 14-bit range). Read-only.
+
+    Layout mirrors ``$07`` minus the payload:
+    ``F0 00 20 33 <prod> <dev> 47 <inst=00> <5-byte address> F7``. This is how the
+    current bank's rig/amp/cabinet names are read on demand — the addresses come
+    from :func:`libkp.params.bank_preview_address`.
+    """
+    out = bytearray([0xF0])
+    out.extend(MANUFACTURER_ID)
+    out.extend([product, device, FUNCTION_REQUEST_EXT_STRING, 0x00])
+    out.extend(ext_encode(address, 5))
+    out.append(0xF7)
+    return bytes(out)
 
 
 def set_single(product: int, device: int, page: int, number: int, value: int) -> bytes:

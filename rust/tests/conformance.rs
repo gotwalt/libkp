@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use libkp::cbor::{self, Decoder};
 use libkp::control::{Control, ModuleSlot};
 use libkp::midi3::{Unframer, frame};
 use libkp::model::RealtimeStatus;
@@ -94,7 +95,7 @@ fn opt_str(v: &Value) -> Option<&str> {
 
 #[test]
 fn spec_version_matches() {
-    assert_eq!(generated::SPEC_VERSION, "0.1.0");
+    assert_eq!(generated::SPEC_VERSION, "0.5.0");
     assert_eq!(libkp::SPEC_VERSION, generated::SPEC_VERSION);
     assert_eq!(PORT, 5727);
 }
@@ -404,6 +405,15 @@ fn param_lookup_vectors() {
         );
     }
 
+    for c in cases(&doc, "effect_category_name") {
+        let value = u16_of(c, "value");
+        assert_eq!(
+            params::effect_category_name(value),
+            opt_str(&c["name"]),
+            "effect_category_name({value})"
+        );
+    }
+
     for c in cases(&doc, "page_name") {
         let page = u8_of(c, "page");
         assert_eq!(
@@ -512,12 +522,133 @@ fn state_apply_vectors() {
                 "[{name}] tuner_note"
             );
         }
+        if let Some(v) = expect.get("current_bank") {
+            assert_eq!(
+                state.current_bank,
+                Some(v.as_u64().unwrap() as u16),
+                "[{name}] current_bank"
+            );
+        }
+        if let Some(v) = expect.get("current_rig_slot") {
+            assert_eq!(
+                state.current_rig_slot,
+                Some(v.as_u64().unwrap() as u16),
+                "[{name}] current_rig_slot"
+            );
+        }
+        if let Some(v) = expect.get("current_rig_index") {
+            assert_eq!(
+                state.current_rig_index(),
+                Some(v.as_u64().unwrap() as u16),
+                "[{name}] current_rig_index"
+            );
+        }
         if let Some(v) = expect.get("main_volume") {
             assert_eq!(
                 state.output.main_volume,
                 Some(v.as_u64().unwrap() as u16),
                 "[{name}] main_volume"
             );
+        }
+        if let Some(v) = expect.get("headphone_volume") {
+            assert_eq!(
+                state.output.headphone_volume,
+                Some(v.as_u64().unwrap() as u16),
+                "[{name}] headphone_volume"
+            );
+        }
+        if let Some(v) = expect.get("monitor_volume") {
+            assert_eq!(
+                state.output.monitor_volume,
+                Some(v.as_u64().unwrap() as u16),
+                "[{name}] monitor_volume"
+            );
+        }
+        if let Some(v) = expect.get("master_volume") {
+            assert_eq!(
+                state.output.master_volume(),
+                Some(v.as_u64().unwrap() as u16),
+                "[{name}] master_volume"
+            );
+        }
+        if let Some(entries) = expect.get("bank").and_then(|v| v.as_array()) {
+            for e in entries {
+                let slot = e["slot"].as_u64().unwrap() as usize;
+                let bank_slot = &state.bank.slots[slot];
+                if let Some(v) = e.get("rig_name") {
+                    assert_eq!(
+                        bank_slot.rig_name.as_deref(),
+                        v.as_str(),
+                        "[{name}] bank rig_name"
+                    );
+                }
+                if let Some(v) = e.get("amp_name") {
+                    assert_eq!(
+                        bank_slot.amp_name.as_deref(),
+                        v.as_str(),
+                        "[{name}] bank amp_name"
+                    );
+                }
+                if let Some(v) = e.get("cabinet_name") {
+                    assert_eq!(
+                        bank_slot.cabinet_name.as_deref(),
+                        v.as_str(),
+                        "[{name}] bank cabinet_name"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cbor.json
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cbor_param_write_vectors() {
+    let doc = vector("cbor.json");
+    for c in cases(&doc, "param_write") {
+        let addr = c["addr"].as_u64().unwrap() as u32;
+        let value = c["value"].as_i64().unwrap();
+        assert_eq!(
+            hex(&cbor::to_vec(&cbor::param_write(addr, value))),
+            str_of(c, "hex"),
+            "param_write({addr}, {value})"
+        );
+    }
+    assert_eq!(
+        hex(&cbor::to_vec(&cbor::state_dump_request())),
+        str_of(&doc["state_dump_request"], "hex"),
+        "state_dump_request"
+    );
+}
+
+#[test]
+fn cbor_extract_snapshot_vectors() {
+    let doc = vector("cbor.json");
+    for c in cases(&doc, "extract_snapshot") {
+        let name = str_of(c, "name");
+        let mut decoder = Decoder::new();
+        let items = decoder.push(&unhex(&str_of(c, "stream_hex")));
+        let snap = cbor::extract_snapshot(&items);
+        let expect = &c["expect"];
+
+        let want_bank = expect["current_bank"].as_u64().map(|v| v as u16);
+        assert_eq!(snap.current_bank, want_bank, "[{name}] current_bank");
+        let want_slot = expect["current_rig_slot"].as_u64().map(|v| v as u16);
+        assert_eq!(
+            snap.current_rig_slot, want_slot,
+            "[{name}] current_rig_slot"
+        );
+
+        if let Some(strings) = expect.get("strings").and_then(|v| v.as_array()) {
+            let got: Vec<(u32, String)> = snap.strings.clone();
+            let want: Vec<(u32, String)> = strings
+                .iter()
+                .map(|s| (s["addr"].as_u64().unwrap() as u32, str_of(s, "text")))
+                .collect();
+            assert_eq!(got, want, "[{name}] strings");
         }
     }
 }

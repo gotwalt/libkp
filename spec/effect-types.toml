@@ -91,3 +91,23 @@ effect_types = [
   { value = 183, name = "Ionosphere Reverb" },
   { value = 193, name = "Spring Reverb" },
 ]
+
+# Effect Type value → category. Appendix B allocates Type values in 16-value
+# blocks (a few split into half-blocks), one block per category of the device's
+# type knob; the ranges below are inferred from that value-range structure
+# rather than being printed as a table. Value 0 (empty) and any value outside
+# every range has no category.
+effect_categories = [
+  { min = 1,   max = 16,  name = "Wah" },
+  { min = 17,  max = 31,  name = "Shaper" },
+  { min = 32,  max = 48,  name = "Distortion" },
+  { min = 49,  max = 63,  name = "Dynamics" },
+  { min = 64,  max = 79,  name = "Modulation" },
+  { min = 80,  max = 95,  name = "Phaser & Flanger" },
+  { min = 96,  max = 111, name = "Equalizer" },
+  { min = 112, max = 120, name = "Booster" },
+  { min = 121, max = 127, name = "Effect Loop" },
+  { min = 128, max = 143, name = "Pitch" },
+  { min = 144, max = 175, name = "Delay" },
+  { min = 176, max = 207, name = "Reverb" },
+]

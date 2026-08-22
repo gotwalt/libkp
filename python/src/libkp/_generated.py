@@ -1,10 +1,11 @@
 """GENERATED FILE — DO NOT EDIT. Edit spec/*.toml and run codegen/generate.py."""
 
-SPEC_VERSION = "0.1.0"
+SPEC_VERSION = "0.5.0"
 
 PORT = 5727
 CONNECT_TIMEOUT_SECS = 5
 SOCKET_TIMEOUT_SECS = 15
+CONNECTION_COOLDOWN_MS = 1000
 
 DISCOVERY_HEADER = "DSCV"
 POLL_INTERVAL_MS = 500
@@ -22,6 +23,16 @@ PROTOCOL_MIDI3_STREAM = "{369F50E7-750B-459A-BAEE-85ADD3F3798D}"
 PROTOCOL_REQUEST_RESPONSE = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}"
 PROTOCOL_CBOR_CONTROL = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"
 PROTOCOL_RESERVED = "{77DB6B28-785E-4641-B840-42F0F06A11FC}"
+
+CBOR_ITEM_TAG = 1
+CBOR_SELECTOR_SINGLE = 1
+CBOR_SELECTOR_MULTI = 2
+CBOR_SELECTOR_STRING = 4
+CBOR_FILLER_BYTE = 0xc0
+STATE_DUMP_TRIGGER_ADDRESS = 102528
+STATE_DUMP_TRIGGER_VALUE = 1
+SENSITIVE_ADDRESSES = (200008, 200009)
+REDACTED_PLACEHOLDER = "[redacted]"
 
 MIDI3_TAG_CONTINUATION = 0x14
 MIDI3_TAG_FINAL_1 = 0x15
@@ -76,7 +87,13 @@ AMP_ON_NUMBER = 0x02
 GAIN_NUMBER = 0x04
 SYSTEM_PAGE = 0x7f
 MAIN_VOLUME_NUMBER = 0x00
+HEADPHONE_VOLUME_NUMBER = 0x01
 MONITOR_VOLUME_NUMBER = 0x02
+PAGE_BANK_PREVIEW = 0x96
+BANK_SLOTS = 5
+BANK_RIG_NAME_BASE = 0x00
+BANK_AMP_NAME_BASE = 0x05
+BANK_CABINET_NAME_BASE = 0x0a
 PAGE_MORPH = 0x00
 MORPH_NUMBER = 0x0b
 PAGE_TUNER_NOTE = 0x7d
@@ -84,6 +101,8 @@ TUNER_NOTE_NUMBER = 0x54
 TUNER_IN_TUNE_CENTER = 8192
 TUNER_IN_TUNE_WINDOW = 350
 METER_COUNT = 11
+CURRENT_BANK_ADDRESS = 100701
+CURRENT_RIG_SLOT_ADDRESS = 100702
 
 METER_PAGE = 0x7c
 METER_FIRST_NUMBER = 0x4e
@@ -93,7 +112,7 @@ STROBE_SEGMENT_INDICES = (0, 1, 2)
 
 FUNCTION_NAMES = {0x01: "single-param", 0x02: "multi-param", 0x03: "string-param", 0x04: "blob", 0x06: "ext-param", 0x07: "ext-string-param", 0x08: "morphed-multi-param", 0x3c: "rendered-string-reply", 0x41: "request-single", 0x42: "request-multi", 0x43: "request-string", 0x47: "request-ext-string", 0x7c: "request-rendered-string", 0x7e: "beacon"}
 
-PAGE_NAMES = {0x00: "String Tags", 0x04: "Rig Settings", 0x05: "Fixed FX", 0x09: "Input Section", 0x0a: "Amplifier", 0x0b: "Amplifier EQ", 0x0c: "Cabinet", 0x32: "Effect A", 0x33: "Effect B", 0x34: "Effect C", 0x35: "Effect D", 0x38: "Effect X", 0x3a: "Effect MOD", 0x3c: "Effect DLY", 0x3d: "Effect REV", 0x76: "User Scales", 0x7c: "Realtime/Meters", 0x7d: "Looper/Freeze", 0x7f: "System/Global"}
+PAGE_NAMES = {0x00: "String Tags", 0x04: "Rig Settings", 0x05: "Fixed FX", 0x09: "Input Section", 0x0a: "Amplifier", 0x0b: "Amplifier EQ", 0x0c: "Cabinet", 0x32: "Effect A", 0x33: "Effect B", 0x34: "Effect C", 0x35: "Effect D", 0x38: "Effect X", 0x3a: "Effect MOD", 0x3c: "Effect DLY", 0x3d: "Effect REV", 0x76: "User Scales", 0x7c: "Realtime/Meters", 0x7d: "Looper/Freeze", 0x7f: "System/Global", 0x96: "Bank Preview"}
 
 EFFECT_SLOTS = [("A", 0x32), ("B", 0x33), ("C", 0x34), ("D", 0x35), ("X", 0x38), ("MOD", 0x3a), ("DLY", 0x3c), ("REV", 0x3d)]
 
@@ -138,6 +157,7 @@ NON_EFFECT_PARAMS = {
     (0x0a, 11): "Tube Shape",
     (0x0a, 12): "Tube Bias",
     (0x0a, 15): "Direct Mix",
+    (0x0a, 20): "Gain (smoothed follower)",
     (0x0a, 21): "Bright Cap Intensity",
     (0x0b, 4): "Bass",
     (0x0b, 5): "Middle",
@@ -238,6 +258,21 @@ NON_EFFECT_PARAMS = {
     (0x7f, 53): "Looper Location",
     (0x7f, 59): "Aux >Mono",
     (0x7f, 126): "Tuner Mode State",
+    (0x96, 0): "Bank Rig Name",
+    (0x96, 1): "Bank Rig Name",
+    (0x96, 2): "Bank Rig Name",
+    (0x96, 3): "Bank Rig Name",
+    (0x96, 4): "Bank Rig Name",
+    (0x96, 5): "Bank Amp Name",
+    (0x96, 6): "Bank Amp Name",
+    (0x96, 7): "Bank Amp Name",
+    (0x96, 8): "Bank Amp Name",
+    (0x96, 9): "Bank Amp Name",
+    (0x96, 10): "Bank Cabinet Name",
+    (0x96, 11): "Bank Cabinet Name",
+    (0x96, 12): "Bank Cabinet Name",
+    (0x96, 13): "Bank Cabinet Name",
+    (0x96, 14): "Bank Cabinet Name",
 }
 
 STRING_TAGS = {1: "Rig Name", 2: "Rig Author", 3: "Rig Creation Date", 4: "Rig Comment", 10: "Amp Name", 11: "Amp Author", 14: "Amp Location", 15: "Amp Manufacturer", 16: "Amp Comment", 18: "Amp Model", 19: "Amp Channel", 20: "Pickup Type", 21: "Year of Production", 32: "Cabinet Name", 33: "Cabinet Author", 36: "Cabinet Location", 37: "Cabinet Manufacturer", 38: "Microphone Model", 39: "Cabinet Comment", 40: "Microphone Position", 41: "Speaker Configuration", 42: "Cabinet Model", 44: "Speaker Manufacturer", 45: "Speaker Model"}
@@ -335,6 +370,22 @@ EFFECT_TYPES = {
     183: "Ionosphere Reverb",
     193: "Spring Reverb",
 }
+
+# (min, max, name) — inclusive Type value blocks
+EFFECT_CATEGORIES = [
+    (1, 16, "Wah"),
+    (17, 31, "Shaper"),
+    (32, 48, "Distortion"),
+    (49, 63, "Dynamics"),
+    (64, 79, "Modulation"),
+    (80, 95, "Phaser & Flanger"),
+    (96, 111, "Equalizer"),
+    (112, 120, "Booster"),
+    (121, 127, "Effect Loop"),
+    (128, 143, "Pitch"),
+    (144, 175, "Delay"),
+    (176, 207, "Reverb"),
+]
 
 CC_WAH_PEDAL = 1
 CC_PITCH_PEDAL = 4

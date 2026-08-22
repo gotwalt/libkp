@@ -86,6 +86,25 @@ public enum Nrpn {
         )
     }
 
+    /// Request an extended string parameter (function `$47`) at a flat address
+    /// (`page * 128 + number`). The device replies with a `$07` extended string —
+    /// or a plain `$03` when the address is below 16384. Read-only.
+    ///
+    /// Layout mirrors `$07` minus the payload:
+    /// `F0 00 20 33 <prod> <dev> 47 <inst=00> <5-byte address> F7`. This is how
+    /// the current bank's rig/amp/cabinet names are read on demand — the
+    /// addresses come from ``Params/bankPreviewAddress(_:slot:)``.
+    public static func requestExtendedString(
+        product: UInt8, device: UInt8, address: UInt32
+    ) -> [UInt8] {
+        var msg: [UInt8] = [0xF0]
+        msg.append(contentsOf: Generated.manufacturerId)
+        msg.append(contentsOf: [product, device, Generated.fnRequestExtString, 0x00])
+        msg.append(contentsOf: extEncode(UInt64(address), count: 5))
+        msg.append(0xF7)
+        return msg
+    }
+
     /// Request a parameter value rendered to a string (function `$7C`). The
     /// device replies with a `$3C` message carrying the rendered ASCII (e.g.
     /// `<0.0>`). Read-only, but costly in device CPU.

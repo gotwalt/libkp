@@ -75,6 +75,9 @@ public struct Effect: Sendable, Equatable {
     /// The effect Type's human name, or `nil` if unknown or unmapped.
     public var typeName: String? { kind.flatMap { Params.effectTypeName($0) } }
 
+    /// The effect Type's category, or `nil` if unknown or in no block.
+    public var categoryName: String? { kind.flatMap { Params.effectCategoryName($0) } }
+
     /// True if the slot holds no effect (Type == 0, "empty").
     public var isEmpty: Bool { kind == 0 }
 }
@@ -101,10 +104,46 @@ public struct Tuner: Sendable, Equatable {
 public struct Output: Sendable, Equatable {
     /// Main Output Volume (NRPN `0x7F/0`, 14-bit), once seen.
     public var mainVolume: UInt16?
-    /// Monitor Output Volume (NRPN `0x7F/2`, 14-bit), once seen.
+    /// Headphone Output Volume (NRPN `0x7F/1`, 14-bit), once seen. Driven 1:1 by
+    /// the physical Master Volume knob.
+    public var headphoneVolume: UInt16?
+    /// Monitor Output Volume (NRPN `0x7F/2`, 14-bit), once seen. Driven 1:1 by
+    /// the physical Master Volume knob.
     public var monitorVolume: UInt16?
 
     public init() {}
+
+    /// The physical Master Volume knob's value. The knob is a potentiometer that
+    /// drives Headphone (`0x7F/1`) and Monitor (`0x7F/2`) 1:1 under the default
+    /// output routing, so report Headphone, falling back to Monitor. This is a
+    /// **read-only** readout: the pot has no soft-takeover, so a written value is
+    /// authoritative only until the knob next moves.
+    public var masterVolume: UInt16? { headphoneVolume ?? monitorVolume }
+}
+
+/// One bank slot's preview names — the identity of one of the current bank's
+/// five rigs, as shown on the device's rig browser.
+public struct BankSlot: Sendable, Equatable {
+    /// Rig name in this slot (Bank Preview number 0…4), once seen.
+    public var rigName: String?
+    /// The rig's amp name (Bank Preview number 5…9), once seen.
+    public var ampName: String?
+    /// The rig's cabinet name (Bank Preview number 10…14), once seen.
+    public var cabinetName: String?
+
+    public init() {}
+}
+
+/// The loaded bank's five-slot name preview (page `0x96`). The device pushes the
+/// whole block on a bank change, and it is readable on demand via
+/// ``DeviceModel/refreshBank()``. `slots[0]` is rig slot 1.
+public struct Bank: Sendable, Equatable {
+    /// The five preview slots, in slot order (index 0 = slot 1).
+    public var slots: [BankSlot]
+
+    public init() {
+        slots = Array(repeating: BankSlot(), count: Generated.bankSlots)
+    }
 }
 
 /// A decoded realtime status / meter frame: the eleven 14-bit values the stream
@@ -154,6 +193,10 @@ public enum DeviceEvent: Sendable, Equatable {
     case rigChanged
     /// A page-0 string tag was applied (1 = Rig Name, 10 = Amp Name, …).
     case stringTag(number: UInt8)
+    /// A bank-preview name was applied (page `0x96`): one of the current bank's
+    /// rig / amp / cabinet names. Read ``DeviceState/bank`` for the new value.
+    /// `number` is the Bank Preview number (0…14): 0–4 rig, 5–9 amp, 10–14 cab.
+    case bankPreview(number: UInt8)
     /// An effect slot's Type, On/Off or Mix changed. `slot` indexes
     /// ``Params/effectSlots`` (0 = A … 7 = REV).
     case effectChanged(slot: Int)
@@ -174,6 +217,10 @@ public enum DeviceEvent: Sendable, Equatable {
     /// A rendered-string reply arrived (`$3C`), carrying a value's exact display
     /// text. Transient — not stored in the snapshot tree.
     case renderedString(page: UInt8, number: UInt8, value: UInt16, text: String)
+    /// The device's current position was learned from the CBOR state-dump
+    /// snapshot. Read ``DeviceState/currentBank`` and
+    /// ``DeviceState/currentRigSlot`` for the new values (both 0-based).
+    case currentPosition(bank: UInt16?, slot: UInt16?)
     /// The model connected to a device.
     case connected
     /// The device closed the connection.
@@ -230,6 +277,26 @@ public struct DeviceState: Sendable, Equatable {
     public var tuner: Tuner
     /// The global output volumes.
     public var output: Output
+    /// The loaded bank's five-slot name preview (page `0x96`).
+    public var bank: Bank
+    /// Current bank, 0-based, once known. Seeded from the CBOR state-dump
+    /// snapshot (``StateSnapshot/fetch(host:port:timeout:)``) via
+    /// ``DeviceModel/setCurrentPosition(bank:slot:)``, then kept live by the
+    /// Bank Select / Program Change pair the device sends on every rig change.
+    public var currentBank: UInt16?
+    /// Current rig slot within the bank, 0-based, once known. Same source as
+    /// ``currentBank``; slot 0 is rig slot 1.
+    public var currentRigSlot: UInt16?
+    /// The high 7 bits of a rig index, held between the Bank Select that carries
+    /// them and the Program Change that completes the pair.
+    private var pendingRigIndexMsb: UInt8?
+    /// The flat, 0-based rig index — `currentBank * bankSlots + currentRigSlot`
+    /// — once both halves are known. This is the device's own numbering, and the
+    /// only address that can name a rig outside the current bank.
+    public var currentRigIndex: UInt16? {
+        guard let currentBank, let currentRigSlot else { return nil }
+        return currentBank * UInt16(Params.bankSlots) + currentRigSlot
+    }
     /// Latest morph position (0–16383), once seen.
     public var morph: UInt16?
     /// The most recent realtime status / meter frame (the FAST lane).
@@ -245,6 +312,9 @@ public struct DeviceState: Sendable, Equatable {
         effects = Params.effectSlots.map { Effect(slot: $0.name, page: $0.page) }
         tuner = Tuner()
         output = Output()
+        bank = Bank()
+        currentBank = nil
+        currentRigSlot = nil
         morph = nil
         status = RealtimeStatus()
     }
@@ -275,6 +345,9 @@ extension DeviceState {
     /// - `$06` extended and any other traffic → ignored.
     @discardableResult
     public mutating func apply(_ msg: [UInt8]) -> ApplyOutcome {
+        // Channel-voice messages ride the same stream as the SysEx: the device
+        // announces every rig change as a Bank Select / Program Change pair.
+        if let outcome = applyRigIndex(msg) { return outcome }
         guard let (header, values) = NrpnHeader.parse(msg) else { return .empty }
 
         // The extended-string ($07) address is 5×7-bit encoded and does not fit
@@ -294,6 +367,40 @@ extension DeviceState {
             return applyRenderedString(msg)
         default:
             return .empty  // $06 extended, and anything else, ignored.
+        }
+    }
+
+    /// Fold the device's position report into the tree.
+    ///
+    /// The device says where it is with two channel-voice messages: CC32 (Bank
+    /// Select LSB) carrying the high 7 bits, then a Program Change carrying the
+    /// low 7. Together they are a flat, 0-based rig index — `128 * msb + program`
+    /// — which divides by ``Params/bankSlots`` into bank and slot. Unlike the
+    /// CBOR snapshot, which is a one-shot read at connect, this arrives on every
+    /// change, from the front panel as readily as from a controller.
+    ///
+    /// Returns `nil` for anything that is not one of the two messages, so NRPN
+    /// parsing carries on. A Program Change with no Bank Select ahead of it is
+    /// ignored: half an index is not a position.
+    private mutating func applyRigIndex(_ msg: [UInt8]) -> ApplyOutcome? {
+        guard let status = msg.first else { return nil }
+        switch status & 0xF0 {
+        case Generated.controlChangeStatus:
+            guard msg.count >= 3, msg[1] == Generated.ccBankSelectLsb else { return nil }
+            pendingRigIndexMsb = msg[2] & 0x7F
+            return .empty
+        case Generated.programChangeStatus:
+            guard msg.count >= 2, let msb = pendingRigIndexMsb else { return nil }
+            pendingRigIndexMsb = nil
+            let index = UInt16(msb) * 128 + UInt16(msg[1] & 0x7F)
+            let bank = index / UInt16(Params.bankSlots)
+            let slot = index % UInt16(Params.bankSlots)
+            guard currentBank != bank || currentRigSlot != slot else { return .empty }
+            currentBank = bank
+            currentRigSlot = slot
+            return .slow([.currentPosition(bank: bank, slot: slot)])
+        default:
+            return nil
         }
     }
 
@@ -330,11 +437,27 @@ extension DeviceState {
         guard let (address, text) = Nrpn.parseExtendedString(msg) else { return .empty }
         let page = UInt8(truncatingIfNeeded: address / 128)
         let number = UInt8(truncatingIfNeeded: address % 128)
+        if page == Generated.pageBankPreview {
+            return applyBankPreview(number: number, text: text)
+        }
         guard page == Generated.pageStrings else { return .empty }
         let tracked = applyStringTag(number: number, text: text)
         var events: [DeviceEvent] = [.stringTag(number: number)]
         if number == Generated.stringRigName { events.append(.rigChanged) }
         return ApplyOutcome(events: events, slowChanged: tracked)
+    }
+
+    /// Store one bank-preview name (page `0x96`) into ``bank``. The number selects
+    /// the field (rig / amp / cabinet) and slot; an out-of-range number is
+    /// ignored. A stored value is a SLOW change.
+    private mutating func applyBankPreview(number: UInt8, text: String) -> ApplyOutcome {
+        guard let (field, slot) = Params.bankPreviewSlotField(number) else { return .empty }
+        switch field {
+        case .rigName: bank.slots[slot].rigName = text
+        case .ampName: bank.slots[slot].ampName = text
+        case .cabinetName: bank.slots[slot].cabinetName = text
+        }
+        return .slow([.bankPreview(number: number)])
     }
 
     /// Route one decoded numeric address/value pair into the tree. Shared by
@@ -382,6 +505,10 @@ extension DeviceState {
         // System output volumes (SLOW).
         if page == Generated.systemPage && number == Generated.mainVolumeNumber {
             output.mainVolume = value
+            return .slow([.paramChanged(page: page, number: number, value: value)])
+        }
+        if page == Generated.systemPage && number == Generated.headphoneVolumeNumber {
+            output.headphoneVolume = value
             return .slow([.paramChanged(page: page, number: number, value: value)])
         }
         if page == Generated.systemPage && number == Generated.monitorVolumeNumber {

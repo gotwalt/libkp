@@ -13,6 +13,14 @@ port = 5727
 # TCP connect timeout and socket read timeout, in seconds.
 connect_timeout_secs = 5
 socket_timeout_secs = 15
+# Minimum quiet gap between one TCP session closing and the next one opening, in
+# milliseconds. The device refuses to greet — or resets — a session opened too
+# soon after a prior socket closed (observed live: a session opened immediately
+# after a close times out waiting for the greeting; ~1 s of spacing connects
+# cleanly). An orchestrator that opens more than one session — e.g. the CBOR
+# state-dump snapshot followed by a MIDI3 stream — must space them by at least
+# this, and never run them concurrently. See docs/06.
+connection_cooldown_ms = 1000
 
 [discovery]
 # UDP broadcast discovery. The client broadcasts a fixed 34-byte poll; Profilers
@@ -62,8 +70,37 @@ session_preamble_len = 8
 # libkp; the CBOR channel is documented (docs/06) but not implemented.
 midi3_stream    = "{369F50E7-750B-459A-BAEE-85ADD3F3798D}"  # bidirectional MIDI3: meters + request/reply/control
 request_response = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}" # accepts; sends an 11-byte token on open
-cbor_control    = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"  # native CBOR (Protocol3) — experimental, not implemented
+cbor_control    = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"  # native CBOR (Protocol3): the state-dump snapshot route
 reserved        = "{77DB6B28-785E-4641-B840-42F0F06A11FC}"  # offered but rejects the handshake (-NO)
+
+[cbor]
+# The native control channel (protocol GUID `cbor_control`) completes the same
+# handshake and 8-byte preamble as the MIDI3 stream, then carries a continuous
+# sequence of bare CBOR items (RFC 8949) with no outer framing — the CBOR
+# self-description supplies the boundaries. Every item is `tag(1)` wrapping a
+# small integer array whose first element (after an optional leading negative
+# source-flag word) selects the shape. See docs/06.
+item_tag = 1
+selector_single = 1     # tag(1)([1, addr, value])            — one parameter
+selector_multi = 2      # tag(1)([2, base, v0, v1, ...])      — a consecutive run from base
+selector_string = 4     # tag(1)([4, addr, "text"])           — a string parameter
+# Inter-item padding: bare 0xC0 (a tag(0) head with no content, not well-formed
+# on its own) appears in runs between top-level items and must be skipped —
+# except when the next head opens a text string, which marks a genuine tag(0)
+# datetime rather than filler.
+filler_byte = 0xC0
+# The device does NOT volunteer its full parameter state on connect; a passive
+# session sees only live change events. Writing this single item asks for it:
+# the device answers with the whole state as a burst of `selector_multi` and
+# `selector_string` items. The write is non-mutating (it sets a status flag the
+# device already carries) and applies to address 102528 = 1.
+state_dump_trigger_address = 102528
+state_dump_trigger_value = 1
+# Addresses whose string values are the device's stored WiFi credentials
+# (network name and passphrase). The state dump volunteers both in the clear; a
+# reader must never surface them. See docs/06.
+sensitive_addresses = [200008, 200009]
+redacted_placeholder = "[redacted]"
 
 [midi3]
 # The streaming protocol carries MIDI as 4-byte frames [tag][b0 b1 b2].
