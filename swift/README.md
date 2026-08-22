@@ -21,7 +21,7 @@ Requires Swift 6.0 or newer and macOS 13+.
 |---|---|
 | `Sources/LibKP/Generated.swift` | **Generated** constants and lookup tables — do not edit; see [`../codegen`](../codegen) |
 | `Sources/LibKP/Protocol.swift` | The discovery TagStream encoding and the poll packet |
-| `Sources/LibKP/Discovery.swift` | UDP discovery over `NWListener` / `NWConnection` |
+| `Sources/LibKP/Discovery.swift` | UDP discovery over an exclusively-bound BSD socket |
 | `Sources/LibKP/Session.swift` | TCP session, protocol handshake, stream preamble |
 | `Sources/LibKP/Inbox.swift` | The timed read buffer behind the session's async reads |
 | `Sources/LibKP/Midi3.swift` | Stream framing/unframing |
@@ -80,6 +80,20 @@ if let device = try await Discovery.findFirst(listenFor: 3) {
     print(device.name ?? "unnamed", device.host)
 }
 ```
+
+Discovery needs UDP 5727 **exclusively** — the device replies only to that
+port, and the kernel hands each reply to just one bound socket, so a second
+listener steals replies rather than copying them. Acquiring it fails fast if
+another program (Kemper's Rig Manager, typically) holds it. Hold a
+`DiscoveryPort` across a session rather than re-acquiring per attempt; see
+[Discovery](../docs/02-discovery.md#owning-the-port).
+
+```swift
+let port = try DiscoveryPort()   // throws .portUnavailable if it is taken
+defer { port.close() }
+let replies = try await port.poll()
+```
+
 ### Fast vs slow state
 
 State is classified into two lanes. **FAST** is the meter `RealtimeStatus`

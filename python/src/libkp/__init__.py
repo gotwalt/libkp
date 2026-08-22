@@ -49,7 +49,7 @@ from .control import (
     program_change,
     slot_enable_cc,
 )
-from .discovery import DiscoveryOptions, Reply, discover, find_first
+from .discovery import DiscoveryOptions, DiscoveryPort, Reply, discover, find_first
 from .errors import (
     CommandError,
     ConnectError,
@@ -59,6 +59,7 @@ from .errors import (
     FieldOverrunError,
     LibKPError,
     ParseError,
+    PortUnavailableError,
     ProtocolRejectedError,
     SessionError,
     TimeoutErrorLibKP,
@@ -149,6 +150,7 @@ __all__ = [
     "DiscoveryOptions",
     "Reply",
     "discover",
+    "DiscoveryPort",
     "find_first",
     "Session",
     "HandshakeOutcome",
@@ -235,6 +237,7 @@ __all__ = [
     # errors
     "LibKPError",
     "ParseError",
+    "PortUnavailableError",
     "TooShortError",
     "FieldOverrunError",
     "DiscoverError",

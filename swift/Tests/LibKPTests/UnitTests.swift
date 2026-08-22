@@ -61,6 +61,66 @@ final class ProtocolTests: XCTestCase {
     }
 }
 
+// MARK: - Exclusive ownership of the discovery port
+
+final class DiscoveryPortTests: XCTestCase {
+    /// A second acquire must fail rather than quietly share the port. Sharing is
+    /// the failure this guards against: the kernel gives an arriving reply to
+    /// exactly one bound socket, so a co-bound listener steals replies instead of
+    /// duplicating them.
+    func testThePortIsHeldExclusively() throws {
+        let first = try DiscoveryPort(port: 54331)
+        defer { first.close() }
+        XCTAssertEqual(first.port, 54331)
+
+        XCTAssertThrowsError(try DiscoveryPort(port: 54331)) { error in
+            guard case let DiscoverError.portUnavailable(port) = error else {
+                return XCTFail("expected portUnavailable, got \(error)")
+            }
+            XCTAssertEqual(port, 54331)
+            XCTAssertTrue("\(error)".contains("exclusive"))
+        }
+    }
+
+    func testReleasingThePortLetsItBeAcquiredAgain() throws {
+        try DiscoveryPort(port: 54332).close()
+        try DiscoveryPort(port: 54332).close()  // no leak: the first release freed it
+    }
+
+    func testClosingAPortTwiceIsHarmless() throws {
+        let port = try DiscoveryPort(port: 54333)
+        port.close()
+        port.close()
+    }
+
+    /// A long-running client re-polls to notice devices coming and going, without
+    /// ever releasing the port in between.
+    func testAHeldPortCanBePolledRepeatedly() async throws {
+        let port = try DiscoveryPort(port: 54334)
+        defer { port.close() }
+        var options = DiscoveryOptions()
+        options.listenFor = 0.1
+        options.repeatEvery = 0.05
+        options.extraTargets = ["127.0.0.1"]
+
+        // Our own echoed poll must not be mistaken for a device.
+        for _ in 0..<2 {
+            let replies = try await port.poll(options)
+            XCTAssertTrue(replies.isEmpty)
+        }
+    }
+
+    /// The one-shot helper must not leave the port held behind it.
+    func testDiscoverReleasesThePortItAcquired() async throws {
+        var options = DiscoveryOptions()
+        options.listenFor = 0.1
+        options.repeatEvery = 0.05
+        _ = try await Discovery.discover(options)
+        // Would throw if `discover` leaked the standard port.
+        try DiscoveryPort().close()
+    }
+}
+
 // MARK: - MIDI3 framing
 
 final class Midi3Tests: XCTestCase {

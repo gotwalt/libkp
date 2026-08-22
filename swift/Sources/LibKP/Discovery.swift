@@ -1,5 +1,4 @@
 import Foundation
-import Network
 
 /// One raw reply from a candidate device.
 public struct DiscoveryReply: Sendable, Equatable {
@@ -48,38 +47,274 @@ public struct DiscoveryOptions: Sendable {
     }
 }
 
-/// UDP discovery: broadcast the poll, collect Profiler replies.
+/// Exclusive owner of the UDP discovery port.
 ///
-/// Discovery and the TCP session share one port (5727). The client broadcasts a
-/// fixed poll packet; Profilers on the LAN reply on the same port. The exchange
-/// was established by observed experimentation.
-public enum Discovery {
-    /// Broadcast the discovery poll and gather replies until the listen window
-    /// ends. Returns one reply per distinct source address (last payload wins).
-    public static func discover(
+/// Acquire one before opening a session and keep it for the session's lifetime.
+/// Holding it does two things: it guarantees every reply reaches *this* process —
+/// no other socket can bind the port while it is open — and it fails loudly, up
+/// front, if the port is already taken, rather than letting discovery quietly come
+/// up empty later. See ``DiscoverError/portUnavailable(port:)``.
+///
+/// ``poll(_:)`` may be called as often as needed on a held port, which is what a
+/// long-running client wants: re-poll to notice Profilers appearing and
+/// disappearing, without ever letting go of the port in between.
+///
+/// ```swift
+/// let port = try DiscoveryPort()
+/// defer { port.close() }
+/// let replies = try await port.poll()
+/// ```
+///
+/// This is a plain BSD socket rather than a `Network.framework` listener on
+/// purpose. Sharing the port is the thing to prevent, and `NWParameters` offers
+/// only `allowLocalEndpointReuse` — which sets `SO_REUSEPORT` and so invites
+/// exactly the silent reply-stealing this type exists to rule out. A raw socket
+/// is the only way to *decline* to share.
+public final class DiscoveryPort: @unchecked Sendable {
+    /// The port held.
+    public let port: UInt16
+
+    private let fd: Int32
+    private let lock = NSLock()
+    private var closed = false
+
+    /// Take exclusive ownership of `port`.
+    ///
+    /// - Throws: ``DiscoverError/portUnavailable(port:)`` if another process
+    ///   already holds it; ``DiscoverError/listenerFailed(_:)`` for any other
+    ///   socket failure.
+    public init(port: UInt16 = Generated.port) throws {
+        self.port = port
+
+        let handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard handle >= 0 else {
+            throw DiscoverError.listenerFailed("socket(): \(DiscoveryPort.errnoText())")
+        }
+
+        // Broadcast is required to reach 255.255.255.255 and the per-interface
+        // subnet broadcasts. Note what is *not* set: neither SO_REUSEADDR nor
+        // SO_REUSEPORT, so the bind below is exclusive.
+        var on: Int32 = 1
+        guard
+            setsockopt(
+                handle, SOL_SOCKET, SO_BROADCAST, &on, socklen_t(MemoryLayout<Int32>.size)) == 0
+        else {
+            let text = DiscoveryPort.errnoText()
+            Darwin.close(handle)
+            throw DiscoverError.listenerFailed("SO_BROADCAST: \(text)")
+        }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: in_addr_t(0))  // INADDR_ANY
+        let bound = withUnsafePointer(to: &address) { raw in
+            raw.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(handle, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else {
+            let code = errno
+            let text = DiscoveryPort.errnoText(code)
+            Darwin.close(handle)
+            // The whole point of the exclusive bind: a port already in use is a
+            // conflict to report, not a condition to work around.
+            if code == EADDRINUSE { throw DiscoverError.portUnavailable(port: port) }
+            throw DiscoverError.listenerFailed("bind(): \(text)")
+        }
+
+        self.fd = handle
+    }
+
+    deinit { close() }
+
+    /// Release the port. Safe to call more than once.
+    public func close() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        closed = true
+        Darwin.close(fd)
+    }
+
+    /// Broadcast the poll and gather replies until the listen window ends.
+    ///
+    /// Returns one reply per distinct source address (last payload wins). The
+    /// device answers from a fresh ephemeral port each poll, so keying by full
+    /// source address would report one "device" per reply.
+    public func poll(
         _ options: DiscoveryOptions = DiscoveryOptions()
     ) async throws -> [DiscoveryReply] {
         let collector = ReplyCollector()
-        let poll = KemperProtocol.buildPollRequest(mac: options.mac)
-        let targets = broadcastTargets(extra: options.extraTargets)
+        let packet = KemperProtocol.buildPollRequest(mac: options.mac)
+        let targets = Discovery.broadcastTargets(extra: options.extraTargets)
+        let cancelled = CancelFlag()
 
-        let listener = try makeListener(collector: collector)
-        defer { listener.cancel() }
-
-        let senders = targets.map { makeSender(to: $0, collector: collector) }
-        defer { senders.forEach { $0.cancel() } }
-
-        let deadline = Date().addingTimeInterval(options.listenFor)
-        while Date() < deadline {
-            for sender in senders {
-                sender.send(content: Data(poll), completion: .contentProcessed { _ in })
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                DiscoveryPort.queue.async {
+                    do {
+                        try self.run(
+                            packet: packet, targets: targets, options: options,
+                            collector: collector, cancelled: cancelled)
+                        continuation.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
             }
-            let wait = min(options.repeatEvery, max(deadline.timeIntervalSinceNow, 0))
-            if wait <= 0 { break }
-            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
-            if Task.isCancelled { throw DiscoverError.cancelled }
+        } onCancel: {
+            cancelled.set()
         }
+
         return collector.replies()
+    }
+
+    // MARK: - The blocking poll loop
+
+    /// Runs on ``queue``: send a round, wait for readability, drain, repeat until
+    /// the window closes. Blocking here keeps it off the cooperative pool.
+    private func run(
+        packet: [UInt8],
+        targets: [String],
+        options: DiscoveryOptions,
+        collector: ReplyCollector,
+        cancelled: CancelFlag
+    ) throws {
+        let deadline = Date().addingTimeInterval(options.listenFor)
+        var nextPoll = Date.distantPast
+        var buffer = [UInt8](repeating: 0, count: 2048)
+
+        while true {
+            if cancelled.isSet { throw DiscoverError.cancelled }
+            let now = Date()
+            if now >= deadline { break }
+
+            if now >= nextPoll {
+                try sendRound(packet: packet, targets: targets)
+                nextPoll = now.addingTimeInterval(options.repeatEvery)
+            }
+
+            // Wake for whichever comes first: the next poll or the deadline.
+            let window = min(deadline, nextPoll).timeIntervalSince(Date())
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = Darwin.poll(&descriptor, 1, Int32(max(0, window * 1000).rounded()))
+            if ready < 0 {
+                if errno == EINTR { continue }
+                throw DiscoverError.listenerFailed("poll(): \(DiscoveryPort.errnoText())")
+            }
+            if ready == 0 { continue }
+
+            var from = sockaddr_in()
+            var fromLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let received = withUnsafeMutablePointer(to: &from) { raw in
+                raw.withMemoryRebound(to: sockaddr.self, capacity: 1) { sender in
+                    buffer.withUnsafeMutableBytes {
+                        recvfrom($0.baseAddress, $0.count, 0, sender, &fromLength, on: fd)
+                    }
+                }
+            }
+            if received < 0 {
+                if errno == EINTR || errno == EAGAIN { continue }
+                throw DiscoverError.listenerFailed("recvfrom(): \(DiscoveryPort.errnoText())")
+            }
+            guard received > 0 else { continue }
+
+            collector.record(
+                host: Discovery.ipv4String(from.sin_addr.s_addr),
+                payload: Array(buffer[0..<received]))
+        }
+    }
+
+    /// Send the poll to every target. One unreachable target (a firewall denying
+    /// global broadcast, say) must not abort the sweep — only a total failure does.
+    private func sendRound(packet: [UInt8], targets: [String]) throws {
+        var sent = 0
+        var lastError = ""
+        for target in targets {
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = port.bigEndian
+            guard inet_pton(AF_INET, target, &address.sin_addr) == 1 else {
+                lastError = "\(target): not an IPv4 address"
+                continue
+            }
+            let result = withUnsafePointer(to: &address) { raw in
+                raw.withMemoryRebound(to: sockaddr.self, capacity: 1) { destination in
+                    packet.withUnsafeBytes {
+                        sendto(
+                            fd, $0.baseAddress, $0.count, 0, destination,
+                            socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+            if result < 0 {
+                lastError = "\(target): \(DiscoveryPort.errnoText())"
+            } else {
+                sent += 1
+            }
+        }
+        if sent == 0 && !lastError.isEmpty { throw DiscoverError.sendFailed(lastError) }
+    }
+
+    private static let queue = DispatchQueue(label: "com.libkp.discovery")
+
+    private static func errnoText(_ code: Int32 = errno) -> String {
+        String(cString: strerror(code))
+    }
+}
+
+/// `recvfrom` with the buffer arguments first, so the pointer dances above nest
+/// in a readable order.
+private func recvfrom(
+    _ buffer: UnsafeMutableRawPointer?,
+    _ count: Int,
+    _ flags: Int32,
+    _ sender: UnsafeMutablePointer<sockaddr>,
+    _ senderLength: UnsafeMutablePointer<socklen_t>,
+    on fd: Int32
+) -> Int {
+    Darwin.recvfrom(fd, buffer, count, flags, sender, senderLength)
+}
+
+/// A cancellation bit shared between the task and the blocking loop.
+private final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    func set() {
+        lock.lock()
+        flag = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flag
+    }
+}
+
+/// UDP discovery: broadcast the poll, collect Profiler replies.
+///
+/// Discovery and the TCP session share port 5727. The client broadcasts a fixed
+/// poll packet; Profilers on the LAN reply on the same port. The exchange was
+/// established by observed experimentation.
+public enum Discovery {
+    /// Acquire the discovery port, poll once, and release it.
+    ///
+    /// A convenience for one-shot callers such as a CLI. Anything that goes on to
+    /// open a session should hold a ``DiscoveryPort`` across the session instead,
+    /// so no other process can take the port midway through.
+    public static func discover(
+        _ options: DiscoveryOptions = DiscoveryOptions()
+    ) async throws -> [DiscoveryReply] {
+        let port = try DiscoveryPort()
+        defer { port.close() }
+        return try await port.poll(options)
     }
 
     /// Convenience: discover for `listenFor` seconds and return the first device
@@ -88,82 +323,6 @@ public enum Discovery {
         var options = DiscoveryOptions()
         options.listenFor = listenFor
         return try await discover(options).first
-    }
-
-    // MARK: - Transport plumbing
-
-    private static func makeListener(collector: ReplyCollector) throws -> NWListener {
-        let parameters = NWParameters.udp
-        parameters.allowLocalEndpointReuse = true
-        guard let port = NWEndpoint.Port(rawValue: Generated.port) else {
-            throw DiscoverError.listenerFailed("invalid port")
-        }
-        let listener: NWListener
-        do {
-            listener = try NWListener(using: parameters, on: port)
-        } catch {
-            throw DiscoverError.listenerFailed(error.localizedDescription)
-        }
-        listener.newConnectionHandler = { connection in
-            connection.start(queue: discoveryQueue)
-            connection.receiveMessage { data, _, _, _ in
-                if let data, !data.isEmpty {
-                    collector.record(
-                        host: endpointHost(connection.endpoint), payload: [UInt8](data))
-                }
-                connection.cancel()
-            }
-        }
-        listener.start(queue: discoveryQueue)
-        return listener
-    }
-
-    private static func makeSender(to host: String, collector: ReplyCollector) -> NWConnection {
-        let parameters = NWParameters.udp
-        parameters.allowLocalEndpointReuse = true
-        // Poll from the shared port so a device that answers the source port is
-        // heard by the listener bound there.
-        if let localPort = NWEndpoint.Port(rawValue: Generated.port) {
-            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.any), port: localPort)
-        }
-        let connection = NWConnection(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: Generated.port) ?? .any,
-            using: parameters
-        )
-        connection.start(queue: discoveryQueue)
-        receiveLoop(connection, collector: collector)
-        return connection
-    }
-
-    /// Some stacks deliver the reply on the sending socket rather than the
-    /// listener; drain it either way.
-    private static func receiveLoop(_ connection: NWConnection, collector: ReplyCollector) {
-        connection.receiveMessage { data, _, _, error in
-            if let data, !data.isEmpty {
-                collector.record(host: endpointHost(connection.endpoint), payload: [UInt8](data))
-            }
-            guard error == nil else { return }
-            receiveLoop(connection, collector: collector)
-        }
-    }
-
-    private static let discoveryQueue = DispatchQueue(label: "com.libkp.discovery")
-
-    private static func endpointHost(_ endpoint: NWEndpoint) -> String {
-        switch endpoint {
-        case let .hostPort(host, _):
-            switch host {
-            case let .ipv4(address):
-                return "\(address)".components(separatedBy: "%").first ?? "\(address)"
-            case let .ipv6(address):
-                return "\(address)".components(separatedBy: "%").first ?? "\(address)"
-            case let .name(name, _): return name
-            @unknown default: return "\(host)"
-            }
-        default:
-            return "\(endpoint)"
-        }
     }
 
     /// Broadcast targets: the global broadcast address, every local IPv4
@@ -210,7 +369,7 @@ public enum Discovery {
     }
 
     /// Format a network-byte-order IPv4 address.
-    private static func ipv4String(_ networkOrder: in_addr_t) -> String {
+    static func ipv4String(_ networkOrder: in_addr_t) -> String {
         let host = UInt32(bigEndian: networkOrder)
         return "\((host >> 24) & 0xFF).\((host >> 16) & 0xFF).\((host >> 8) & 0xFF).\(host & 0xFF)"
     }

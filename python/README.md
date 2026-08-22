@@ -121,6 +121,21 @@ async def main():
 
 asyncio.run(main())
 ```
+
+Discovery needs UDP 5727 **exclusively** — the device replies only to that
+port, and the kernel hands each reply to just one bound socket, so a second
+listener steals replies rather than copying them. Acquiring it fails fast if
+another program (Kemper's Rig Manager, typically) holds it. Hold a
+`DiscoveryPort` across a session rather than re-acquiring per attempt; see
+[Discovery](../docs/02-discovery.md#owning-the-port).
+
+```python
+from libkp import DiscoveryPort
+
+with DiscoveryPort.acquire() as port:  # raises PortUnavailableError if taken
+    replies = await port.poll()
+```
+
 ## Layout
 
 | Module | What it does |

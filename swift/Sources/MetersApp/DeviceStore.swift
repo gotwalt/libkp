@@ -175,6 +175,10 @@ final class DeviceStore: ObservableObject {
     private var model: DeviceModel?
     private var tasks: [Task<Void, Never>] = []
     private var epoch = 0
+    /// The UDP discovery port, taken on first use and held for as long as this
+    /// store lives — deliberately not released between connect attempts. See
+    /// ``heldDiscoveryPort()``.
+    private var discoveryPort: DiscoveryPort?
 
     // The fast lane, accumulated off the published properties.
     private var frame = MeterFrame()
@@ -282,8 +286,9 @@ final class DeviceStore: ObservableObject {
             } else {
                 phase = .discovering
                 do {
-                    let reply = try await Discovery.findFirst(
-                        listenFor: DeviceStore.discoveryWindow)
+                    var options = DiscoveryOptions()
+                    options.listenFor = DeviceStore.discoveryWindow
+                    let reply = try await heldDiscoveryPort().poll(options).first
                     guard epoch == self.epoch else { return }
                     guard let reply else {
                         phase = .failed(message: "No Profiler found on the network.")
@@ -293,6 +298,15 @@ final class DeviceStore: ObservableObject {
                     host = reply.host
                     name = reply.name
                     Log.conn("discovered \(reply.host) \(Log.opt(reply.name))")
+                } catch let error as DiscoverError {
+                    guard epoch == self.epoch else { return }
+                    // `DiscoverError` states the remedy itself — in particular
+                    // ``DiscoverError/portUnavailable(port:)`` names the conflict
+                    // rather than leaving it to look like an absent device.
+                    Log.conn("discovery failed: \(error)")
+                    phase = .failed(message: "\(error)")
+                    await waitBeforeRetry()
+                    continue
                 } catch {
                     guard epoch == self.epoch else { return }
                     phase = .failed(message: "Discovery failed: \(error)")
@@ -363,6 +377,26 @@ final class DeviceStore: ObservableObject {
                 await waitBeforeRetry()
             }
         }
+    }
+
+    /// The discovery port, acquired once and then held.
+    ///
+    /// LibKP requires sole ownership of UDP 5727: the device answers a poll only
+    /// on that port, and the kernel gives each reply to exactly one bound socket,
+    /// so a second listener on the machine takes replies instead of duplicating
+    /// them. Holding the port for the whole session means no other process can
+    /// take it between a dropped connection and the reconnect, and acquiring it
+    /// up front turns a conflict into a stated error rather than a device that
+    /// appears to be missing.
+    ///
+    /// Only ``ConnectionMode/automatic`` needs it. Manual mode connects straight
+    /// to a known address over TCP and never polls, so it does not claim the port.
+    private func heldDiscoveryPort() throws -> DiscoveryPort {
+        if let discoveryPort { return discoveryPort }
+        let port = try DiscoveryPort()
+        Log.conn("acquired UDP \(port.port) exclusively for this session")
+        discoveryPort = port
+        return port
     }
 
     /// Sleep out the retry delay.

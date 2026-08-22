@@ -9,14 +9,15 @@ key][value]`` fields (``NAME``, ``SER#``, ``VSTR``, …).
 from __future__ import annotations
 
 import asyncio
+import errno
 import socket
 from dataclasses import dataclass, field
 
 from . import _generated as gen
-from .errors import DiscoverError, ParseError
+from .errors import DiscoverError, ParseError, PortUnavailableError
 from .protocol import PLACEHOLDER_MAC, PORT, TagStream, build_poll_request
 
-__all__ = ["Reply", "DiscoveryOptions", "discover", "find_first"]
+__all__ = ["Reply", "DiscoveryOptions", "DiscoveryPort", "discover", "find_first"]
 
 #: The global IPv4 broadcast address.
 _GLOBAL_BROADCAST = "255.255.255.255"
@@ -139,22 +140,35 @@ def broadcast_targets(extra: list[str] | None = None) -> list[str]:
 
 
 def _bind_broadcast_socket(port: int) -> socket.socket:
-    """Create a UDP socket suitable for broadcast discovery, bound to ``port``."""
+    """Create a UDP socket for broadcast discovery, bound **exclusively** to ``port``.
+
+    Neither ``SO_REUSEADDR`` nor ``SO_REUSEPORT`` is set, and that is deliberate.
+    The device answers a poll only on this port, and the kernel delivers each
+    arriving datagram to just one of the sockets bound to it — so a second
+    listener does not see a copy of the reply, it takes it. Sharing the port
+    therefore turns discovery into a coin flip rather than a redundancy.
+
+    Refusing to share makes the conflict loud: acquiring the port fails with
+    :class:`PortUnavailableError` at start-up, and once acquired no other process
+    can take it for as long as the socket is open.
+    """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     except OSError as exc:
         raise DiscoverError(f"failed to create UDP socket: {exc}") from exc
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        reuse_port = getattr(socket, "SO_REUSEPORT", None)
-        if reuse_port is not None:
-            sock.setsockopt(socket.SOL_SOCKET, reuse_port, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.setblocking(False)
-        sock.bind(("0.0.0.0", port))
     except OSError as exc:
         sock.close()
         raise DiscoverError(f"failed to configure discovery socket: {exc}") from exc
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError as exc:
+        sock.close()
+        if exc.errno == errno.EADDRINUSE:
+            raise PortUnavailableError(port, exc) from exc
+        raise DiscoverError(f"failed to bind discovery socket: {exc}") from exc
     return sock
 
 
@@ -175,22 +189,68 @@ async def _send_round(
         raise DiscoverError(f"failed to send discovery poll: {last_error}")
 
 
-async def discover(options: DiscoveryOptions | None = None) -> list[Reply]:
-    """Broadcast the discovery poll and gather replies until the window ends.
+class DiscoveryPort:
+    """Exclusive owner of the UDP discovery port.
 
-    Returns one :class:`Reply` per distinct source IP (last payload wins). The
-    device answers from a fresh ephemeral port each poll, so keying by full
-    source address would report one "device" per reply.
+    Acquire one before opening a session and keep it for the session's lifetime.
+    Holding it does two things: it guarantees every reply reaches *this* process
+    — no other socket can bind the port while it is open — and it fails loudly,
+    up front, if the port is already taken, rather than letting discovery come up
+    empty later on. See :class:`~libkp.errors.PortUnavailableError`.
+
+    :meth:`poll` may be called as often as needed on a held port, which is what a
+    long-running client wants: the device set is re-polled to notice Profilers
+    appearing and disappearing, without ever letting go of the port in between.
+
+    Usable as a context manager::
+
+        with DiscoveryPort.acquire() as port:
+            replies = await port.poll()
     """
-    opts = options or DiscoveryOptions()
-    loop = asyncio.get_running_loop()
-    poll = build_poll_request(opts.mac)
-    targets = broadcast_targets(opts.extra_targets)
-    sock = _bind_broadcast_socket(opts.port)
 
-    replies: dict[str, Reply] = {}
-    try:
-        await _send_round(loop, sock, poll, targets, opts.port)
+    __slots__ = ("_sock", "port")
+
+    def __init__(self, sock: socket.socket, port: int) -> None:
+        self._sock = sock
+        #: The port held.
+        self.port = port
+
+    @classmethod
+    def acquire(cls, port: int = PORT) -> DiscoveryPort:
+        """Take exclusive ownership of ``port``.
+
+        :raises PortUnavailableError: if another process already holds it.
+        """
+        return cls(_bind_broadcast_socket(port), port)
+
+    def close(self) -> None:
+        """Release the port. Safe to call more than once."""
+        self._sock.close()
+
+    def __enter__(self) -> DiscoveryPort:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    async def poll(self, options: DiscoveryOptions | None = None) -> list[Reply]:
+        """Broadcast the poll and gather replies until the listen window ends.
+
+        Returns one :class:`Reply` per distinct source IP (last payload wins). The
+        device answers from a fresh ephemeral port each poll, so keying by full
+        source address would report one "device" per reply.
+
+        ``options.port`` is ignored — the poll goes out on the held port, since
+        that is the one the device replies to.
+        """
+        opts = options or DiscoveryOptions()
+        loop = asyncio.get_running_loop()
+        poll = build_poll_request(opts.mac)
+        targets = broadcast_targets(opts.extra_targets)
+        sock = self._sock
+
+        replies: dict[str, Reply] = {}
+        await _send_round(loop, sock, poll, targets, self.port)
         deadline = loop.time() + opts.listen_for
         next_poll = loop.time() + opts.repeat_every
 
@@ -213,12 +273,22 @@ async def discover(options: DiscoveryOptions | None = None) -> list[Reply]:
                     replies[addr[0]] = Reply(addr=addr, payload=payload)
 
             if loop.time() >= next_poll:
-                await _send_round(loop, sock, poll, targets, opts.port)
+                await _send_round(loop, sock, poll, targets, self.port)
                 next_poll = loop.time() + opts.repeat_every
-    finally:
-        sock.close()
 
-    return [replies[ip] for ip in sorted(replies)]
+        return [replies[ip] for ip in sorted(replies)]
+
+
+async def discover(options: DiscoveryOptions | None = None) -> list[Reply]:
+    """Acquire the discovery port, poll once, and release it.
+
+    A convenience for one-shot callers such as a CLI. Anything that goes on to
+    open a session should hold a :class:`DiscoveryPort` across the session
+    instead, so no other process can take the port midway through.
+    """
+    opts = options or DiscoveryOptions()
+    with DiscoveryPort.acquire(opts.port) as port:
+        return await port.poll(opts)
 
 
 async def find_first(listen_for: float = 3.0) -> Reply | None:
