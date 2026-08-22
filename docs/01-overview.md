@@ -66,13 +66,14 @@ socket, replying inline.
 
 ## The four protocol GUIDs
 
-The device offers four dialects at step 4. `libkp` implements the first.
+The device offers four dialects at step 4. `libkp` speaks the first fully and
+the third for one purpose.
 
 | GUID | Role | In `libkp` |
 |---|---|---|
 | `{369F50E7-750B-459A-BAEE-85ADD3F3798D}` | MIDI3 stream — meters, requests, replies, control | **implemented** |
 | `{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}` | request/response channel; emits an 11-byte token on open | not implemented |
-| `{774CDB9E-74ED-4740-AF09-AC96B3A69A11}` | native CBOR control channel | [experimental](06-cbor-channel.md), not implemented |
+| `{774CDB9E-74ED-4740-AF09-AC96B3A69A11}` | native CBOR control channel | [the state-dump snapshot only](06-cbor-channel.md) |
 | `{77DB6B28-785E-4641-B840-42F0F06A11FC}` | reserved — offered, but rejects the handshake with `-NO` | n/a |
 
 See [Handshake](03-handshake.md).
@@ -127,8 +128,10 @@ Even with no requests outstanding, an open MIDI3 stream delivers:
   number `$4E`, eleven 14-bit values: the tuner strobe and the output meters
   ([Realtime status & meters](07-realtime-status.md));
 - the **beat pulse** at page `$7C`, number 0, toggling 0/16383 with the tempo;
-- a **`$01` echo of every parameter the device changes**, including changes made
-  at the front panel — which is what lets a client keep a consistent state model;
+- a **`$01` push for parameters the device changes on its own**, such as a knob
+  turned at the front panel — a client's own `$01` writes are *not* echoed, so
+  confirming one means asking for it back with `$41`
+  ([Control model](08-control-model.md));
 - on a rig change, an **unprompted dump of the entire new rig**: name, author,
   comment, amp, cabinet, every effect-slot type and state, and the rig settings.
 

@@ -121,7 +121,6 @@ async def main():
 
 asyncio.run(main())
 ```
-
 ## Layout
 
 | Module | What it does |
@@ -130,6 +129,7 @@ asyncio.run(main())
 | `libkp.discovery` | Async UDP broadcast discovery (`discover`, `find_first`). |
 | `libkp.session` | TCP connect plus the line-based protocol-selection handshake. |
 | `libkp.midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
+| `libkp.cbor` | The native CBOR channel: codec plus `fetch_state_snapshot`, the state-dump read of the current bank/rig. |
 | `libkp.nrpn` | Kemper SysEx/NRPN builders and parsers, plus the beacon. |
 | `libkp.control` | The 7-bit CC / PC / Bank Select vocabulary. |
 | `libkp.params` | Offline `page/number → name` lookups. |
@@ -163,16 +163,26 @@ Commands split into two groups:
 - **Parameters** (`set_gain`, `set_rig_volume`, `set_main_volume`,
   `set_monitor_volume`, `set_effect_enabled`, `set_effect_mix`, `set_tempo_bpm`,
   `set_param`) go out as 14-bit NRPN `$01` Single Parameter Changes. The device
-  echoes them on the same stream the model ingests, so `model.state()` stays
-  consistent.
+  applies them silently and does not echo them, so follow a set with
+  `request_param()` when `model.state()` should confirm the new value.
 - **Actions** (`select_rig`, `rig_up`, `rig_down`, `bank`, `tap_tempo`,
   `tuner_mode`, `morph_button`, `freeze`, `rotary_fast`, `delay_infinity`,
   `effect_button`, the pedals, and `send_control`) are momentary 7-bit Control
   Changes and are not reflected in state.
 
-`refresh_rig()` is neither: it only issues read-only value *requests* (the rig
-strings and each effect slot's Type/On-Off) and is what `connect()` runs as the
-initial sync.
+`refresh_rig()` and `refresh_bank()` are neither: they only issue read-only value
+*requests* — the rig strings and each effect slot's Type/On-Off, and the current
+bank's five-slot rig/amp/cabinet name preview — and are what `connect()` runs as
+the initial sync. The bank preview lands in `state.bank`; the master-volume knob
+reads back through `state.output.master_volume`.
+
+The device's **current bank and rig position** is not on the MIDI3 stream at all.
+`await fetch_state_snapshot(ip)` reads it over the native CBOR channel (docs/06):
+it opens its own short-lived session, triggers the device's state dump, and
+returns the 0-based `current_bank` / `current_rig_slot`. Run it at boot *before*
+`DeviceModel.connect` — the device dislikes concurrent connections — then feed
+the result in with `model.set_current_position(bank, slot)`, which folds the
+indices into `state.current_bank` / `state.current_rig_slot`.
 
 ## Decoding without a device
 

@@ -13,7 +13,8 @@ Every protocol constant and lookup table lives once, in [`../spec`](../spec):
   the discovery poll.
 - `parameters.toml` — the page/number parameter maps, effect slots, string tags,
   and well-known addresses.
-- `effect-types.toml` — the effect Type value → name table.
+- `effect-types.toml` — the effect Type value → name table, and the category
+  blocks the values are allocated in.
 - `controls.toml` — the Control Change vocabulary.
 - `meters.toml` — the realtime status / meter block.
 

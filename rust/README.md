@@ -35,16 +35,16 @@ while let Ok(state) = snapshots.recv().await {
 # Ok(())
 # }
 ```
-
 ## Layout
 
 | Module | What it does |
 |---|---|
 | `generated` | **Data only** — constants and lookup tables emitted from the shared `spec/` by `codegen/generate.py`. Never edited by hand. |
 | `protocol` | The tag-stream wire encoding and the `DSCV` discovery poll packet. |
-| `discovery` | Async UDP broadcast discovery (`discover`, `find_first`). |
+| `discovery` | Async UDP broadcast discovery (`DiscoveryPort`, `discover`, `find_first`). |
 | `session` | TCP connect, the protocol-list handshake, and the stream preamble. |
 | `midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
+| `cbor` | The native CBOR channel: codec plus `StateSnapshot::fetch`, the state-dump read of the current bank/rig. |
 | `nrpn` | Kemper SysEx/NRPN builders and parsers (14-bit values, string tags, extended strings, the beacon). |
 | `control` | The 7-bit CC / Program Change / Bank Select vocabulary (`Control`). |
 | `params` | Offline `page/number → name` lookups over the generated tables. |
@@ -70,8 +70,9 @@ than snapshots.
 ### Parameters vs actions
 
 - **Parameters** (`set_gain`, `set_rig_volume`, `set_effect_enabled`, …) go out
-  as 14-bit NRPN Single Parameter Changes. The device echoes them back on the
-  same stream, so the snapshot stays consistent.
+  as 14-bit NRPN Single Parameter Changes. The device applies them silently and
+  does not echo them, so follow a set with `request_param` when the snapshot
+  should confirm the new value.
 - **Actions** (`tap_tempo`, `rig_up`, `select_rig`, `tuner_mode`, …) go out as
   7-bit Control Changes. They are momentary and carry no read-back, so they are
   not reflected in state.
