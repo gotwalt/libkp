@@ -1,0 +1,55 @@
+{
+  "description": "The native CBOR control channel: the state-dump write, and reading the current bank/rig position out of a decoded dump.",
+  "param_write": [
+    {
+      "addr": 15953,
+      "value": 0,
+      "hex": "c18301193e5100"
+    },
+    {
+      "addr": 102405,
+      "value": 19,
+      "hex": "c183011a0001900513"
+    },
+    {
+      "addr": 102528,
+      "value": 1,
+      "hex": "c183011a0001908001"
+    }
+  ],
+  "state_dump_request": {
+    "hex": "c183011a0001908001"
+  },
+  "extract_snapshot": [
+    {
+      "name": "position inside one consecutive multi-run, after inter-item filler",
+      "stream_hex": "c0c0c185021a0001895c000102",
+      "expect": {
+        "current_bank": 1,
+        "current_rig_slot": 2,
+        "strings": []
+      }
+    },
+    {
+      "name": "position from single items, plus a rig name and a redacted secret",
+      "stream_hex": "c183011a0001895d03c183011a0001895e04c18304016d4d617a20313820507573686564c183041a00030d4866736563726574",
+      "expect": {
+        "current_bank": 3,
+        "current_rig_slot": 4,
+        "strings": [
+          { "addr": 1, "text": "Maz 18 Pushed" },
+          { "addr": 200008, "text": "[redacted]" }
+        ]
+      }
+    },
+    {
+      "name": "an empty stream yields no position",
+      "stream_hex": "",
+      "expect": {
+        "current_bank": null,
+        "current_rig_slot": null,
+        "strings": []
+      }
+    }
+  ]
+}
