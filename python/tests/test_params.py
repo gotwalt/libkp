@@ -43,6 +43,15 @@ def test_effect_types():
     assert params.effect_type_name(5) is None
 
 
+def test_effect_categories():
+    assert params.effect_category_name(16) == "Wah"
+    assert params.effect_category_name(17) == "Shaper"
+    # A type with no name still resolves to its block.
+    assert params.effect_category_name(76) == "Modulation"
+    assert params.effect_category_name(0) is None
+    assert params.effect_category_name(300) is None
+
+
 def test_realtime_page_addresses():
     assert params.page_name(0x7C) == "Realtime/Meters"
     assert params.param_name(0x7C, 0x4E) == "Tuner Strobe Segment (phase-low)"

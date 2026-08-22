@@ -22,6 +22,25 @@ pub enum DiscoverError {
         source: std::io::Error,
     },
 
+    /// The discovery port is already held by another process.
+    ///
+    /// libkp takes UDP [`DISCOVERY_PORT`](crate::protocol::DISCOVERY_PORT)
+    /// exclusively for as long as a session is active. The device answers a poll
+    /// only on that port, and the kernel hands each arriving reply to exactly one
+    /// of the sockets bound to it — so a second listener takes replies rather
+    /// than seeing a copy. Binding exclusively surfaces the clash here, at
+    /// start-up, instead of as a device that intermittently cannot be found.
+    #[error(
+        "UDP port {port} is already held by another application. libkp needs \
+         exclusive use of it while a session is active; quit any other Kemper \
+         software (Rig Manager keeps this port open) and try again: {source}"
+    )]
+    PortUnavailable {
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("failed to enumerate local network interfaces: {0}")]
     Interfaces(#[source] std::io::Error),
 

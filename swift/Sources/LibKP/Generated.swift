@@ -3,10 +3,11 @@
 import Foundation
 
 public enum Generated {
-    public static let specVersion: String = "0.1.0"
+    public static let specVersion: String = "0.5.0"
     public static let port: UInt16 = 5727
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15
+    public static let connectionCooldownMs: UInt64 = 1000
     public static let discoveryHeader: String = "DSCV"
     public static let pollIntervalMs: UInt64 = 500
     public static let pollMacPrefix: String = "MAC#"
@@ -21,6 +22,15 @@ public enum Generated {
     public static let protocolRequestResponse: String = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}"
     public static let protocolCborControl: String = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"
     public static let protocolReserved: String = "{77DB6B28-785E-4641-B840-42F0F06A11FC}"
+    public static let cborItemTag: UInt64 = 1
+    public static let cborSelectorSingle: Int64 = 1
+    public static let cborSelectorMulti: Int64 = 2
+    public static let cborSelectorString: Int64 = 4
+    public static let cborFillerByte: UInt8 = 0xc0
+    public static let stateDumpTriggerAddress: UInt32 = 102528
+    public static let stateDumpTriggerValue: Int64 = 1
+    public static let sensitiveAddresses: [UInt32] = [200008, 200009]
+    public static let redactedPlaceholder: String = "[redacted]"
     public static let midi3TagContinuation: UInt8 = 0x14
     public static let midi3TagFinal1: UInt8 = 0x15
     public static let midi3TagFinal2: UInt8 = 0x16
@@ -69,7 +79,13 @@ public enum Generated {
     public static let gainNumber: UInt8 = 0x04
     public static let systemPage: UInt8 = 0x7f
     public static let mainVolumeNumber: UInt8 = 0x00
+    public static let headphoneVolumeNumber: UInt8 = 0x01
     public static let monitorVolumeNumber: UInt8 = 0x02
+    public static let pageBankPreview: UInt8 = 0x96
+    public static let bankSlots: Int = 5
+    public static let bankRigNameBase: UInt8 = 0x00
+    public static let bankAmpNameBase: UInt8 = 0x05
+    public static let bankCabinetNameBase: UInt8 = 0x0a
     public static let pageMorph: UInt8 = 0x00
     public static let morphNumber: UInt8 = 0x0b
     public static let pageTunerNote: UInt8 = 0x7d
@@ -77,6 +93,8 @@ public enum Generated {
     public static let tunerInTuneCenter: UInt16 = 8192
     public static let tunerInTuneWindow: UInt16 = 350
     public static let meterCount: Int = 11
+    public static let currentBankAddress: UInt32 = 100701
+    public static let currentRigSlotAddress: UInt32 = 100702
     public static let meterPage: UInt8 = 0x7c
     public static let meterFirstNumber: UInt8 = 0x4e
     public static let meterUpdateRateHz: Int = 20
@@ -128,7 +146,7 @@ public enum Generated {
     public static let controlChangeStatus: UInt8 = 0xb0
 
     public static let functionNames: [UInt8: String] = [0x01: "single-param", 0x02: "multi-param", 0x03: "string-param", 0x04: "blob", 0x06: "ext-param", 0x07: "ext-string-param", 0x08: "morphed-multi-param", 0x3c: "rendered-string-reply", 0x41: "request-single", 0x42: "request-multi", 0x43: "request-string", 0x47: "request-ext-string", 0x7c: "request-rendered-string", 0x7e: "beacon"]
-    public static let pageNames: [UInt8: String] = [0x00: "String Tags", 0x04: "Rig Settings", 0x05: "Fixed FX", 0x09: "Input Section", 0x0a: "Amplifier", 0x0b: "Amplifier EQ", 0x0c: "Cabinet", 0x32: "Effect A", 0x33: "Effect B", 0x34: "Effect C", 0x35: "Effect D", 0x38: "Effect X", 0x3a: "Effect MOD", 0x3c: "Effect DLY", 0x3d: "Effect REV", 0x76: "User Scales", 0x7c: "Realtime/Meters", 0x7d: "Looper/Freeze", 0x7f: "System/Global"]
+    public static let pageNames: [UInt8: String] = [0x00: "String Tags", 0x04: "Rig Settings", 0x05: "Fixed FX", 0x09: "Input Section", 0x0a: "Amplifier", 0x0b: "Amplifier EQ", 0x0c: "Cabinet", 0x32: "Effect A", 0x33: "Effect B", 0x34: "Effect C", 0x35: "Effect D", 0x38: "Effect X", 0x3a: "Effect MOD", 0x3c: "Effect DLY", 0x3d: "Effect REV", 0x76: "User Scales", 0x7c: "Realtime/Meters", 0x7d: "Looper/Freeze", 0x7f: "System/Global", 0x96: "Bank Preview"]
     public static let effectSlots: [(String, UInt8)] = [("A", 0x32), ("B", 0x33), ("C", 0x34), ("D", 0x35), ("X", 0x38), ("MOD", 0x3a), ("DLY", 0x3c), ("REV", 0x3d)]
     public static let effectParams: [UInt8: String] = [0: "Type", 3: "On/Off", 4: "Mix", 6: "Volume", 7: "Stereo", 8: "Wah Manual / Freq Shifter Delay Pitch", 9: "Wah Peak", 10: "Wah Pedal Range", 12: "Wah Pedal Mode", 13: "Wah Touch Attack / Fuzz Impedance LP", 14: "Wah Touch Release", 15: "Wah Touch Boost / Delay Cross Feedback", 16: "Distortion Drive / Reverb Formant Mix", 17: "Distortion Tone / Reverb Mid Frequency", 18: "Fuzz Octa / Compressor Intensity / Noise Gate Threshold / Auto Swell Compressor", 19: "Compressor Attack / Legacy Delay Bandwidth / Legacy Reverb Bandwidth", 20: "Fuzz Transistor Shape / Modulation Rate / Auto Swell / Widener Tune", 21: "Drive Definition / Fuzz Transistor Tone / Modulation Depth / Micro Pitch Detune / Double Tracker Looseness / Widener Intensity", 22: "Modulation Feedback / Formant Reverb Vowel", 23: "Drive Slim Down / Fuzz Definition / Modulation Crossover / Octaver Low Cut", 24: "Modulation Hyper Chorus Amount", 25: "Modulation Manual / Reverb Formant Offset / Spring Reverb Spectral Balance", 26: "Modulation Peak Spread / Wah Phaser Peak Spread / Reverb Formant Peak", 27: "Modulation Stages / Wah Phaser Stages / Legacy Reverb Room Size", 30: "Rotary Speed (Slow/Fast)", 31: "Rotary Distance", 32: "Rotary Low-High-Balance", 33: "Compressor Squash / Legacy Delay Frequency / Legacy Reverb Mid Frequency", 34: "Graphic EQ Gain 80 Hz", 35: "Graphic EQ Gain 160 Hz", 36: "Graphic EQ Gain 320 Hz", 37: "Graphic EQ Gain 640 Hz", 38: "Graphic EQ Gain 1250 Hz", 39: "Graphic EQ Gain 2500 Hz", 40: "Graphic EQ Gain 5000 Hz", 41: "Graphic EQ Gain 10000 Hz", 42: "Studio/Metal EQ / Metal DS Low Gain / Acoustic Sim Body", 43: "Studio EQ Low Frequency", 44: "Studio/Metal EQ / Metal DS High Gain / Acoustic Sim Sparkle", 45: "Studio EQ High Frequency", 46: "Studio EQ Mid1 / Metal EQ/DS Middle Gain / Acoustic Sim Bronze", 47: "Studio EQ Mid1 / Metal EQ/DS Middle Frequency", 48: "Studio EQ Mid1 Q-Factor", 49: "Studio EQ Mid2 Gain / Acoustic Sim Pickup", 50: "Studio EQ Mid2 Frequency", 51: "Studio EQ Mid2 Q-Factor", 52: "Wah Peak Range", 53: "Ducking", 54: "Mix 2 (Pitch/Octaver/Delay Serial/Crystal Mix / Space Intensity)", 55: "Voice Balance / Delay Balance", 56: "Voice 1 Pitch / Toe Pitch / Transpose Pitch / Quad Voice Pitch 4 / Crystal 1 Pitch", 57: "Voice 2 Pitch / Heel Pitch / Quad Voice Pitch 3 / Wah Formant Pitch Shift / Crystal 2 Pitch", 58: "Pitch Detune", 60: "Smooth Chords", 61: "Pure Tuning", 62: "Voice 1 Interval / Quad Voice 4 Interval", 63: "Voice 2 Interval / Quad Voice 3 Interval", 64: "Key", 65: "Formant Shift Freeze", 66: "Formant Shift Offset", 67: "Equalizer Low Cut", 68: "Equalizer High Cut / Reverb High Cut", 69: "Mix 3 (delay/reverb)", 70: "Mix Pre/Post", 71: "Delay 1 Time / Reverb Room Size / Reverb Attack / Spring Size", 72: "Delay 2 Time / Reverb Predelay Time", 73: "Delay 2 Ratio / Quad Delay 3 Ratio / Rate Flanger/Phaser Oneway", 74: "Quad Delay 2 Ratio / Delay Ratio Serial", 75: "Quad Delay 1 Ratio", 76: "Delay Note Value 1 / Quad Note Value 4", 77: "Delay Note Value 2 / Quad Note Value 3 / Reverb Predelay Note Value", 78: "Quad Note Value 2 / Note Value Serial", 79: "Quad Note Value 1", 80: "To Tempo / Equalizer Steep Low", 81: "Delay Volume 4", 82: "Delay Volume 3", 83: "Delay Volume 2", 84: "Delay Volume 1", 85: "Delay Panorama 4", 86: "Delay Panorama 3", 87: "Delay Panorama 2", 88: "Delay Panorama 1", 89: "Voice Pitch 2 / Crystal Pitch", 90: "Voice Pitch 1", 91: "Voice 3 Interval", 92: "Voice 4 Interval", 93: "Delay Feedback 1 / Reverb Decay Time", 94: "Infinity Feedback", 95: "Infinity", 96: "Feedback 2/Serial / Reverb Low Boost / Echo Reverb Feedback / Ionosphere Buildup", 97: "Delay Feedback Sync", 98: "Delay Low Cut / Reverb Low Decay/Damp", 99: "Delay High Cut / Reverb High Decay/Damp / Fuzz True Impedance", 100: "Delay Cut More / Equalizer Steep High / Full OC HP/LP / Effect Loop (Stage)", 101: "Modulation (delay/reverb)", 102: "Delay Chorus", 103: "Delay Flutter Intensity / Reverb Modulation", 104: "Delay Flutter Rate / Reverb Early Diffusion / Spring Dripstone", 105: "Delay Grit / Reverb Brass / Spring Distortion (Dwell)", 106: "Reverse Mix", 107: "Input Swell", 108: "Smear", 109: "Ducking Pre/Post"]
     public static let nonEffectParams: [NonEffectKey: String] = [
@@ -170,6 +188,7 @@ public enum Generated {
         NonEffectKey(0x0a, 11): "Tube Shape",
         NonEffectKey(0x0a, 12): "Tube Bias",
         NonEffectKey(0x0a, 15): "Direct Mix",
+        NonEffectKey(0x0a, 20): "Gain (smoothed follower)",
         NonEffectKey(0x0a, 21): "Bright Cap Intensity",
         NonEffectKey(0x0b, 4): "Bass",
         NonEffectKey(0x0b, 5): "Middle",
@@ -270,6 +289,21 @@ public enum Generated {
         NonEffectKey(0x7f, 53): "Looper Location",
         NonEffectKey(0x7f, 59): "Aux >Mono",
         NonEffectKey(0x7f, 126): "Tuner Mode State",
+        NonEffectKey(0x96, 0): "Bank Rig Name",
+        NonEffectKey(0x96, 1): "Bank Rig Name",
+        NonEffectKey(0x96, 2): "Bank Rig Name",
+        NonEffectKey(0x96, 3): "Bank Rig Name",
+        NonEffectKey(0x96, 4): "Bank Rig Name",
+        NonEffectKey(0x96, 5): "Bank Amp Name",
+        NonEffectKey(0x96, 6): "Bank Amp Name",
+        NonEffectKey(0x96, 7): "Bank Amp Name",
+        NonEffectKey(0x96, 8): "Bank Amp Name",
+        NonEffectKey(0x96, 9): "Bank Amp Name",
+        NonEffectKey(0x96, 10): "Bank Cabinet Name",
+        NonEffectKey(0x96, 11): "Bank Cabinet Name",
+        NonEffectKey(0x96, 12): "Bank Cabinet Name",
+        NonEffectKey(0x96, 13): "Bank Cabinet Name",
+        NonEffectKey(0x96, 14): "Bank Cabinet Name",
     ]
     public static let stringTags: [UInt8: String] = [1: "Rig Name", 2: "Rig Author", 3: "Rig Creation Date", 4: "Rig Comment", 10: "Amp Name", 11: "Amp Author", 14: "Amp Location", 15: "Amp Manufacturer", 16: "Amp Comment", 18: "Amp Model", 19: "Amp Channel", 20: "Pickup Type", 21: "Year of Production", 32: "Cabinet Name", 33: "Cabinet Author", 36: "Cabinet Location", 37: "Cabinet Manufacturer", 38: "Microphone Model", 39: "Cabinet Comment", 40: "Microphone Position", 41: "Speaker Configuration", 42: "Cabinet Model", 44: "Speaker Manufacturer", 45: "Speaker Model"]
     public static let page0Numeric: [UInt8: String] = [0x0b: "Morph State"]
@@ -364,6 +398,20 @@ public enum Generated {
         183: "Ionosphere Reverb",
         193: "Spring Reverb",
     ]
+    public static let effectCategories: [EffectCategory] = [
+        EffectCategory(min: 1, max: 16, name: "Wah"),
+        EffectCategory(min: 17, max: 31, name: "Shaper"),
+        EffectCategory(min: 32, max: 48, name: "Distortion"),
+        EffectCategory(min: 49, max: 63, name: "Dynamics"),
+        EffectCategory(min: 64, max: 79, name: "Modulation"),
+        EffectCategory(min: 80, max: 95, name: "Phaser & Flanger"),
+        EffectCategory(min: 96, max: 111, name: "Equalizer"),
+        EffectCategory(min: 112, max: 120, name: "Booster"),
+        EffectCategory(min: 121, max: 127, name: "Effect Loop"),
+        EffectCategory(min: 128, max: 143, name: "Pitch"),
+        EffectCategory(min: 144, max: 175, name: "Delay"),
+        EffectCategory(min: 176, max: 207, name: "Reverb"),
+    ]
     public static let slotEnableCc: [String: UInt8] = ["A": 17, "B": 18, "C": 19, "D": 20, "X": 22, "MOD": 24, "DLY": 27, "REV": 29]
     public static let meterFields: [MeterField] = [
         MeterField(index: 0, number: 78, id: "strobe_seg_low", name: "Tuner Strobe Segment (phase-low)", render: "strobe"),
@@ -392,5 +440,11 @@ public struct MeterField {
     public let id: String
     public let name: String
     public let render: String
+}
+
+public struct EffectCategory {
+    public let min: UInt16
+    public let max: UInt16
+    public let name: String
 }
 

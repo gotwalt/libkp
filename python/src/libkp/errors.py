@@ -66,6 +66,32 @@ class DiscoverError(LibKPError):
     """Discovery could not be carried out (socket, bind, or send failure)."""
 
 
+class PortUnavailableError(DiscoverError):
+    """The discovery port could not be taken exclusively.
+
+    libkp requires sole ownership of UDP :data:`~libkp.protocol.PORT` for as long
+    as a session is active. The device answers a poll only on that port, and the
+    operating system hands each reply to exactly one of the sockets bound to it,
+    so a second listener silently swallows replies rather than duplicating them.
+    Binding exclusively turns that into this error at start-up instead of a
+    device that intermittently "cannot be found".
+
+    The usual holder is other Kemper software on the same machine — Rig Manager
+    keeps the port open for its whole run — which must be quit first.
+    """
+
+    def __init__(self, port: int, cause: OSError) -> None:
+        super().__init__(
+            f"UDP port {port} is already held by another application. libkp needs "
+            f"exclusive use of it while a session is active; quit any other Kemper "
+            f"software (Rig Manager keeps this port open) and try again. ({cause})"
+        )
+        #: The port that could not be acquired.
+        self.port = port
+        #: The underlying :class:`OSError` from :func:`socket.socket.bind`.
+        self.cause = cause
+
+
 # ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------

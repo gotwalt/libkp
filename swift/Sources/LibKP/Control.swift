@@ -114,10 +114,18 @@ public enum Control: Equatable, Hashable, Sendable {
     /// is 2 bytes; ``bankSelect(msb:lsb:)`` is two Control Changes (CC0 then
     /// CC32) concatenated into 6 bytes. Controller/value bytes are masked to
     /// 7 bits and slot/button indices are clamped to their valid ranges.
+    ///
+    /// The navigation controls are **momentary**: the device reads value 1 as
+    /// the press and needs the matching value-0 release to complete the gesture.
+    /// Left held, it abandons the change and reloads the previous rig a couple
+    /// of seconds later. ``up``, ``down`` and ``loadSlot(_:)`` therefore emit
+    /// both halves as one 6-byte message.
     public func message(channel: UInt8 = 0) -> [UInt8] {
         func cc(_ controller: UInt8, _ value: UInt8) -> [UInt8] {
             Nrpn.controlChange(channel: channel, controller: controller, value: value)
         }
+        /// A momentary press immediately followed by its release.
+        func tap(_ controller: UInt8) -> [UInt8] { cc(controller, 1) + cc(controller, 0) }
         func sw(_ on: Bool) -> UInt8 { on ? 1 : 0 }
 
         switch self {
@@ -140,11 +148,11 @@ public enum Control: Equatable, Hashable, Sendable {
         case .tapTempo: return cc(Generated.ccTapTempo, 1)
         case let .tunerMode(open): return cc(Generated.ccTunerMode, sw(open))
         case let .bankPreselect(bank): return cc(Generated.ccBankPreselect, bank)
-        case .up: return cc(Generated.ccUp, 1)
-        case .down: return cc(Generated.ccDown, 1)
+        case .up: return tap(Generated.ccUp)
+        case .down: return tap(Generated.ccDown)
         case let .loadSlot(slot):
             let n = min(max(slot, 1), 5)
-            return cc(Generated.ccLoadSlot1 + (n - 1), 1)
+            return tap(Generated.ccLoadSlot1 + (n - 1))
         case let .effectButton(button):
             let n = min(max(button, 1), 4)
             return cc(Generated.ccEffectButtonI + (n - 1), 1)

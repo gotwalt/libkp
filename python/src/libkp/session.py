@@ -34,6 +34,7 @@ __all__ = [
     "PROTOCOL_RESERVED",
     "HANDSHAKE_TERMINATOR",
     "SESSION_PREAMBLE",
+    "CONNECTION_COOLDOWN",
     "HandshakeOutcome",
     "Session",
     "parse_protocol_list",
@@ -43,7 +44,8 @@ __all__ = [
 PROTOCOL_MIDI3_STREAM: str = gen.PROTOCOL_MIDI3_STREAM
 #: Request/response protocol GUID: accepts the handshake but pushes nothing.
 PROTOCOL_REQUEST_RESPONSE: str = gen.PROTOCOL_REQUEST_RESPONSE
-#: Native CBOR control channel — documented, not implemented here.
+#: The device's native CBOR control channel — the state-dump snapshot route
+#: (:mod:`libkp.cbor`).
 PROTOCOL_CBOR_CONTROL: str = gen.PROTOCOL_CBOR_CONTROL
 #: Offered by the device but rejects the handshake.
 PROTOCOL_RESERVED: str = gen.PROTOCOL_RESERVED
@@ -56,6 +58,14 @@ SESSION_PREAMBLE: bytes = b"\x00" * gen.SESSION_PREAMBLE_LEN
 
 #: Default connect timeout.
 CONNECT_TIMEOUT: float = float(gen.CONNECT_TIMEOUT_SECS)
+
+#: Minimum quiet gap, in seconds, between one session closing and the next
+#: opening. The device refuses to greet — or resets — a session opened too soon
+#: after a prior socket closed, so an orchestrator that opens more than one
+#: session (the CBOR :func:`~libkp.cbor.fetch_state_snapshot` then a MIDI3
+#: :class:`~libkp.model.DeviceModel`) must space them by at least this and never
+#: overlap them. See ``docs/06``.
+CONNECTION_COOLDOWN: float = gen.CONNECTION_COOLDOWN_MS / 1000.0
 
 _GREETING_MAX = 256
 

@@ -36,7 +36,9 @@ device behavior. This includes:
 - The TCP handshake (the protocol-GUID negotiation and session preamble).
 - MIDI3 stream framing.
 - The realtime status / meter block field identities.
-- The existence and shape of the native CBOR control channel (documented in
-  [docs/06](docs/06-cbor-channel.md), not implemented).
+- The native CBOR control channel: its wire shape, the state-dump trigger, and
+  the current bank/rig addresses it returns (documented in
+  [docs/06](docs/06-cbor-channel.md); `libkp` implements the codec and the
+  state-dump snapshot, not the wider management grammar).
 
 These findings are labeled "observed experimentation" throughout the docs.

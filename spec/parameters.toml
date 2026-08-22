@@ -50,6 +50,7 @@ pages = [
   { page = 0x7C, name = "Realtime/Meters" },
   { page = 0x7D, name = "Looper/Freeze" },
   { page = 0x7F, name = "System/Global" },
+  { page = 0x96, name = "Bank Preview" },
 ]
 
 # The eight effect slots in signal-chain order: (short name, address page).
@@ -217,6 +218,10 @@ non_effect_params = [
   { page = 0x0A, number = 11, name = "Tube Shape" },
   { page = 0x0A, number = 12, name = "Tube Bias" },
   { page = 0x0A, number = 15, name = "Direct Mix" },
+  # Number 20 is the smoothed follower of Gain (number 4): the value the DSP is
+  # actually applying, which trails the base and converges on it. Display-only
+  # telemetry — a controller reads and writes number 4, not this.
+  { page = 0x0A, number = 20, name = "Gain (smoothed follower)" },
   { page = 0x0A, number = 21, name = "Bright Cap Intensity" },
   # Amplifier EQ (0x0B)
   { page = 0x0B, number = 4, name = "Bass" },
@@ -304,6 +309,14 @@ non_effect_params = [
 param_ranges = [
   { page = 0x76, start = 0,  end = 11, name = "User Scale 1 Step" },
   { page = 0x76, start = 12, end = 23, name = "User Scale 2 Step" },
+  # Bank Preview (page 0x96): the loaded bank's five-slot preview. Numbers 0–4
+  # are the five rig names, 5–9 their amps, 10–14 their cabinets. These are
+  # extended-string ($07 / request $47) addresses, since page 0x96 puts them
+  # above the 14-bit range. The device also pushes the whole block on a bank
+  # change. See the [bank_preview] section for the slot geometry.
+  { page = 0x96, start = 0,  end = 4,  name = "Bank Rig Name" },
+  { page = 0x96, start = 5,  end = 9,  name = "Bank Amp Name" },
+  { page = 0x96, start = 10, end = 14, name = "Bank Cabinet Name" },
 ]
 
 # Page-0 string tags (function $03 / $43), Appendix C.
@@ -364,7 +377,13 @@ amp_on_number = 0x02
 gain_number = 0x04
 system_page = 0x7F
 main_volume_number = 0x00
+headphone_volume_number = 0x01
 monitor_volume_number = 0x02
+# The physical Master Volume knob is a potentiometer (the only absolute-position
+# control on the device) that drives Headphone (0x7F/1) and Monitor (0x7F/2) 1:1
+# under the default output routing. It has no soft-takeover, so a written value
+# is authoritative only until the pot next moves; treat master volume as a
+# read-only readout. Main Output (0x7F/0) is independent of the knob.
 page_morph = 0x00
 morph_number = 0x0B
 page_tuner_note = 0x7D
@@ -372,3 +391,17 @@ tuner_note_number = 0x54
 tuner_in_tune_center = 8192
 tuner_in_tune_window = 350
 meter_count = 11
+# Bank Preview (page 0x96): the loaded bank's five-slot name preview. The three
+# groups of five consecutive numbers start at these bases (rig / amp / cabinet).
+page_bank_preview = 0x96
+bank_slots = 5
+bank_rig_name_base = 0x00
+bank_amp_name_base = 0x05
+bank_cabinet_name_base = 0x0A
+# The device's current position, as single extended addresses that appear in the
+# CBOR state dump (docs/06). Both are 0-based: bank 0 slot 0 is the first rig of
+# the first bank. The MIDI3 stream never reports these — the read-only name-match
+# (loaded rig name vs. the bank preview) is the stream-only fallback for the slot,
+# and cannot recover the bank number at all.
+current_bank_address = 100701      # 0x1895D
+current_rig_slot_address = 100702  # 0x1895E
