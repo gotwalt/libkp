@@ -33,9 +33,22 @@ pub const PROTOCOL_MIDI3_STREAM: &str = generated::PROTOCOL_MIDI3_STREAM;
 /// Request/response protocol identifier: accepts the handshake but pushes nothing.
 pub const PROTOCOL_REQUEST_RESPONSE: &str = generated::PROTOCOL_REQUEST_RESPONSE;
 
+/// The device's native CBOR control channel — the state-dump snapshot route
+/// ([`crate::cbor`]). Completes the same handshake and preamble as the MIDI3
+/// stream, then speaks CBOR rather than MIDI3 frames.
+pub const PROTOCOL_CBOR_CONTROL: &str = generated::PROTOCOL_CBOR_CONTROL;
+
 /// 8 zero bytes the client writes to open the stream.
 pub const SESSION_PREAMBLE: [u8; generated::SESSION_PREAMBLE_LEN] =
     [0u8; generated::SESSION_PREAMBLE_LEN];
+
+/// Minimum quiet gap between one session closing and the next opening. The
+/// device refuses to greet — or resets — a session opened too soon after a prior
+/// socket closed, so an orchestrator that opens more than one session (the CBOR
+/// [`StateSnapshot::fetch`](crate::cbor::StateSnapshot::fetch) then a MIDI3
+/// [`DeviceModel`](crate::model::DeviceModel)) must space them by at least this
+/// and never overlap them. See `docs/06`.
+pub const CONNECTION_COOLDOWN: Duration = Duration::from_millis(generated::CONNECTION_COOLDOWN_MS);
 
 /// An open TCP session with a Profiler.
 pub struct Session {

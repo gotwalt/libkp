@@ -35,6 +35,13 @@ Quick start::
 from __future__ import annotations
 
 from ._generated import SPEC_VERSION
+from .cbor import (
+    StateSnapshot,
+    extract_snapshot,
+    fetch_state_snapshot,
+    param_write,
+    state_dump_request,
+)
 from .control import (
     Control,
     ModuleSlot,
@@ -42,7 +49,7 @@ from .control import (
     program_change,
     slot_enable_cc,
 )
-from .discovery import DiscoveryOptions, Reply, discover, find_first
+from .discovery import DiscoveryOptions, DiscoveryPort, Reply, discover, find_first
 from .errors import (
     CommandError,
     ConnectError,
@@ -52,6 +59,7 @@ from .errors import (
     FieldOverrunError,
     LibKPError,
     ParseError,
+    PortUnavailableError,
     ProtocolRejectedError,
     SessionError,
     TimeoutErrorLibKP,
@@ -82,6 +90,7 @@ from .params import (
     EFFECT_SLOTS,
     describe,
     describe_numeric,
+    effect_category_name,
     effect_slot_page,
     effect_type_name,
     page_name,
@@ -91,6 +100,8 @@ from .params import (
 from .protocol import PORT, TagStream, build_poll_request
 from .registry import ParamDescriptor, ParamKind, descriptor, format_value
 from .session import (
+    CONNECTION_COOLDOWN,
+    PROTOCOL_CBOR_CONTROL,
     PROTOCOL_MIDI3_STREAM,
     PROTOCOL_REQUEST_RESPONSE,
     HandshakeOutcome,
@@ -99,10 +110,14 @@ from .session import (
 from .state import (
     Amp,
     ApplyOutcome,
+    Bank,
+    BankPreview,
+    BankSlot,
     BeatPulse,
     Cabinet,
     Connected,
     Connection,
+    CurrentPosition,
     DeviceEvent,
     DeviceState,
     Disconnected,
@@ -135,11 +150,14 @@ __all__ = [
     "DiscoveryOptions",
     "Reply",
     "discover",
+    "DiscoveryPort",
     "find_first",
     "Session",
     "HandshakeOutcome",
     "PROTOCOL_MIDI3_STREAM",
     "PROTOCOL_REQUEST_RESPONSE",
+    "PROTOCOL_CBOR_CONTROL",
+    "CONNECTION_COOLDOWN",
     "Unframer",
     "frame",
     "is_kemper_sysex",
@@ -172,6 +190,7 @@ __all__ = [
     "page_name",
     "string_tag_name",
     "effect_type_name",
+    "effect_category_name",
     "effect_slot_page",
     "describe",
     "describe_numeric",
@@ -189,10 +208,13 @@ __all__ = [
     "Effect",
     "Tuner",
     "Output",
+    "BankSlot",
+    "Bank",
     "ApplyOutcome",
     "DeviceEvent",
     "RigChanged",
     "StringTag",
+    "BankPreview",
     "EffectChanged",
     "ParamChanged",
     "Status",
@@ -202,12 +224,20 @@ __all__ = [
     "TunerDeviance",
     "TunerNote",
     "RenderedString",
+    "CurrentPosition",
     "Connected",
     "Disconnected",
     "DeviceModel",
+    # cbor state-dump snapshot
+    "StateSnapshot",
+    "extract_snapshot",
+    "fetch_state_snapshot",
+    "param_write",
+    "state_dump_request",
     # errors
     "LibKPError",
     "ParseError",
+    "PortUnavailableError",
     "TooShortError",
     "FieldOverrunError",
     "DiscoverError",

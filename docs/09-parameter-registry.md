@@ -13,6 +13,7 @@ device, no network, no state.
 | `page` | section name |
 | string-tag number (page 0) | tag name |
 | effect-type value | effect name |
+| effect-type value | category name |
 | `(page, number)` | a display string, with a structural fallback |
 
 All of it is offline and total — every lookup either returns a name or `null`,
@@ -41,13 +42,16 @@ Two of those deserve comment. `param_name(50, 0)` and `param_name(61, 4)` are
 pages `$32` and `$3D` — modules A and REV — resolving through the **shared
 effect map** described below. And `param_name(118, 5)` comes from a **range
 entry**: the spec declares User Scale steps as `page $76, numbers 0–11` and
-`12–23` rather than 24 separate rows, and the generator expands them.
+`12–23` rather than 24 separate rows, and the generator expands them. The
+**Bank Preview** page (`$96` / 150) is declared the same way — numbers 0–4 are
+`"Bank Rig Name"`, 5–9 `"Bank Amp Name"`, 10–14 `"Bank Cabinet Name"`.
 
 Section names come from the page table:
 
 ```
 page_name(124)  →  "Realtime/Meters"
 page_name(10)   →  "Amplifier"
+page_name(150)  →  "Bank Preview"
 page_name(153)  →  null
 ```
 
@@ -154,6 +158,37 @@ effect_type_name(5)    →  null
 The table is sparse — values 5, 14–16, 22–31 and many others are unassigned — so
 `null` is expected and means "no effect type with that value", not a bug.
 
+### Type categories
+
+The Type values are not scattered: Appendix B allocates them in 16-value blocks
+(a few split into half-blocks), one block per group of the device's type knob.
+The registry carries those blocks as a second lookup, so a UI can label a slot
+with its family without knowing the individual type:
+
+```
+effect_category_name(0)    →  null
+effect_category_name(16)   →  "Wah"
+effect_category_name(17)   →  "Shaper"
+effect_category_name(76)   →  "Modulation"
+effect_category_name(179)  →  "Reverb"
+effect_category_name(300)  →  null
+```
+
+| Values | Category | Values | Category |
+|---|---|---|---|
+| 1–16 | Wah | 96–111 | Equalizer |
+| 17–31 | Shaper | 112–120 | Booster |
+| 32–48 | Distortion | 121–127 | Effect Loop |
+| 49–63 | Dynamics | 128–143 | Pitch |
+| 64–79 | Modulation | 144–175 | Delay |
+| 80–95 | Phaser & Flanger | 176–207 | Reverb |
+
+Unlike the name table this one is *dense within a block*, so a type value the
+spec has no name for still gets a category — 76 is unnamed but plainly a
+modulation. Value 0 ("empty") and anything past the last block return `null`.
+The blocks are `effect_categories` in
+[`../spec/effect-types.toml`](../spec/effect-types.toml).
+
 Put together, this is the whole effect-block view the
 [`meters`](07-realtime-status.md#the-meters-example) example renders:
 
@@ -189,7 +224,7 @@ from [`../spec/`](../spec):
 | File | Supplies |
 |---|---|
 | `parameters.toml` | pages, the shared effect map, non-effect parameters, range entries, string tags, page-0 numerics, well-known addresses |
-| `effect-types.toml` | the effect Type value → name table |
+| `effect-types.toml` | the effect Type value → name table, and the category blocks |
 | `controls.toml` | the CC vocabulary and the per-slot enable CCs |
 | `meters.toml` | the realtime status block's field identities |
 | `protocol.toml` | transport, handshake, framing and SysEx constants |
@@ -212,8 +247,9 @@ you to do, is in
 
 The page/number map, the shared effect-module parameter list, the string tags,
 and the effect-type table are transcribed from the
-[Kemper MIDI Parameter Documentation](https://www.kemper-amps.com/downloads/5/User-Manuals).
-The Fixed-FX page, several tuner and tempo addresses, and the numeric morph-state
+[Kemper MIDI Parameter Documentation](https://www.kemper-amps.com/downloads/5/User-Manuals);
+the effect-type category blocks are inferred from the value-range structure of
+its Appendix B and the device's type-knob grouping. The Fixed-FX page, several tuner and tempo addresses, and the numeric morph-state
 parameter are credited to [PySwitch](https://github.com/Tunetown/PySwitch). The
 page `$7C` meter-field identities were established by observed experimentation.
 See [../CREDITS.md](../CREDITS.md).

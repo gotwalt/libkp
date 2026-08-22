@@ -80,6 +80,43 @@
         "tuner_note": 9,
         "main_volume": 12000
       }
+    },
+    {
+      "name": "rig index, single byte",
+      "messages": [
+        "b02000",
+        "c07b"
+      ],
+      "expect": {
+        "current_bank": 24,
+        "current_rig_slot": 3,
+        "current_rig_index": 123
+      }
+    },
+    {
+      "name": "rig index, two bytes",
+      "messages": [
+        "b02001",
+        "c048"
+      ],
+      "expect": {
+        "current_bank": 40,
+        "current_rig_slot": 0,
+        "current_rig_index": 200
+      }
+    },
+    {
+      "name": "rig index ignores an unpaired program change",
+      "messages": [
+        "b02000",
+        "c07b",
+        "c005"
+      ],
+      "expect": {
+        "current_bank": 24,
+        "current_rig_slot": 3,
+        "current_rig_index": 123
+      }
     }
   ]
 }

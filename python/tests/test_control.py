@@ -26,7 +26,7 @@ def test_tuner_mode_open_is_cc31_value_1():
 
 @pytest.mark.parametrize("n,controller", [(3, 52), (1, 50), (5, 54), (0, 50), (99, 54)])
 def test_load_slot_maps_to_cc50_plus_and_clamps(n, controller):
-    assert c.LoadSlot(n).message(0) == bytes([0xB0, controller, 1])
+    assert c.LoadSlot(n).message(0) == bytes([0xB0, controller, 1, 0xB0, controller, 0])
 
 
 @pytest.mark.parametrize("n,controller", [(4, 78), (1, 75), (0, 75), (9, 78)])
@@ -57,8 +57,13 @@ def test_switch_variants_emit_one_or_zero():
     assert c.DelayInfinity(True).message(0) == bytes([0xB0, 34, 1])
     assert c.Freeze(True).message(0) == bytes([0xB0, 35, 1])
     assert c.ToggleAllModules().message(0) == bytes([0xB0, 16, 1])
-    assert c.Up().message(0) == bytes([0xB0, 48, 1])
-    assert c.Down().message(0) == bytes([0xB0, 49, 1])
+
+
+def test_momentary_variants_press_then_release():
+    """The device abandons a navigation whose button is never released."""
+    assert c.Up().message(0) == bytes([0xB0, 48, 1, 0xB0, 48, 0])
+    assert c.Down().message(0) == bytes([0xB0, 49, 1, 0xB0, 49, 0])
+    assert c.Up().message(3) == bytes([0xB3, 48, 1, 0xB3, 48, 0])
 
 
 def test_program_change_bytes():

@@ -10,7 +10,7 @@ import pytest
 from conftest import VECTORS_DIR, vector
 
 from libkp import _generated as gen
-from libkp import control, midi3, nrpn, params, protocol
+from libkp import cbor, control, midi3, nrpn, params, protocol
 from libkp.state import DeviceState
 
 # ---------------------------------------------------------------------------
@@ -19,13 +19,13 @@ from libkp.state import DeviceState
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.1.0"
+    assert gen.SPEC_VERSION == "0.5.0"
 
 
 def test_every_vector_file_is_covered():
     """Guard against a new vector file landing without a test for it."""
     present = {p.stem for p in VECTORS_DIR.glob("*.json")}
-    covered = {"u14", "discovery", "midi3", "nrpn", "controls", "params", "state"}
+    covered = {"u14", "discovery", "midi3", "nrpn", "controls", "params", "state", "cbor"}
     assert present == covered, f"uncovered vector files: {sorted(present - covered)}"
 
 
@@ -256,6 +256,11 @@ def test_effect_type_name(case):
     assert params.effect_type_name(case["value"]) == case["name"]
 
 
+@pytest.mark.parametrize("case", _PARAMS["effect_category_name"], ids=_ids(["value"]))
+def test_effect_category_name(case):
+    assert params.effect_category_name(case["value"]) == case["name"]
+
+
 @pytest.mark.parametrize("case", _PARAMS["page_name"], ids=_ids(["page"]))
 def test_page_name(case):
     assert params.page_name(case["page"]) == case["name"]
@@ -291,8 +296,29 @@ def _assert_state_expectations(state: DeviceState, expect: dict) -> None:
         assert state.morph == expect["morph"]
     if "tuner_note" in expect:
         assert state.tuner.note == expect["tuner_note"]
+    if "current_bank" in expect:
+        assert state.current_bank == expect["current_bank"]
+    if "current_rig_slot" in expect:
+        assert state.current_rig_slot == expect["current_rig_slot"]
+    if "current_rig_index" in expect:
+        assert state.current_rig_index == expect["current_rig_index"]
     if "main_volume" in expect:
         assert state.output.main_volume == expect["main_volume"]
+    if "headphone_volume" in expect:
+        assert state.output.headphone_volume == expect["headphone_volume"]
+    if "monitor_volume" in expect:
+        assert state.output.monitor_volume == expect["monitor_volume"]
+    if "master_volume" in expect:
+        assert state.output.master_volume == expect["master_volume"]
+    if "bank" in expect:
+        for entry in expect["bank"]:
+            slot = state.bank.slots[entry["slot"]]
+            if "rig_name" in entry:
+                assert slot.rig_name == entry["rig_name"]
+            if "amp_name" in entry:
+                assert slot.amp_name == entry["amp_name"]
+            if "cabinet_name" in entry:
+                assert slot.cabinet_name == entry["cabinet_name"]
     if "status_raw" in expect:
         assert list(state.status.raw) == expect["status_raw"]
     if "effect" in expect:
@@ -313,3 +339,32 @@ def test_state_apply(case):
     for hex_message in case["messages"]:
         state.apply(bytes.fromhex(hex_message))
     _assert_state_expectations(state, case["expect"])
+
+
+# ---------------------------------------------------------------------------
+# cbor.json
+# ---------------------------------------------------------------------------
+
+_CBOR = vector("cbor")
+
+
+@pytest.mark.parametrize("case", _CBOR["param_write"], ids=lambda c: str(c["addr"]))
+def test_cbor_param_write(case):
+    assert cbor.to_vec(cbor.param_write(case["addr"], case["value"])).hex() == case["hex"]
+
+
+def test_cbor_state_dump_request():
+    assert cbor.to_vec(cbor.state_dump_request()).hex() == _CBOR["state_dump_request"]["hex"]
+
+
+@pytest.mark.parametrize("case", _CBOR["extract_snapshot"], ids=lambda c: c["name"])
+def test_cbor_extract_snapshot(case):
+    decoder = cbor.Decoder()
+    items = decoder.push(bytes.fromhex(case["stream_hex"]))
+    snap = cbor.extract_snapshot(items)
+    expect = case["expect"]
+    assert snap.current_bank == expect["current_bank"]
+    assert snap.current_rig_slot == expect["current_rig_slot"]
+    if "strings" in expect:
+        want = [(s["addr"], s["text"]) for s in expect["strings"]]
+        assert snap.strings == want

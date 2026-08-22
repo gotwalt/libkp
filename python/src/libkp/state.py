@@ -39,10 +39,13 @@ __all__ = [
     "Effect",
     "Tuner",
     "Output",
+    "BankSlot",
+    "Bank",
     "DeviceState",
     "DeviceEvent",
     "RigChanged",
     "StringTag",
+    "BankPreview",
     "EffectChanged",
     "ParamChanged",
     "Status",
@@ -52,6 +55,7 @@ __all__ = [
     "TunerDeviance",
     "TunerNote",
     "RenderedString",
+    "CurrentPosition",
     "Connected",
     "Disconnected",
     "ApplyOutcome",
@@ -210,6 +214,11 @@ class Effect:
         return None if self.kind is None else params.effect_type_name(self.kind)
 
     @property
+    def category_name(self) -> str | None:
+        """The effect Type's category, or ``None`` if unknown or in no block."""
+        return None if self.kind is None else params.effect_category_name(self.kind)
+
+    @property
     def is_empty(self) -> bool:
         """True if the slot holds no effect (Type == 0, "empty")."""
         return self.kind == 0
@@ -239,8 +248,50 @@ class Output:
 
     #: Main Output Volume (NRPN ``0x7F/0``, 14-bit), once seen.
     main_volume: int | None = None
-    #: Monitor Output Volume (NRPN ``0x7F/2``, 14-bit), once seen.
+    #: Headphone Output Volume (NRPN ``0x7F/1``, 14-bit), once seen. Driven 1:1 by
+    #: the physical Master Volume knob.
+    headphone_volume: int | None = None
+    #: Monitor Output Volume (NRPN ``0x7F/2``, 14-bit), once seen. Driven 1:1 by
+    #: the physical Master Volume knob.
     monitor_volume: int | None = None
+
+    @property
+    def master_volume(self) -> int | None:
+        """The physical Master Volume knob's value.
+
+        The knob is a potentiometer that drives Headphone (``0x7F/1``) and Monitor
+        (``0x7F/2``) 1:1 under the default output routing, so report Headphone,
+        falling back to Monitor. **Read-only**: the pot has no soft-takeover, so a
+        written value is authoritative only until the knob next moves.
+        """
+        return self.headphone_volume if self.headphone_volume is not None else self.monitor_volume
+
+
+@dataclass(slots=True)
+class BankSlot:
+    """One bank slot's preview names — the identity of one of the current bank's
+    five rigs, as shown on the device's rig browser."""
+
+    #: Rig name in this slot (Bank Preview number 0..4), once seen.
+    rig_name: str | None = None
+    #: The rig's amp name (Bank Preview number 5..9), once seen.
+    amp_name: str | None = None
+    #: The rig's cabinet name (Bank Preview number 10..14), once seen.
+    cabinet_name: str | None = None
+
+
+@dataclass(slots=True)
+class Bank:
+    """The loaded bank's five-slot name preview (page ``0x96``).
+
+    The device pushes the whole block on a bank change, and it is readable on
+    demand via :meth:`libkp.model.DeviceModel.refresh_bank`. ``slots[0]`` is rig
+    slot 1.
+    """
+
+    slots: list[BankSlot] = field(
+        default_factory=lambda: [BankSlot() for _ in range(gen.BANK_SLOTS)]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +313,15 @@ class RigChanged(DeviceEvent):
 class StringTag(DeviceEvent):
     """A page-0 string tag was applied (``number`` 1 = Rig Name, 10 = Amp Name…)."""
 
+    number: int
+
+
+@dataclass(frozen=True, slots=True)
+class BankPreview(DeviceEvent):
+    """A bank-preview name was applied (page ``0x96``): one of the current bank's
+    rig / amp / cabinet names. Read :attr:`DeviceState.bank` for the new value."""
+
+    #: The Bank Preview number (0..14): 0–4 rig, 5–9 amp, 10–14 cabinet.
     number: int
 
 
@@ -336,6 +396,20 @@ class RenderedString(DeviceEvent):
     number: int
     value: int
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPosition(DeviceEvent):
+    """The device's current position was learned from the CBOR state-dump snapshot.
+
+    Read :attr:`DeviceState.current_bank` and :attr:`DeviceState.current_rig_slot`
+    for the new values (both 0-based).
+    """
+
+    #: Current bank, 0-based, if the dump carried it.
+    bank: int | None
+    #: Current rig slot within the bank, 0-based, if the dump carried it.
+    slot: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +494,32 @@ class DeviceState:
     tuner: Tuner = field(default_factory=Tuner)
     #: The global output volumes.
     output: Output = field(default_factory=Output)
+    #: The loaded bank's five-slot name preview (page ``0x96``).
+    bank: Bank = field(default_factory=Bank)
+    #: Current bank, 0-based, once known. Seeded from the CBOR state-dump
+    #: snapshot (:func:`libkp.cbor.fetch_state_snapshot`) via
+    #: :meth:`libkp.model.DeviceModel.set_current_position`, then kept live by
+    #: the Bank Select / Program Change pair the device sends on every rig change.
+    current_bank: int | None = None
+    #: Current rig slot within the bank, 0-based, once known. Same source as
+    #: :attr:`current_bank`; slot 0 is rig slot 1.
+    current_rig_slot: int | None = None
+    #: The high 7 bits of a rig index, held between the Bank Select that carries
+    #: them and the Program Change that completes the pair.
+    _pending_rig_index_msb: int | None = None
+
+    @property
+    def current_rig_index(self) -> int | None:
+        """Flat, 0-based rig index, once both halves are known.
+
+        ``current_bank * BANK_SLOTS + current_rig_slot`` -- the device's own
+        numbering, and the only address that can name a rig outside the current
+        bank.
+        """
+        if self.current_bank is None or self.current_rig_slot is None:
+            return None
+        return self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
+
     #: Latest morph position (0–16383), once seen (NRPN ``0x00/0x0B``).
     morph: int | None = None
     #: The most recent realtime status / meter frame (the FAST lane).
@@ -459,6 +559,12 @@ class DeviceState:
         - ``$3C`` rendered-string reply → a transient ``RenderedString``. FAST.
         - ``$06`` extended and any other traffic → ignored.
         """
+        # Channel-voice messages ride the same stream as the SysEx: the device
+        # announces every rig change as a Bank Select / Program Change pair.
+        outcome = self._apply_rig_index(msg)
+        if outcome is not None:
+            return outcome
+
         parsed = NrpnHeader.parse(msg)
         if parsed is None:
             return ApplyOutcome.empty()
@@ -483,6 +589,42 @@ class DeviceState:
 
     # -- decode helpers ----------------------------------------------------
 
+    def _apply_rig_index(self, msg: bytes) -> ApplyOutcome | None:
+        """Fold the device's position report into the tree.
+
+        The device says where it is with two channel-voice messages: CC32 (Bank
+        Select LSB) carrying the high 7 bits, then a Program Change carrying the
+        low 7. Together they are a flat, 0-based rig index -- ``128 * msb +
+        program`` -- which divides by ``BANK_SLOTS`` into bank and slot.
+        Unlike the CBOR snapshot, a one-shot read at connect, this arrives on
+        every change, from the front panel as readily as from a controller.
+
+        Returns ``None`` for anything that is not one of the two messages, so
+        NRPN parsing carries on. A Program Change with no Bank Select ahead of it
+        is ignored: half an index is not a position.
+        """
+        if not msg:
+            return None
+        status = msg[0] & 0xF0
+        if status == gen.CONTROL_CHANGE_STATUS:
+            if len(msg) < 3 or msg[1] != gen.CC_BANK_SELECT_LSB:
+                return None
+            self._pending_rig_index_msb = msg[2] & 0x7F
+            return ApplyOutcome.empty()
+        if status == gen.PROGRAM_CHANGE_STATUS:
+            msb = self._pending_rig_index_msb
+            if len(msg) < 2 or msb is None:
+                return None
+            self._pending_rig_index_msb = None
+            index = msb * 128 + (msg[1] & 0x7F)
+            bank, slot = divmod(index, gen.BANK_SLOTS)
+            if self.current_bank == bank and self.current_rig_slot == slot:
+                return ApplyOutcome.empty()
+            self.current_bank = bank
+            self.current_rig_slot = slot
+            return ApplyOutcome.slow([CurrentPosition(bank=bank, slot=slot)])
+        return None
+
     def _apply_string(self, number: int, vals: bytes) -> ApplyOutcome:
         """Route a ``$03`` page-0 string tag into the tree."""
         return self._store_string_tag(number, _ascii_until_nul(vals))
@@ -500,9 +642,30 @@ class DeviceState:
             return ApplyOutcome.empty()
         address, text = parsed
         page, number = divmod(address, 128)
+        if page == gen.PAGE_BANK_PREVIEW:
+            return self._store_bank_preview(number, text)
         if page != nrpn.PAGE_STRINGS:
             return ApplyOutcome.empty()
         return self._store_string_tag(number, text)
+
+    def _store_bank_preview(self, number: int, text: str) -> ApplyOutcome:
+        """Store one bank-preview name (page ``0x96``) into :attr:`bank`.
+
+        The number selects the field (rig / amp / cabinet) and slot; an
+        out-of-range number is ignored. A stored value is a SLOW change.
+        """
+        resolved = params.bank_preview_slot_field(number)
+        if resolved is None:
+            return ApplyOutcome.empty()
+        field_, slot = resolved
+        target = self.bank.slots[slot]
+        if field_ is params.BankPreviewField.RIG_NAME:
+            target.rig_name = text
+        elif field_ is params.BankPreviewField.AMP_NAME:
+            target.amp_name = text
+        else:
+            target.cabinet_name = text
+        return ApplyOutcome.slow([BankPreview(number=number)])
 
     def _store_string_tag(self, number: int, text: str) -> ApplyOutcome:
         """Store a decoded page-0 string tag into the matching field."""
@@ -555,6 +718,9 @@ class DeviceState:
         # System output volumes (SLOW).
         if page == gen.SYSTEM_PAGE and number == gen.MAIN_VOLUME_NUMBER:
             self.output.main_volume = value
+            return ApplyOutcome.slow([ParamChanged(page, number, value)])
+        if page == gen.SYSTEM_PAGE and number == gen.HEADPHONE_VOLUME_NUMBER:
+            self.output.headphone_volume = value
             return ApplyOutcome.slow([ParamChanged(page, number, value)])
         if page == gen.SYSTEM_PAGE and number == gen.MONITOR_VOLUME_NUMBER:
             self.output.monitor_volume = value

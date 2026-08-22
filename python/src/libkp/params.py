@@ -10,6 +10,8 @@ morph-state parameter on page 0). The realtime meter field identities on page
 
 from __future__ import annotations
 
+from enum import Enum
+
 from . import _generated as gen
 
 __all__ = [
@@ -20,6 +22,11 @@ __all__ = [
     "EFFECT_PARAM_STATE",
     "EFFECT_PARAM_MIX",
     "EFFECT_PARAM_VOLUME",
+    "PAGE_BANK_PREVIEW",
+    "BANK_SLOTS",
+    "BankPreviewField",
+    "bank_preview_address",
+    "bank_preview_slot_field",
     "function_name",
     "page_name",
     "param_name",
@@ -28,6 +35,7 @@ __all__ = [
     "effect_slot_name",
     "effect_slot_index",
     "effect_type_name",
+    "effect_category_name",
     "string_tag_name",
     "page0_numeric_name",
     "describe",
@@ -108,6 +116,18 @@ def effect_type_name(value: int) -> str | None:
     return gen.EFFECT_TYPES.get(value)
 
 
+def effect_category_name(value: int) -> str | None:
+    """The category of an effect Type value — the group of the device's type knob
+    it belongs to, derived from the block structure of Appendix B's value ranges.
+
+    ``None`` for 0 (``"empty"``) and for values in no block.
+    """
+    for low, high, name in gen.EFFECT_CATEGORIES:
+        if low <= value <= high:
+            return name
+    return None
+
+
 def string_tag_name(number: int) -> str | None:
     """String-tag names on page 0 — functions ``$03``/``$43`` only."""
     return gen.STRING_TAGS.get(number)
@@ -117,6 +137,49 @@ def page0_numeric_name(number: int) -> str | None:
     """Page 0 is dual-use: string tags via ``$03``/``$43``, but *numeric* params
     via ``$01``/``$41`` (credited to PySwitch, which reads morph state this way)."""
     return gen.PAGE0_NUMERIC.get(number)
+
+
+#: Page holding the loaded bank's five-slot name preview (rig/amp/cabinet).
+PAGE_BANK_PREVIEW: int = gen.PAGE_BANK_PREVIEW
+#: Number of rig slots in a bank.
+BANK_SLOTS: int = gen.BANK_SLOTS
+
+
+class BankPreviewField(Enum):
+    """Which of the three five-slot name groups on :data:`PAGE_BANK_PREVIEW`."""
+
+    #: Rig names (numbers ``BANK_RIG_NAME_BASE``..).
+    RIG_NAME = gen.BANK_RIG_NAME_BASE
+    #: Amp names (numbers ``BANK_AMP_NAME_BASE``..).
+    AMP_NAME = gen.BANK_AMP_NAME_BASE
+    #: Cabinet names (numbers ``BANK_CABINET_NAME_BASE``..).
+    CABINET_NAME = gen.BANK_CABINET_NAME_BASE
+
+    @property
+    def base(self) -> int:
+        """First controller number of this group on :data:`PAGE_BANK_PREVIEW`."""
+        return self.value
+
+
+def bank_preview_address(field: BankPreviewField, slot: int) -> int:
+    """Flat NRPN address (``page * 128 + number``) of a bank-preview field for a
+    1-based ``slot`` (1..:data:`BANK_SLOTS`).
+
+    This is the read-on-demand address for
+    :func:`libkp.nrpn.request_extended_string`.
+    """
+    slot = min(max(slot, 1), BANK_SLOTS) - 1
+    return PAGE_BANK_PREVIEW * 128 + field.base + slot
+
+
+def bank_preview_slot_field(number: int) -> tuple[BankPreviewField, int] | None:
+    """Reverse of :func:`bank_preview_address`: map a :data:`PAGE_BANK_PREVIEW`
+    number (0..14) to its ``(field, 0-based slot index)``, or ``None`` if out of
+    range."""
+    for field in BankPreviewField:
+        if field.base <= number < field.base + BANK_SLOTS:
+            return field, number - field.base
+    return None
 
 
 def describe(page: int, number: int) -> str:

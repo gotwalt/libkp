@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from libkp.discovery import (
     DiscoveryOptions,
+    DiscoveryPort,
     Reply,
     _is_poll,
     broadcast_targets,
     discover,
 )
+from libkp.errors import PortUnavailableError
 from libkp.protocol import build_poll_request, push_field
 
 # A synthetic reply payload in the shape the device answers with.
@@ -69,3 +73,51 @@ def test_discovery_with_no_device_returns_no_replies():
         return await discover(options)
 
     assert asyncio.run(scenario()) == []
+
+
+def test_the_discovery_port_is_held_exclusively():
+    """A second acquire must fail rather than quietly share the port.
+
+    Sharing is the failure this guards against: the kernel gives an arriving
+    reply to exactly one bound socket, so a co-bound listener steals replies
+    instead of duplicating them.
+    """
+    with DiscoveryPort.acquire(54322) as first:
+        assert first.port == 54322
+        with pytest.raises(PortUnavailableError) as caught:
+            DiscoveryPort.acquire(54322)
+    assert caught.value.port == 54322
+    assert "exclusive" in str(caught.value)
+
+
+def test_releasing_the_port_lets_it_be_acquired_again():
+    DiscoveryPort.acquire(54323).close()
+    DiscoveryPort.acquire(54323).close()  # no leak: the first release freed it
+
+
+def test_closing_a_port_twice_is_harmless():
+    port = DiscoveryPort.acquire(54324)
+    port.close()
+    port.close()
+
+
+def test_a_held_port_can_be_polled_repeatedly():
+    """A long-running client re-polls to notice devices coming and going,
+    without ever releasing the port in between."""
+
+    async def scenario():
+        options = DiscoveryOptions(listen_for=0.1, repeat_every=0.05, port=54325)
+        with DiscoveryPort.acquire(54325) as port:
+            return [await port.poll(options), await port.poll(options)]
+
+    assert asyncio.run(scenario()) == [[], []]
+
+
+def test_discover_releases_the_port_it_acquired():
+    """The one-shot helper must not leave the port held behind it."""
+
+    async def scenario():
+        await discover(DiscoveryOptions(listen_for=0.1, repeat_every=0.05, port=54326))
+
+    asyncio.run(scenario())
+    DiscoveryPort.acquire(54326).close()  # would raise if discover leaked it

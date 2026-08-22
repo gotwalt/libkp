@@ -291,8 +291,20 @@ impl Control {
     /// is 2 bytes; [`Control::BankSelect`] is two Control Changes (CC0 then
     /// CC32) concatenated into 6 bytes. All controller/value bytes are masked
     /// to 7 bits and slot/button indices are clamped to their valid ranges.
+    ///
+    /// The navigation controls are **momentary**: the device treats value 1 as
+    /// the press and needs the matching value-0 release to complete the gesture.
+    /// Left held, it abandons the change and reloads the previous rig a couple
+    /// of seconds later. [`Control::Up`], [`Control::Down`] and
+    /// [`Control::LoadSlot`] therefore emit both halves as one 6-byte message.
     pub fn message(&self, channel: u8) -> Vec<u8> {
         let cc = |controller: u8, value: u8| control_change(channel, controller, value).to_vec();
+        // A momentary press immediately followed by its release.
+        let tap = |controller: u8| {
+            let mut out = control_change(channel, controller, 1).to_vec();
+            out.extend_from_slice(&control_change(channel, controller, 0));
+            out
+        };
         match *self {
             Control::WahPedal(v) => cc(CC_WAH_PEDAL, v),
             Control::PitchPedal(v) => cc(CC_PITCH_PEDAL, v),
@@ -313,11 +325,11 @@ impl Control {
             Control::TapTempo => cc(CC_TAP_TEMPO, 1),
             Control::TunerMode(open) => cc(CC_TUNER_MODE, sw(open)),
             Control::BankPreselect(bank) => cc(CC_BANK_PRESELECT, bank),
-            Control::Up => cc(CC_UP, 1),
-            Control::Down => cc(CC_DOWN, 1),
+            Control::Up => tap(CC_UP),
+            Control::Down => tap(CC_DOWN),
             Control::LoadSlot(slot) => {
                 let slot = slot.clamp(1, 5);
-                cc(CC_LOAD_SLOT_1 + (slot - 1), 1)
+                tap(CC_LOAD_SLOT_1 + (slot - 1))
             }
             Control::EffectButton(n) => {
                 let n = n.clamp(1, 4);
@@ -359,12 +371,27 @@ mod tests {
 
     #[test]
     fn load_slot_maps_to_cc50_plus() {
-        assert_eq!(Control::LoadSlot(3).message(0), vec![0xB0, 52, 1]);
-        assert_eq!(Control::LoadSlot(1).message(0), vec![0xB0, 50, 1]);
-        assert_eq!(Control::LoadSlot(5).message(0), vec![0xB0, 54, 1]);
+        assert_eq!(
+            Control::LoadSlot(3).message(0),
+            vec![0xB0, 52, 1, 0xB0, 52, 0]
+        );
+        assert_eq!(
+            Control::LoadSlot(1).message(0),
+            vec![0xB0, 50, 1, 0xB0, 50, 0]
+        );
+        assert_eq!(
+            Control::LoadSlot(5).message(0),
+            vec![0xB0, 54, 1, 0xB0, 54, 0]
+        );
         // Out-of-range clamps into 1..=5.
-        assert_eq!(Control::LoadSlot(0).message(0), vec![0xB0, 50, 1]);
-        assert_eq!(Control::LoadSlot(99).message(0), vec![0xB0, 54, 1]);
+        assert_eq!(
+            Control::LoadSlot(0).message(0),
+            vec![0xB0, 50, 1, 0xB0, 50, 0]
+        );
+        assert_eq!(
+            Control::LoadSlot(99).message(0),
+            vec![0xB0, 54, 1, 0xB0, 54, 0]
+        );
     }
 
     #[test]
@@ -432,8 +459,14 @@ mod tests {
         assert_eq!(Control::DelayInfinity(true).message(0), vec![0xB0, 34, 1]);
         assert_eq!(Control::Freeze(true).message(0), vec![0xB0, 35, 1]);
         assert_eq!(Control::ToggleAllModules.message(0), vec![0xB0, 16, 1]);
-        assert_eq!(Control::Up.message(0), vec![0xB0, 48, 1]);
-        assert_eq!(Control::Down.message(0), vec![0xB0, 49, 1]);
+    }
+
+    #[test]
+    fn momentary_variants_press_then_release() {
+        // The device abandons a navigation whose button is never released.
+        assert_eq!(Control::Up.message(0), vec![0xB0, 48, 1, 0xB0, 48, 0]);
+        assert_eq!(Control::Down.message(0), vec![0xB0, 49, 1, 0xB0, 49, 0]);
+        assert_eq!(Control::Up.message(3), vec![0xB3, 48, 1, 0xB3, 48, 0]);
     }
 
     #[test]

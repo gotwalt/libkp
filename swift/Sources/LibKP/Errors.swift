@@ -24,6 +24,18 @@ extension ParseError: CustomStringConvertible {
 public enum DiscoverError: Error, Sendable {
     /// The UDP listener could not be created or started.
     case listenerFailed(String)
+    /// The discovery port is already held by another process.
+    ///
+    /// LibKP takes UDP ``Generated/port`` exclusively for as long as a session is
+    /// active. The device answers a poll only on that port, and the kernel hands
+    /// each arriving reply to exactly one of the sockets bound to it — so a second
+    /// listener takes replies rather than seeing a copy. Binding exclusively
+    /// surfaces the clash here, at start-up, instead of as a device that
+    /// intermittently "cannot be found".
+    ///
+    /// The usual holder is other Kemper software on the same machine — Rig Manager
+    /// keeps the port open for its whole run — which must be quit first.
+    case portUnavailable(port: UInt16)
     /// No poll could be sent to any target.
     case sendFailed(String)
     /// The discovery run was cancelled before it finished.
@@ -34,6 +46,12 @@ extension DiscoverError: CustomStringConvertible {
     public var description: String {
         switch self {
         case let .listenerFailed(detail): return "failed to open the discovery listener: \(detail)"
+        case let .portUnavailable(port):
+            return """
+                UDP port \(port) is already held by another application. LibKP needs \
+                exclusive use of it while a session is active; quit any other Kemper \
+                software (Rig Manager keeps this port open) and try again.
+                """
         case let .sendFailed(detail): return "failed to send the discovery poll: \(detail)"
         case .cancelled: return "discovery cancelled"
         }

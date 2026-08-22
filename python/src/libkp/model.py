@@ -26,10 +26,11 @@ Four access points, mirroring a UI store:
 Parameters vs actions
 ---------------------
 
-- **Parameters** (``set_*``) — settable values the device also reports back.
-  They go out as 14-bit NRPN ``$01`` Single Parameter Changes, so the device
-  echoes the change on the same stream the model ingests and :meth:`state` stays
-  consistent.
+- **Parameters** (``set_*``) — settable values the device stores. They go out as
+  14-bit NRPN ``$01`` Single Parameter Changes; the device applies the write
+  silently and does *not* echo it back on the stream, so follow a set with
+  :meth:`DeviceModel.request_param` when :meth:`state` should confirm the new
+  value — the ``$41`` reply flows through normal ingest.
 - **Actions** (verbs) — momentary presses and live expression that carry no
   stored value. They go out as 7-bit Control Change messages from the
   :mod:`libkp.control` vocabulary and are *not* reflected in state.
@@ -52,6 +53,7 @@ from .state import (
     ApplyOutcome,
     Connected,
     Connection,
+    CurrentPosition,
     DeviceEvent,
     DeviceState,
     Disconnected,
@@ -180,6 +182,7 @@ class DeviceModel:
 
         if sync:
             await model.refresh_rig()
+            await model.refresh_bank()
         return model
 
     async def close(self) -> None:
@@ -320,6 +323,40 @@ class DeviceModel:
                 nrpn.request_single(PRODUCT, DEVICE, page, params.EFFECT_PARAM_STATE)
             )
 
+    async def refresh_bank(self) -> None:
+        """Request the current bank's five-slot name preview (rig / amp / cabinet
+        names) as extended strings (``$47``).
+
+        The ``$07`` replies fold into :attr:`~libkp.state.DeviceState.bank`.
+        Read-only: it changes nothing on the device. The device also pushes this
+        block unasked on a bank change, so a controller need only call this once
+        at connect.
+        """
+        for field_ in params.BankPreviewField:
+            for slot in range(1, params.BANK_SLOTS + 1):
+                address = params.bank_preview_address(field_, slot)
+                await self._enqueue(nrpn.request_extended_string(PRODUCT, DEVICE, address))
+
+    def set_current_position(self, bank: int | None, slot: int | None) -> None:
+        """Fold a :class:`~libkp.cbor.StateSnapshot`'s current bank and rig slot
+        into the state tree, emitting a
+        :class:`~libkp.state.CurrentPosition` event and broadcasting a fresh
+        snapshot.
+
+        The MIDI3 stream never reports these indices; a controller learns them by
+        running :func:`libkp.cbor.fetch_state_snapshot` over a separate CBOR
+        session — which the device wants done *before* this streaming session
+        opens, not concurrently — and applying the result here. Only the non-``None``
+        arguments overwrite; a ``None`` leaves the current value untouched.
+        Synchronous: no I/O.
+        """
+        if bank is not None:
+            self._state.current_bank = bank
+        if slot is not None:
+            self._state.current_rig_slot = slot
+        self._emit(CurrentPosition(bank=bank, slot=slot))
+        self._snapshots.send(self._state.snapshot())
+
     async def request_param(self, page: int, number: int) -> None:
         """Request one numeric parameter (``$41``); the reply arrives as ``$01``."""
         await self._enqueue(nrpn.request_single(PRODUCT, DEVICE, page, number))
@@ -364,6 +401,24 @@ class DeviceModel:
     async def bank(self, n: int) -> None:
         """Preselect bank ``n`` (1-based; CC47). Takes effect with the next rig."""
         await self.send_control(control_mod.BankPreselect(max(n - 1, 0)))
+
+    async def select_rig_index(self, index: int) -> None:
+        """Load a rig by its flat, 0-based index.
+
+        This is the device's own numbering, and the only address that reaches a
+        rig outside the current bank. Sent as the documented pair: the absolute
+        bank preselect (CC47) followed by the slot load (CC50-54) that commits
+        it. The index divides by ``BANK_SLOTS``, so index 123 is bank 25, slot 4.
+
+        Nothing here assumes how many banks a device has. Aim past the end and
+        the device simply stays where it is -- and says so in the Bank Select /
+        Program Change report that follows, so
+        :attr:`~libkp.state.DeviceState.current_rig_index` always reflects where
+        it actually landed, not where this aimed.
+        """
+        bank, slot = divmod(index, gen.BANK_SLOTS)
+        await self.bank(bank + 1)
+        await self.select_rig(slot + 1)
 
     async def tap_tempo(self) -> None:
         """Tap the tempo (CC30)."""

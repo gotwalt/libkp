@@ -21,10 +21,11 @@ import Foundation
 ///
 /// Commands split into two groups:
 ///
-/// - **Parameters** (`set*`) — settable values the device also reports back.
-///   They go out as 14-bit NRPN `$01` Single Parameter Changes, so the device
-///   echoes the change on the same stream the model ingests and the snapshot
-///   stays consistent.
+/// - **Parameters** (`set*`) — settable values the device stores. They go out as
+///   14-bit NRPN `$01` Single Parameter Changes; the device applies the write
+///   silently and does *not* echo it back on the stream, so follow a set with
+///   ``requestParam(page:number:)`` when the snapshot should confirm the new
+///   value — the `$41` reply flows through normal ingest.
 /// - **Actions** (verbs) — momentary presses and live expression that carry no
 ///   stored value. They go out as 7-bit Control Change messages via ``Control``
 ///   and are *not* reflected in state.
@@ -75,6 +76,7 @@ public actor DeviceModel {
         let model = DeviceModel(session: session)
         await model.start(tail: outcome.responseTail)
         try? await model.refreshRig()
+        try? await model.refreshBank()
         return model
     }
 
@@ -268,6 +270,39 @@ public actor DeviceModel {
         }
     }
 
+    /// Request the current bank's five-slot name preview (rig / amp / cabinet
+    /// names) as extended strings (`$47`). The `$07` replies fold into
+    /// ``DeviceState/bank``. Read-only: it changes nothing on the device. The
+    /// device also pushes this block unasked on a bank change, so a controller
+    /// need only call this once at connect.
+    public func refreshBank() async throws {
+        for field in Params.BankPreviewField.allCases {
+            for slot in 1...Params.bankSlots {
+                try await send(
+                    Nrpn.requestExtendedString(
+                        product: DeviceModel.product, device: DeviceModel.device,
+                        address: Params.bankPreviewAddress(field, slot: slot)
+                    ))
+            }
+        }
+    }
+
+    /// Fold a ``StateSnapshot``'s current bank and rig slot into the state tree,
+    /// emitting a ``DeviceEvent/currentPosition(bank:slot:)`` and broadcasting a
+    /// fresh snapshot.
+    ///
+    /// The MIDI3 stream never reports these indices; a controller learns them by
+    /// running ``StateSnapshot/fetch(host:port:timeout:)`` over a separate CBOR
+    /// session — which the device wants done *before* this streaming session
+    /// opens, not concurrently — and applying the result here. Only the non-`nil`
+    /// fields overwrite; a `nil` leaves the current value untouched.
+    public func setCurrentPosition(bank: UInt16?, slot: UInt16?) {
+        if bank != nil { state.currentBank = bank }
+        if slot != nil { state.currentRigSlot = slot }
+        emit(.currentPosition(bank: bank, slot: slot))
+        publishSnapshot()
+    }
+
     /// Request one numeric parameter's current value (function `$41`). The
     /// device answers with a `$01` message on the same stream, which the ingest
     /// loop folds into the snapshot. Read-only.
@@ -322,6 +357,7 @@ public actor DeviceModel {
 
     /// Select rig slot 1–5 in the current bank (CC50–54).
     public func selectRig(_ slot: UInt8) async throws { try await send(control: .loadSlot(slot)) }
+
     /// Step to the next rig (CC48).
     public func rigUp() async throws { try await send(control: .up) }
     /// Step to the previous rig (CC49).
@@ -329,6 +365,23 @@ public actor DeviceModel {
     /// Preselect bank `n` (1-based; CC47).
     public func bank(_ n: UInt16) async throws {
         try await send(control: .bankPreselect(UInt8(truncatingIfNeeded: max(n, 1) - 1)))
+    }
+
+    /// Load a rig by its flat, 0-based index — the device's own numbering, and
+    /// the only address that reaches a rig outside the current bank.
+    ///
+    /// Sent as the documented pair: the absolute bank preselect (CC47) followed
+    /// by the slot load (CC50–54) that commits it. The index divides by
+    /// ``Params/bankSlots``, so index 123 is bank 25, slot 4.
+    ///
+    /// Nothing here assumes how many banks a device has. Aim past the end and
+    /// the device simply stays where it is — and says so in the Bank Select /
+    /// Program Change report that follows, so ``DeviceState/currentRigIndex``
+    /// always reflects where it actually landed, not where this aimed.
+    public func selectRigIndex(_ index: UInt16) async throws {
+        let slots = UInt16(Params.bankSlots)
+        try await bank(index / slots + 1)
+        try await selectRig(UInt8(index % slots) + 1)
     }
     /// Tap the tempo (CC30).
     public func tapTempo() async throws { try await send(control: .tapTempo) }

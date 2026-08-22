@@ -77,6 +77,7 @@ def test_effect_type_name_and_is_empty():
     effect.kind = 179
     assert not effect.is_empty
     assert effect.type_name == "Easy Reverb"
+    assert effect.category_name == "Reverb"
 
 
 @pytest.mark.parametrize(

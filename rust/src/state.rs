@@ -87,6 +87,12 @@ impl Effect {
         params::effect_type_name(self.kind?)
     }
 
+    /// The effect Type's category via [`crate::params::effect_category_name`],
+    /// or `None` if the type is unknown or in no block.
+    pub fn category_name(&self) -> Option<&'static str> {
+        params::effect_category_name(self.kind?)
+    }
+
     /// True if the slot holds no effect (Type == 0, "empty").
     pub fn is_empty(&self) -> bool {
         self.kind == Some(0)
@@ -119,8 +125,45 @@ impl Tuner {
 pub struct Output {
     /// Main Output Volume (NRPN `0x7F/0`, 14-bit), once seen.
     pub main_volume: Option<u16>,
-    /// Monitor Output Volume (NRPN `0x7F/2`, 14-bit), once seen.
+    /// Headphone Output Volume (NRPN `0x7F/1`, 14-bit), once seen. Driven 1:1 by
+    /// the physical Master Volume knob.
+    pub headphone_volume: Option<u16>,
+    /// Monitor Output Volume (NRPN `0x7F/2`, 14-bit), once seen. Driven 1:1 by
+    /// the physical Master Volume knob.
     pub monitor_volume: Option<u16>,
+}
+
+impl Output {
+    /// The physical Master Volume knob's value. The knob is a potentiometer that
+    /// drives Headphone (`0x7F/1`) and Monitor (`0x7F/2`) 1:1 under the default
+    /// output routing, so report Headphone, falling back to Monitor. This is a
+    /// **read-only** readout: the pot has no soft-takeover, so a written value is
+    /// authoritative only until the knob next moves.
+    pub fn master_volume(&self) -> Option<u16> {
+        self.headphone_volume.or(self.monitor_volume)
+    }
+}
+
+/// One bank slot's preview names — the identity of one of the current bank's
+/// five rigs, as shown on the device's rig browser.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BankSlot {
+    /// Rig name in this slot (Bank Preview number 0..4), once seen.
+    pub rig_name: Option<String>,
+    /// The rig's amp name (Bank Preview number 5..9), once seen.
+    pub amp_name: Option<String>,
+    /// The rig's cabinet name (Bank Preview number 10..14), once seen.
+    pub cabinet_name: Option<String>,
+}
+
+/// The loaded bank's five-slot name preview (page `0x96`). The device pushes the
+/// whole block on a bank change, and it is readable on demand via
+/// [`DeviceModel::refresh_bank`](crate::model::DeviceModel::refresh_bank). Slot
+/// index 0 is rig slot 1.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bank {
+    /// The five preview slots, in slot order (index 0 = slot 1).
+    pub slots: [BankSlot; crate::generated::BANK_SLOTS],
 }
 
 /// The immutable device-state snapshot — the store's value type.
@@ -146,6 +189,20 @@ pub struct DeviceState {
     pub tuner: Tuner,
     /// The global output volumes.
     pub output: Output,
+    /// The loaded bank's five-slot name preview (page `0x96`).
+    pub bank: Bank,
+    /// Current bank, 0-based, once known. Seeded from the CBOR state-dump
+    /// snapshot ([`crate::cbor::StateSnapshot::fetch`]) via
+    /// [`DeviceModel::set_current_position`](crate::model::DeviceModel::set_current_position),
+    /// then kept live by the Bank Select / Program Change pair the device sends
+    /// on every rig change.
+    pub current_bank: Option<u16>,
+    /// Current rig slot within the bank, 0-based, once known. Same source as
+    /// [`current_bank`](Self::current_bank); slot 0 is rig slot 1.
+    pub current_rig_slot: Option<u16>,
+    /// The high 7 bits of a rig index, held between the Bank Select that carries
+    /// them and the Program Change that completes the pair.
+    pub(crate) pending_rig_index_msb: Option<u8>,
     /// Latest morph position (0–16383), once seen (NRPN `0x00/0x0B`).
     pub morph: Option<u16>,
     /// The most recent realtime status / meter frame (the FAST lane).
@@ -153,6 +210,15 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
+    /// The flat, 0-based rig index — `current_bank * BANK_SLOTS +
+    /// current_rig_slot` — once both halves are known.
+    ///
+    /// This is the device's own numbering, and the only address that can name a
+    /// rig outside the current bank.
+    pub fn current_rig_index(&self) -> Option<u16> {
+        Some(self.current_bank? * generated::BANK_SLOTS as u16 + self.current_rig_slot?)
+    }
+
     /// A fresh, empty state: [`Connection::Disconnected`], no rig data, all eight
     /// effect slots seeded from [`crate::params::effect_slots`], zeroed meters.
     pub fn new() -> Self {
@@ -174,6 +240,10 @@ impl DeviceState {
             effects,
             tuner: Tuner::default(),
             output: Output::default(),
+            bank: Bank::default(),
+            current_bank: None,
+            current_rig_slot: None,
+            pending_rig_index_msb: None,
             morph: None,
             status: RealtimeStatus::default(),
         }
@@ -232,6 +302,7 @@ mod tests {
         e.kind = Some(179);
         assert!(!e.is_empty());
         assert_eq!(e.type_name(), Some("Easy Reverb"));
+        assert_eq!(e.category_name(), Some("Reverb"));
     }
 
     #[test]

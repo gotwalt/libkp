@@ -75,6 +75,72 @@
       "name": null
     }
   ],
+  "effect_category_name": [
+    {
+      "value": 0,
+      "name": null
+    },
+    {
+      "value": 1,
+      "name": "Wah"
+    },
+    {
+      "value": 16,
+      "name": "Wah"
+    },
+    {
+      "value": 17,
+      "name": "Shaper"
+    },
+    {
+      "value": 32,
+      "name": "Distortion"
+    },
+    {
+      "value": 49,
+      "name": "Dynamics"
+    },
+    {
+      "value": 76,
+      "name": "Modulation"
+    },
+    {
+      "value": 89,
+      "name": "Phaser & Flanger"
+    },
+    {
+      "value": 112,
+      "name": "Booster"
+    },
+    {
+      "value": 121,
+      "name": "Effect Loop"
+    },
+    {
+      "value": 129,
+      "name": "Pitch"
+    },
+    {
+      "value": 161,
+      "name": "Delay"
+    },
+    {
+      "value": 179,
+      "name": "Reverb"
+    },
+    {
+      "value": 207,
+      "name": "Reverb"
+    },
+    {
+      "value": 208,
+      "name": null
+    },
+    {
+      "value": 300,
+      "name": null
+    }
+  ],
   "page_name": [
     {
       "page": 124,

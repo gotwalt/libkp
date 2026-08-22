@@ -11,7 +11,7 @@ from libkp import _generated as gen
 from libkp.errors import DisconnectedError, UnknownSlotError
 from libkp.model import DeviceModel
 from libkp.nrpn import PAGE_STRINGS, set_single, sysex, u14_split
-from libkp.state import Connection, EffectChanged, Status, TempoBpm
+from libkp.state import Connection, CurrentPosition, EffectChanged, Status, TempoBpm
 
 RIG_NAME = sysex(0x00, 0x00, 0x03, PAGE_STRINGS, 1, b"Test Rig\x00")
 REV_TYPE = set_single(0x00, 0x00, 0x3D, 0, 179)
@@ -39,17 +39,19 @@ def test_connect_performs_the_read_only_initial_sync():
         async with FakeDevice() as device:
             model = await DeviceModel.connect("127.0.0.1", device.port)
             try:
-                await wait_for(lambda: len(device.received) >= 22)
+                await wait_for(lambda: len(device.received) >= 37)
             finally:
                 await model.close()
             return device.received
 
     received = run(scenario())
-    # Six string-tag requests, then a Type + On/Off request per effect slot.
-    assert len(received) == 6 + 16
-    assert all(m[6] in (0x43, 0x41) for m in received), "sync must be read-only"
+    # Six string-tag requests, a Type + On/Off request per effect slot, then the
+    # 15 bank-preview extended-string requests (5 slots x rig/amp/cabinet).
+    assert len(received) == 6 + 16 + 15
+    assert all(m[6] in (0x43, 0x41, 0x47) for m in received), "sync must be read-only"
     assert received[0] == bytes.fromhex("f0002033007f43000001f7")  # Rig Name
     assert received[6][6] == 0x41
+    assert received[22][6] == 0x47  # first bank-preview ext-string request
 
 
 def test_connect_can_skip_the_initial_sync():
@@ -257,12 +259,33 @@ def test_actions_emit_control_changes():
     received = run(scenario())
     assert received[:7] == [
         bytes([0xB0, 30, 1]),
-        bytes([0xB0, 52, 1]),
-        bytes([0xB0, 48, 1]),
-        bytes([0xB0, 49, 1]),
+        # select_rig / rig_up / rig_down are momentary: press then release.
+        bytes([0xB0, 52, 1, 0xB0, 52, 0]),
+        bytes([0xB0, 48, 1, 0xB0, 48, 0]),
+        bytes([0xB0, 49, 1, 0xB0, 49, 0]),
         bytes([0xB0, 47, 3]),
         bytes([0xB0, 31, 1]),
         bytes([0xB0, 35, 0]),
+    ]
+
+
+def test_select_rig_index_sends_absolute_bank_then_slot():
+    """Index 123 is bank 25 slot 4: CC47 value 24, then CC53 press/release."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, sync=False)
+            try:
+                await model.select_rig_index(123)
+                await wait_for(lambda: len(device.received) >= 2)
+            finally:
+                await model.close()
+            return device.received
+
+    received = run(scenario())
+    assert received[:2] == [
+        bytes([0xB0, 47, 24]),
+        bytes([0xB0, 53, 1, 0xB0, 53, 0]),
     ]
 
 
@@ -321,3 +344,38 @@ def test_close_is_idempotent_and_usable_as_a_context_manager():
             return model.connected
 
     assert run(scenario()) is False
+
+
+def test_set_current_position_folds_into_state_and_emits():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, sync=False)
+            events = model.events()
+            snapshots = model.subscribe()
+            try:
+                model.set_current_position(1, 2)
+                snapshot = await asyncio.wait_for(snapshots.get(), 2.0)
+                event = await asyncio.wait_for(events.get(), 2.0)
+                return model.state(), snapshot, event
+            finally:
+                await model.close()
+
+    state, snapshot, event = run(scenario())
+    assert (state.current_bank, state.current_rig_slot) == (1, 2)
+    assert (snapshot.current_bank, snapshot.current_rig_slot) == (1, 2)
+    assert event == CurrentPosition(bank=1, slot=2)
+
+
+def test_set_current_position_only_overwrites_known_indices():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, sync=False)
+            try:
+                model.set_current_position(3, 4)
+                model.set_current_position(None, 0)  # leave the bank untouched
+                return model.state()
+            finally:
+                await model.close()
+
+    state = run(scenario())
+    assert (state.current_bank, state.current_rig_slot) == (3, 0)

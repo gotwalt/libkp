@@ -12,7 +12,7 @@ control.
 3. [Handshake](03-handshake.md) — TCP protocol-GUID negotiation and session preamble
 4. [MIDI3 framing](04-midi3-framing.md) — how MIDI is carried over the stream
 5. [SysEx / NRPN dialect](05-sysex-nrpn.md) — the parameter message grammar
-6. [The CBOR channel](06-cbor-channel.md) — the native control channel (experimental)
+6. [The CBOR channel](06-cbor-channel.md) — native control channel; the current bank/rig snapshot
 7. [Realtime status & meters](07-realtime-status.md) — the ~20 Hz status block
 8. [Control model](08-control-model.md) — CC vs NRPN, and the device model
 9. [Parameter registry](09-parameter-registry.md) — typed parameter descriptors
