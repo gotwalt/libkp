@@ -1,14 +1,18 @@
 # The CBOR channel
 
-> **Experimental — not implemented in `libkp`.**
-> This document records what is known about the device's native control channel
-> from the outside. It is deliberately incomplete: only the wire shape has been
-> characterized, not the command grammar. Nothing here is exercised by the
-> conformance vectors, and no `libkp` code path speaks it.
+> **Partially implemented.** `libkp` speaks this channel for exactly one purpose:
+> the **state-dump snapshot** that reads the device's current bank and rig
+> ([`cbor`](../rust/src/cbor.rs) / [`libkp.cbor`](../python/src/libkp/cbor.py) /
+> [`Cbor`](../swift/Sources/LibKP/Cbor.swift)). The codec (encode + streaming
+> decode) and that one exchange are exercised by the conformance vectors
+> ([`../spec/vectors/cbor.json`](../spec/vectors/cbor.json)). The channel's wider
+> command grammar — preset and library management, backup, firmware transfer — is
+> still only characterized as a category and no `libkp` code path drives it.
 >
-> If you need to read or write parameters, use the MIDI3 stream
-> ([04](04-midi3-framing.md), [05](05-sysex-nrpn.md)). It covers the entire
-> control and monitoring surface this library exposes.
+> For live control and monitoring, use the MIDI3 stream
+> ([04](04-midi3-framing.md), [05](05-sysex-nrpn.md)); it covers the whole
+> realtime surface. The one thing it cannot report is the device's current
+> position, which is what this channel is used for.
 
 ## What it is
 
@@ -32,16 +36,30 @@ self-description supplies the boundaries. A decoder reads one item at a time
 from the byte stream and hands each to the application; a well-formed capture
 decodes to a whole number of items with no residue.
 
-Every item observed has the same shape: a **`tag(1)`** wrapping a small array of
-integers.
+Every parameter item observed is a **`tag(1)`** wrapping a small array whose
+first element (after an optional leading negative source-flag word) selects the
+shape:
 
-| Shape | Notes |
-|---|---|
-| `tag(1)([1, addr, value])` | the common case — one parameter event |
-| `tag(1)([e, 1, addr, value])` | a 4-element variant with a leading element (observed as `-1`); its meaning is not characterized |
+| Shape | Selector | Notes |
+|---|---|---|
+| `tag(1)([1, addr, value])` | 1 | one parameter — a single change or reply |
+| `tag(1)([2, base, v0, v1, …])` | 2 | a **consecutive run**: `base`, `base+1`, … |
+| `tag(1)([4, addr, "text"])` | 4 | a string parameter |
+| `tag(1)([-1, 1, addr, value])` | — | the single-parameter shape with a leading source flag (observed as `-1`) |
 
 `addr` and `value` are plain CBOR integers, so their encoded width varies with
-magnitude — this is not a fixed-size record format.
+magnitude — this is not a fixed-size record format. The encoder writes the
+**shortest integer head that fits**, which is what the device itself emits
+(address 102405 as `1a 00 01 90 05`, 15953 as `19 3e 51`).
+
+### Filler bytes
+
+Between top-level items the channel emits runs of the padding byte **`0xC0`** — a
+`tag(0)` head with no content, which is not well-formed CBOR on its own. Parsed
+naively it swallows the following item, so the decoder skips it. A *genuine*
+`tag(0)` is an RFC 8949 date/time whose content must be a text string, so a
+`0xC0` is treated as filler only when the next head is **not** a text head,
+leaving real datetimes intact.
 
 ## Addressing
 
@@ -57,35 +75,119 @@ which is the identical formula the `$06`/`$07` extended messages use for their
 `(page, number)` decomposition — appear in this space too, so the channel's
 address field spans the full extended range rather than just the 14-bit part.
 
-Worked examples, decoded against known addresses:
-
 | `addr` | Decomposition | Parameter |
 |---|---|---|
 | 15872 | `$7C` × 128 + 0 | Tempo / beat pulse — toggles 0 / 16383 |
 | 15953 | `$7C` × 128 + 81 | Tuner Strobe Phase — reads 0 while idle |
 | 102405 | ≥ 16384, extended | an extended-address parameter with no page/number form |
+| 100701 | ≥ 16384, extended | **current bank**, 0-based (see below) |
+| 100702 | ≥ 16384, extended | **current rig slot** in the bank, 0-based |
 
-Address 102405 also appears as an `$06` Extended Parameter Change on the MIDI3
-stream — see the worked unframing example in
-[MIDI3 framing](04-midi3-framing.md). The two channels are addressing the same
-thing.
+## The state dump — and how to ask for it
+
+The channel does **not** volunteer the device's stored state on connect. A
+passive session — one that completes the handshake and preamble and then only
+listens — sees just the live change events physical knob turns produce; it never
+learns the starting value of anything it did not watch move.
+
+Writing one item asks for the whole thing:
+
+```
+tag(1)([1, 102528, 1])        ->  c1 83 01 1a 00 01 90 80 01
+```
+
+`102528` is `state_dump_trigger_address`; the value is `1`. The device answers
+with its **entire parameter state** as a burst of selector-`2` runs and
+selector-`4` strings. The write is **non-mutating** — `102528` is a status flag
+the device already carries — so a read-only client may send it safely. This one
+item is sufficient by itself.
+
+### Current bank and rig
+
+The dump carries the device's current position as two 0-based extended
+addresses:
+
+| address | meaning |
+|---|---|
+| **100701** (`0x1895D`) | current bank, 0-based |
+| **100702** (`0x1895E`) | current rig slot in the bank, 0-based |
+
+At session open they arrive together inside one consecutive run — e.g.
+`tag(1)([2, 100700, 0, 0, 2])` sets `100700=0`, `100701=0`, `100702=2` — so a
+reader must **walk the whole run** rather than assume a fixed position; live
+changes then push the elements singly. The dump also carries the current rig
+name (string address 1) and the bank's five preview names, so the name and the
+index agree.
+
+This is the only route to these values. The MIDI3 stream never reports them: the
+read-only name-match ([Control model](08-control-model.md)) — comparing the
+loaded rig name against the [bank preview](09-parameter-registry.md) — can
+recover the *slot* but not the bank number, and fails when two slots share a
+name. The numeric indices resolve both.
+
+### Credentials are redacted
+
+The dump also volunteers the device's stored WiFi credentials in the clear — the
+network name at address 200008 and its passphrase at 200009 (`sensitive_addresses`).
+The snapshot reader replaces any string value at these addresses with
+`[redacted]` (`redacted_placeholder`) before it is exposed, and nothing in
+`libkp` surfaces them. A reader built on the raw [`cbor`](../rust/src/cbor.rs)
+codec must do the same.
+
+## The snapshot API
+
+One call opens a fresh, short-lived CBOR session, sends the trigger, reads the
+current position out of the dump, and closes:
+
+```rust
+use libkp::cbor::StateSnapshot;
+let snap = StateSnapshot::fetch(ip).await?;
+// snap.current_bank, snap.current_rig_slot   (both Option<u16>, 0-based)
+```
+
+```python
+from libkp import fetch_state_snapshot
+snap = await fetch_state_snapshot(ip)
+# snap.current_bank, snap.current_rig_slot     (both int | None, 0-based)
+```
+
+```swift
+let snap = try await StateSnapshot.fetch(ip)
+// snap.currentBank, snap.currentRigSlot        (both UInt16?, 0-based)
+```
+
+**Run it before, not alongside, a streaming session.** It opens its own socket,
+independent of a [`DeviceModel`](07-realtime-status.md); the device is unhappy
+about concurrent connections and connection churn. It refuses to greet — or
+resets — a session opened too soon after a prior socket closed: a MIDI3 session
+opened immediately after the snapshot's socket closes times out waiting for the
+greeting, while spacing them by about a second connects cleanly. So a controller
+that also wants live meters should fetch the snapshot first, **wait at least the
+connection cooldown** (`connection_cooldown_ms`, exposed as `CONNECTION_COOLDOWN`
+in Rust/Python and `Session.connectionCooldown` in Swift), let that socket close,
+then open the MIDI3 model — and feed the result in with
+`DeviceModel::set_current_position` (Rust) / `set_current_position` (Python) /
+`setCurrentPosition` (Swift), which folds the indices into `DeviceState`
+(`current_bank` / `current_rig_slot`) and emits a `CurrentPosition` event.
 
 ## The relationship to MIDI3
 
-In an idle session, everything this channel pushes is a re-encoding of events
-the device already broadcasts as MIDI3-framed SysEx. One event universe, two
-wire formats:
+In an idle session, the change events this channel pushes are a re-encoding of
+events the device already broadcasts as MIDI3-framed SysEx. One event universe,
+two wire formats:
 
 | | `{369F50E7-…}` MIDI3 | `{774CDB9E-…}` CBOR |
 |---|---|---|
 | Framing | 4-byte frames → Kemper SysEx | bare CBOR items |
 | Parameter change | `$01` at `<page>/<number>` | `tag(1)([1, addr, value])` |
-| Beat pulse | `$01` page `$7C`, number 0 | the 4-element variant at addr 15872 |
+| Consecutive run | `$02` multi-parameter | `tag(1)([2, base, …])` |
+| String | `$03`/`$43` | `tag(1)([4, addr, "text"])` |
 | Extended parameter | `$06` with a 5-byte address | the same integer address |
-| Realtime status block | `$02` at `$7C`/`$4E` | not observed |
+| Full state dump | not observed | the selector-`2`/`4` burst above |
 
 The channels are independent sessions on independent sockets. Selecting one
-during the handshake precludes the other for that connection.
+during the handshake precludes the other for that connection — and the full
+state dump is something only this channel is known to produce.
 
 ## Encodings do not cross over
 
@@ -103,11 +205,10 @@ this channel must be a CBOR encoder and decoder from the start.
 
 Explicitly out of scope of this document:
 
-- The request and command grammar — how to *ask* for something rather than
-  observe what is pushed. No request shape has been characterized.
-- Whether the channel needs a subscription or handshake step analogous to the
-  MIDI3 [beacon](05-sysex-nrpn.md#beacon-and-sense) before it will answer.
-- The semantics of the leading element in the 4-element variant.
+- The request and command grammar beyond the state-dump trigger — how to *ask*
+  for anything else rather than observe what is pushed. No other request shape
+  has been characterized.
+- The semantics of the leading source-flag element in the 4-element variant.
 - The realtime status block's representation, if it has one here.
 - Every device-management operation: preset and rig management, library
   organization, backup, and firmware transfer.
@@ -124,6 +225,7 @@ but its grammar is uncharacterized and it is likewise not implemented.
 
 ## Sources
 
-The existence, wire shape, and address space of the CBOR channel were
+The existence, wire shape, address space, filler convention, the state-dump
+trigger, and the current-position addresses of the CBOR channel were
 characterized through observed experimentation, from the outside only. See
 [../CREDITS.md](../CREDITS.md).

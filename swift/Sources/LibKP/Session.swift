@@ -44,9 +44,21 @@ public final class Session: @unchecked Sendable {
     /// Request/response protocol identifier: accepts the handshake but pushes
     /// nothing.
     public static let protocolRequestResponse = Generated.protocolRequestResponse
+    /// The device's native CBOR control channel — the state-dump snapshot route
+    /// (see ``Cbor`` and `docs/06`). Completes the same handshake and preamble as
+    /// the MIDI3 stream, then speaks CBOR rather than MIDI3 frames.
+    public static let protocolCborControl = Generated.protocolCborControl
 
     /// The 8 zero bytes the client writes to open the encapsulated stream.
     public static let sessionPreamble = [UInt8](repeating: 0, count: Generated.sessionPreambleLen)
+
+    /// Minimum quiet gap between one session closing and the next opening. The
+    /// device refuses to greet — or resets — a session opened too soon after a
+    /// prior socket closed, so an orchestrator that opens more than one session
+    /// (the CBOR ``StateSnapshot/fetch(host:port:timeout:)`` then a MIDI3
+    /// ``DeviceModel``) must space them by at least this and never overlap them.
+    /// See `docs/06`.
+    public static let connectionCooldown = TimeInterval(Generated.connectionCooldownMs) / 1000.0
 
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.libkp.session")
