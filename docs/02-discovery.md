@@ -4,6 +4,38 @@ Profilers are found by UDP broadcast on port **5727**. The client sends a fixed
 34-byte poll; every Profiler on the LAN answers with a description of itself.
 Both the poll and the reply use the same small serialization, **TagStream**.
 
+## Owning the port
+
+A client must take UDP 5727 **exclusively**, and hold it for as long as the
+session is active.
+
+This is not a stylistic preference. The device answers a poll only on port 5727 —
+it ignores the poll's source port, so listening anywhere else hears nothing — and
+when several sockets are bound to one UDP port the kernel delivers each arriving
+datagram to *exactly one* of them. A second listener therefore does not observe a
+copy of the reply; it takes it. Two programs sharing the port turn discovery into
+a coin flip, and the one that loses reports "no device found" while the network
+and the Profiler are both perfectly healthy.
+
+So bind without `SO_REUSEADDR` and without `SO_REUSEPORT`:
+
+- **If the port is free**, the exclusive bind succeeds and no other process can
+  take it while the socket is open — replies cannot be stolen mid-session.
+- **If the port is already held**, the bind fails with `EADDRINUSE`, and that is
+  the correct moment to stop and say so. Report it as a port conflict naming the
+  likely holder; do not fall back to a shared bind, which merely converts a clear
+  start-up error into an intermittent one.
+
+The usual holder on a desktop machine is other Kemper software: Rig Manager binds
+UDP 5727 for its entire run, so it has to be quit before a client can discover.
+
+Implementations expose this as an owned handle — `DiscoveryPort` in all three —
+acquired before the session and released when it ends. `poll` may be called on it
+as often as needed, which is what a long-running client wants: re-poll to notice
+Profilers appearing and disappearing without ever letting go of the port in
+between. The one-shot `discover` / `find_first` helpers acquire, poll once and
+release, and suit a CLI rather than a session.
+
 ## TagStream
 
 TagStream is a length-prefixed field list with an optional 4-byte ASCII header.

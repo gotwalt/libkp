@@ -60,7 +60,7 @@ pub const SPEC_VERSION: &str = generated::SPEC_VERSION;
 
 pub use cbor::{StateSnapshot, extract_snapshot, param_write, state_dump_request};
 pub use control::{Control, ModuleSlot, program_change, slot_enable_cc};
-pub use discovery::{Options, Reply, discover, find_first};
+pub use discovery::{DiscoveryPort, Options, Reply, discover, find_first};
 pub use error::{DiscoverError, ParseError, SessionError};
 pub use midi3::Unframer;
 pub use model::{ApplyOutcome, CommandError, DeviceEvent, DeviceModel, RealtimeStatus};

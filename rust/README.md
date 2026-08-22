@@ -35,6 +35,19 @@ while let Ok(state) = snapshots.recv().await {
 # Ok(())
 # }
 ```
+
+Discovery needs UDP 5727 **exclusively** — the device replies only to that
+port, and the kernel hands each reply to just one bound socket, so a second
+listener steals replies rather than copying them. Acquiring it fails fast if
+another program (Kemper's Rig Manager, typically) holds it. Hold a
+`DiscoveryPort` across a session rather than re-acquiring per attempt; see
+[Discovery](../docs/02-discovery.md#owning-the-port).
+
+```rust
+let port = libkp::DiscoveryPort::acquire()?;  // Err(PortUnavailable) if taken
+let replies = port.poll(&libkp::Options::default()).await?;
+```
+
 ## Layout
 
 | Module | What it does |
