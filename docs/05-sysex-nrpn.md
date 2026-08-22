@@ -189,16 +189,19 @@ Framed for the wire, this becomes
 `14f000201433007f1401003d1403000115f70000` — see
 [MIDI3 framing](04-midi3-framing.md).
 
-The device echoes the change back on the stream as a `$01` from
-`product 00, device 00`, which is how a state model stays consistent:
+The device applies that write, but — established by observed experimentation —
+it does **not** echo it back on a plain streaming session. A client whose state
+store must reflect the applied value follows the write with a `$41` single
+parameter request for the same address; the reply is an ordinary `$01` from
+`product 00, device 00` and flows through normal ingest:
 
 ```
 f0 00 20 33 00 00 01 00 3d 03 00 01 f7
 ```
 
-That echo also fires for changes made at the **front panel**, so a client never
-has to poll. Read-back after a write lands roughly a second later; do not treat
-the absence of an immediate echo as failure.
+The reply lands roughly a second later, so order state changes before their
+read-backs and give a confirmation poll a couple of seconds before deciding a
+write failed.
 
 `$01` may carry an **optional trailing 14-bit pair**, the morph "B value" for
 the same address. A parser must therefore accept 2 *or* 4 value bytes and use
@@ -364,8 +367,8 @@ Semantics:
   `$7E`, instance `$00`, page `$7F`. No sense for 1.5 s means the link is down.
 - Re-send the beacon at **half the lease** to renew it. Init beacons are retried
   every 5 s until sensing starts.
-- The realtime status block and the `$01` change echoes are pushed **without**
-  any beacon, so a monitoring client can skip the beacon entirely. It is needed
+- The realtime status block and the `$01` pushes for device-side changes arrive
+  **without** any beacon, so a monitoring client can skip it entirely. It is needed
   only for the set-`$02` subscription and the sense heartbeat.
 
 Constants: `[beacon]` in [`../spec/protocol.toml`](../spec/protocol.toml).

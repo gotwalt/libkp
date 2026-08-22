@@ -356,17 +356,17 @@ def build():
         ("tuner_mode", {"on": True}, 0, control_change(0, 31, 1)),
         ("tuner_mode", {"on": False}, 0, control_change(0, 31, 0)),
         ("toggle_all_modules", {}, 0, control_change(0, 16, 1)),
-        ("up", {}, 0, control_change(0, 48, 1)),
-        ("down", {}, 0, control_change(0, 49, 1)),
+        ("up", {}, 0, control_change(0, 48, 1) + control_change(0, 48, 0)),
+        ("down", {}, 0, control_change(0, 49, 1) + control_change(0, 49, 0)),
         ("bank_preselect", {"value": 3}, 0, control_change(0, 47, 3)),
         ("rotary_fast", {"on": True}, 0, control_change(0, 33, 1)),
         ("delay_infinity", {"on": True}, 0, control_change(0, 34, 1)),
         ("freeze", {"on": True}, 0, control_change(0, 35, 1)),
         ("morph_button", {"on": True}, 0, control_change(0, 80, 1)),
         ("morph_button", {"on": False}, 0, control_change(0, 80, 0)),
-        ("load_slot", {"n": 3}, 0, control_change(0, 52, 1)),
-        ("load_slot", {"n": 0}, 0, control_change(0, 50, 1)),
-        ("load_slot", {"n": 99}, 0, control_change(0, 54, 1)),
+        ("load_slot", {"n": 3}, 0, control_change(0, 52, 1) + control_change(0, 52, 0)),
+        ("load_slot", {"n": 0}, 0, control_change(0, 50, 1) + control_change(0, 50, 0)),
+        ("load_slot", {"n": 99}, 0, control_change(0, 54, 1) + control_change(0, 54, 0)),
         ("effect_button", {"n": 4}, 0, control_change(0, 78, 1)),
         ("effect_button", {"n": 0}, 0, control_change(0, 75, 1)),
         ("slot_enable", {"slot": "REV", "on": True}, 0, control_change(0, 29, 1)),
@@ -380,7 +380,8 @@ def build():
     ]
     w("controls.json", {
         "description": "Control op -> raw MIDI bytes. Each impl maps op names to its Control API; "
-                       "values are masked to 7 bits, load_slot clamps to 1..=5, effect_button to 1..=4.",
+                       "values are masked to 7 bits, load_slot clamps to 1..=5, effect_button to 1..=4. "
+                       "Momentary controls (up, down, load_slot) emit a press (value 1) followed by a release (value 0) as one 6-byte message.",
         "cases": [{"op": op, "params": pr, "channel": ch, "hex": hx(b)} for op, pr, ch, b in controls],
     })
 
@@ -389,6 +390,37 @@ def build():
         pa = tomllib.load(fh)
     with open(ROOT / "spec" / "effect-types.toml", "rb") as fh:
         et = tomllib.load(fh)
+
+    def category_of(v: int) -> str | None:
+        for c in et["effect_categories"]:
+            if c["min"] <= v <= c["max"]:
+                return c["name"]
+        return None
+
+    # Ground-truth category expectations, cross-checked against the spec table:
+    # block interiors, both sides of a block boundary, an unnamed Type value,
+    # the empty type, and values past the last block.
+    effect_category_cases = [
+        {"value": 0, "name": None},
+        {"value": 1, "name": "Wah"},
+        {"value": 16, "name": "Wah"},
+        {"value": 17, "name": "Shaper"},
+        {"value": 32, "name": "Distortion"},
+        {"value": 49, "name": "Dynamics"},
+        {"value": 76, "name": "Modulation"},
+        {"value": 89, "name": "Phaser & Flanger"},
+        {"value": 112, "name": "Booster"},
+        {"value": 121, "name": "Effect Loop"},
+        {"value": 129, "name": "Pitch"},
+        {"value": 161, "name": "Delay"},
+        {"value": 179, "name": "Reverb"},
+        {"value": 207, "name": "Reverb"},
+        {"value": 208, "name": None},
+        {"value": 300, "name": None},
+    ]
+    for c in effect_category_cases:
+        assert category_of(c["value"]) == c["name"], c
+
     w("params.json", {
         "description": "Offline name lookups. null means no mapping.",
         "param_name": [
@@ -410,6 +442,7 @@ def build():
             {"value": 193, "name": "Spring Reverb"},
             {"value": 5, "name": None},
         ],
+        "effect_category_name": effect_category_cases,
         "page_name": [
             {"page": 0x7C, "name": "Realtime/Meters"},
             {"page": 0x0A, "name": "Amplifier"},
@@ -477,6 +510,25 @@ def _state_cases():
     cases.append({"name": "morph + tuner note + main vol",
                   "messages": [hx(morph), hx(note), hx(mainv)],
                   "expect": {"morph": 4096, "tuner_note": 9, "main_volume": 12000}})
+    # 7. The device's position: Bank Select LSB (high 7 bits) then Program
+    #    Change (low 7), a flat 0-based rig index that divides by BANK_SLOTS.
+    #    Index 123 = bank 24, slot 3 — the last rig of a 25-bank device.
+    cases.append({"name": "rig index, single byte",
+                  "messages": [hx(bytes([0xB0, 32, 0])), hx(bytes([0xC0, 123]))],
+                  "expect": {"current_bank": 24, "current_rig_slot": 3,
+                             "current_rig_index": 123}})
+    # 8. An index past 127 needs the Bank Select byte: 128 * 1 + 72 = 200.
+    cases.append({"name": "rig index, two bytes",
+                  "messages": [hx(bytes([0xB0, 32, 1])), hx(bytes([0xC0, 72]))],
+                  "expect": {"current_bank": 40, "current_rig_slot": 0,
+                             "current_rig_index": 200}})
+    # 9. A Program Change with no Bank Select ahead of it is half an index, not
+    #    a position: the trailing lone PC must leave the last one standing.
+    cases.append({"name": "rig index ignores an unpaired program change",
+                  "messages": [hx(bytes([0xB0, 32, 0])), hx(bytes([0xC0, 123])),
+                               hx(bytes([0xC0, 5]))],
+                  "expect": {"current_bank": 24, "current_rig_slot": 3,
+                             "current_rig_index": 123}})
     return cases
 
 

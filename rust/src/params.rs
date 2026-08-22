@@ -79,6 +79,58 @@ pub fn page0_numeric_name(n: u8) -> Option<&'static str> {
     lookup_u8(generated::PAGE0_NUMERIC, n)
 }
 
+/// Page holding the loaded bank's five-slot name preview (rig/amp/cabinet).
+pub const PAGE_BANK_PREVIEW: u8 = generated::PAGE_BANK_PREVIEW;
+/// Number of rig slots in a bank.
+pub const BANK_SLOTS: usize = generated::BANK_SLOTS;
+
+/// Which of the three five-slot name groups on [`PAGE_BANK_PREVIEW`] to address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BankPreviewField {
+    /// Rig names (numbers [`generated::BANK_RIG_NAME_BASE`]..).
+    RigName,
+    /// Amp names (numbers [`generated::BANK_AMP_NAME_BASE`]..).
+    AmpName,
+    /// Cabinet names (numbers [`generated::BANK_CABINET_NAME_BASE`]..).
+    CabinetName,
+}
+
+impl BankPreviewField {
+    /// First controller number of this group on [`PAGE_BANK_PREVIEW`].
+    pub fn base(self) -> u8 {
+        match self {
+            BankPreviewField::RigName => generated::BANK_RIG_NAME_BASE,
+            BankPreviewField::AmpName => generated::BANK_AMP_NAME_BASE,
+            BankPreviewField::CabinetName => generated::BANK_CABINET_NAME_BASE,
+        }
+    }
+}
+
+/// Flat NRPN address (`page * 128 + number`) of a bank-preview field for a
+/// 1-based `slot` (1..=[`BANK_SLOTS`]). This is the read-on-demand address for
+/// [`crate::nrpn::request_extended_string`].
+pub fn bank_preview_address(field: BankPreviewField, slot: u8) -> u32 {
+    let slot = slot.clamp(1, BANK_SLOTS as u8) - 1;
+    PAGE_BANK_PREVIEW as u32 * 128 + field.base() as u32 + slot as u32
+}
+
+/// Reverse of [`bank_preview_address`]: map a [`PAGE_BANK_PREVIEW`] number
+/// (0..15) to its `(field, 0-based slot index)`, or `None` if out of range.
+pub fn bank_preview_slot_field(number: u8) -> Option<(BankPreviewField, usize)> {
+    let slots = BANK_SLOTS as u8;
+    for field in [
+        BankPreviewField::RigName,
+        BankPreviewField::AmpName,
+        BankPreviewField::CabinetName,
+    ] {
+        let base = field.base();
+        if number >= base && number < base + slots {
+            return Some((field, usize::from(number - base)));
+        }
+    }
+    None
+}
+
 /// String-tag names on page 0 — function $03/$43 only.
 pub fn string_tag_name(n: u8) -> Option<&'static str> {
     lookup_u8(generated::STRING_TAGS, n)
@@ -90,6 +142,16 @@ pub fn effect_type_name(value: u16) -> Option<&'static str> {
         .binary_search_by_key(&value, |(v, _)| *v)
         .ok()
         .map(|i| generated::EFFECT_TYPES[i].1)
+}
+
+/// The category of an effect Type value — the group of the device's type knob it
+/// belongs to, derived from the block structure of Appendix B's value ranges.
+/// `None` for 0 ("empty") and for values in no block.
+pub fn effect_category_name(value: u16) -> Option<&'static str> {
+    generated::EFFECT_CATEGORIES
+        .iter()
+        .find(|c| value >= c.min && value <= c.max)
+        .map(|c| c.name)
 }
 
 /// Render a "Page: Param" label for a page/number pair, falling back to hex.
@@ -165,6 +227,16 @@ mod tests {
     }
 
     #[test]
+    fn effect_categories() {
+        assert_eq!(effect_category_name(16), Some("Wah"));
+        assert_eq!(effect_category_name(17), Some("Shaper"));
+        // A type with no name still resolves to its block.
+        assert_eq!(effect_category_name(76), Some("Modulation"));
+        assert_eq!(effect_category_name(0), None);
+        assert_eq!(effect_category_name(300), None);
+    }
+
+    #[test]
     fn realtime_page_addresses() {
         assert_eq!(page_name(0x7C), Some("Realtime/Meters"));
         assert_eq!(
@@ -206,5 +278,37 @@ mod tests {
         assert_eq!(function_name(0x01), Some("single-param"));
         assert_eq!(function_name(0x7E), Some("beacon"));
         assert_eq!(function_name(0x55), None);
+    }
+
+    #[test]
+    fn bank_preview_addresses_and_names() {
+        assert_eq!(page_name(0x96), Some("Bank Preview"));
+        assert_eq!(param_name(0x96, 0), Some("Bank Rig Name"));
+        assert_eq!(param_name(0x96, 7), Some("Bank Amp Name"));
+        assert_eq!(param_name(0x96, 14), Some("Bank Cabinet Name"));
+        assert_eq!(param_name(0x96, 15), None);
+        // Slot 1 rig name is the flat page base; slot 5 cabinet is base+4.
+        assert_eq!(bank_preview_address(BankPreviewField::RigName, 1), 19200);
+        assert_eq!(
+            bank_preview_address(BankPreviewField::CabinetName, 5),
+            19214
+        );
+        // Out-of-range slots clamp into 1..=BANK_SLOTS.
+        assert_eq!(bank_preview_address(BankPreviewField::AmpName, 0), 19205);
+        assert_eq!(bank_preview_address(BankPreviewField::AmpName, 9), 19209);
+        // The reverse map recovers (field, 0-based slot).
+        assert_eq!(
+            bank_preview_slot_field(3),
+            Some((BankPreviewField::RigName, 3))
+        );
+        assert_eq!(
+            bank_preview_slot_field(9),
+            Some((BankPreviewField::AmpName, 4))
+        );
+        assert_eq!(
+            bank_preview_slot_field(10),
+            Some((BankPreviewField::CabinetName, 0))
+        );
+        assert_eq!(bank_preview_slot_field(15), None);
     }
 }

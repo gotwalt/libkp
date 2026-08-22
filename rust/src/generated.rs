@@ -2,12 +2,13 @@
 #![allow(clippy::all)]
 #![cfg_attr(rustfmt, rustfmt::skip)]
 
-pub const SPEC_VERSION: &str = "0.1.0";
+pub const SPEC_VERSION: &str = "0.5.0";
 
 // Transport
 pub const PORT: u16 = 5727;
 pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 pub const SOCKET_TIMEOUT_SECS: u64 = 15;
+pub const CONNECTION_COOLDOWN_MS: u64 = 1000;
 
 // Discovery
 pub const DISCOVERY_HEADER: &str = "DSCV";
@@ -28,6 +29,17 @@ pub const PROTOCOL_MIDI3_STREAM: &str = "{369F50E7-750B-459A-BAEE-85ADD3F3798D}"
 pub const PROTOCOL_REQUEST_RESPONSE: &str = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}";
 pub const PROTOCOL_CBOR_CONTROL: &str = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}";
 pub const PROTOCOL_RESERVED: &str = "{77DB6B28-785E-4641-B840-42F0F06A11FC}";
+
+// CBOR channel
+pub const CBOR_ITEM_TAG: u64 = 1;
+pub const CBOR_SELECTOR_SINGLE: i64 = 1;
+pub const CBOR_SELECTOR_MULTI: i64 = 2;
+pub const CBOR_SELECTOR_STRING: i64 = 4;
+pub const CBOR_FILLER_BYTE: u8 = 0xc0;
+pub const STATE_DUMP_TRIGGER_ADDRESS: u32 = 102528;
+pub const STATE_DUMP_TRIGGER_VALUE: i64 = 1;
+pub const SENSITIVE_ADDRESSES: [u32; 2] = [200008, 200009];
+pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
 // MIDI3 framing tags
 pub const MIDI3_TAG_CONTINUATION: u8 = 0x14;
@@ -88,7 +100,13 @@ pub const AMP_ON_NUMBER: u8 = 0x02;
 pub const GAIN_NUMBER: u8 = 0x04;
 pub const SYSTEM_PAGE: u8 = 0x7f;
 pub const MAIN_VOLUME_NUMBER: u8 = 0x00;
+pub const HEADPHONE_VOLUME_NUMBER: u8 = 0x01;
 pub const MONITOR_VOLUME_NUMBER: u8 = 0x02;
+pub const PAGE_BANK_PREVIEW: u8 = 0x96;
+pub const BANK_SLOTS: usize = 5;
+pub const BANK_RIG_NAME_BASE: u8 = 0x00;
+pub const BANK_AMP_NAME_BASE: u8 = 0x05;
+pub const BANK_CABINET_NAME_BASE: u8 = 0x0a;
 pub const PAGE_MORPH: u8 = 0x00;
 pub const MORPH_NUMBER: u8 = 0x0b;
 pub const PAGE_TUNER_NOTE: u8 = 0x7d;
@@ -96,6 +114,8 @@ pub const TUNER_NOTE_NUMBER: u8 = 0x54;
 pub const TUNER_IN_TUNE_CENTER: u16 = 8192;
 pub const TUNER_IN_TUNE_WINDOW: u16 = 350;
 pub const METER_COUNT: usize = 11;
+pub const CURRENT_BANK_ADDRESS: u32 = 100701;
+pub const CURRENT_RIG_SLOT_ADDRESS: u32 = 100702;
 
 // Meter block
 pub const METER_PAGE: u8 = 0x7c;
@@ -144,6 +164,7 @@ pub static PAGE_NAMES: &[(u8, &str)] = &[
     (0x7c, "Realtime/Meters"),
     (0x7d, "Looper/Freeze"),
     (0x7f, "System/Global"),
+    (0x96, "Bank Preview"),
 ];
 
 #[rustfmt::skip]
@@ -305,6 +326,7 @@ pub static NON_EFFECT_PARAMS: &[(u8, u8, &str)] = &[
     (0x0a, 11, "Tube Shape"),
     (0x0a, 12, "Tube Bias"),
     (0x0a, 15, "Direct Mix"),
+    (0x0a, 20, "Gain (smoothed follower)"),
     (0x0a, 21, "Bright Cap Intensity"),
     (0x0b, 4, "Bass"),
     (0x0b, 5, "Middle"),
@@ -405,6 +427,21 @@ pub static NON_EFFECT_PARAMS: &[(u8, u8, &str)] = &[
     (0x7f, 53, "Looper Location"),
     (0x7f, 59, "Aux >Mono"),
     (0x7f, 126, "Tuner Mode State"),
+    (0x96, 0, "Bank Rig Name"),
+    (0x96, 1, "Bank Rig Name"),
+    (0x96, 2, "Bank Rig Name"),
+    (0x96, 3, "Bank Rig Name"),
+    (0x96, 4, "Bank Rig Name"),
+    (0x96, 5, "Bank Amp Name"),
+    (0x96, 6, "Bank Amp Name"),
+    (0x96, 7, "Bank Amp Name"),
+    (0x96, 8, "Bank Amp Name"),
+    (0x96, 9, "Bank Amp Name"),
+    (0x96, 10, "Bank Cabinet Name"),
+    (0x96, 11, "Bank Cabinet Name"),
+    (0x96, 12, "Bank Cabinet Name"),
+    (0x96, 13, "Bank Cabinet Name"),
+    (0x96, 14, "Bank Cabinet Name"),
 ];
 
 #[rustfmt::skip]
@@ -531,6 +568,29 @@ pub static EFFECT_TYPES: &[(u16, &str)] = &[
     (182, "Formant Reverb"),
     (183, "Ionosphere Reverb"),
     (193, "Spring Reverb"),
+];
+
+/// One category block of the effect Type value space: an inclusive range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectCategory {
+    pub min: u16,
+    pub max: u16,
+    pub name: &'static str,
+}
+#[rustfmt::skip]
+pub static EFFECT_CATEGORIES: &[EffectCategory] = &[
+    EffectCategory { min: 1, max: 16, name: "Wah" },
+    EffectCategory { min: 17, max: 31, name: "Shaper" },
+    EffectCategory { min: 32, max: 48, name: "Distortion" },
+    EffectCategory { min: 49, max: 63, name: "Dynamics" },
+    EffectCategory { min: 64, max: 79, name: "Modulation" },
+    EffectCategory { min: 80, max: 95, name: "Phaser & Flanger" },
+    EffectCategory { min: 96, max: 111, name: "Equalizer" },
+    EffectCategory { min: 112, max: 120, name: "Booster" },
+    EffectCategory { min: 121, max: 127, name: "Effect Loop" },
+    EffectCategory { min: 128, max: 143, name: "Pitch" },
+    EffectCategory { min: 144, max: 175, name: "Delay" },
+    EffectCategory { min: 176, max: 207, name: "Reverb" },
 ];
 
 pub const CC_WAH_PEDAL: u8 = 1;

@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.1.0")
+        XCTAssertEqual(Generated.specVersion, "0.5.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file
@@ -17,7 +17,7 @@ final class ConformanceTests: XCTestCase {
     func testEveryVectorFileIsCovered() throws {
         let covered: Set<String> = [
             "u14.json", "discovery.json", "midi3.json", "nrpn.json",
-            "controls.json", "params.json", "state.json",
+            "controls.json", "params.json", "state.json", "cbor.json",
         ]
         let present = Set(try Fixtures.vectorFiles().map(\.lastPathComponent))
         XCTAssertEqual(present, covered, "spec/vectors changed; update the conformance suite")
@@ -292,6 +292,13 @@ final class ConformanceTests: XCTestCase {
             )
         }
 
+        for entry in vector.cases("effect_category_name") {
+            XCTAssertEqual(
+                Params.effectCategoryName(entry.u16("value")), entry.optionalString("name"),
+                "effect_category_name(\(entry.int("value")))"
+            )
+        }
+
         for entry in vector.cases("page_name") {
             XCTAssertEqual(
                 Params.pageName(entry.u8("page")), entry.optionalString("name"),
@@ -371,6 +378,16 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(
                 state.tuner.deviance, deviance.uint16Value, "\(caseName): tuner_deviance")
         }
+        if let bank = expect["current_bank"] as? NSNumber {
+            XCTAssertEqual(state.currentBank, bank.uint16Value, "\(caseName): current_bank")
+        }
+        if let slot = expect["current_rig_slot"] as? NSNumber {
+            XCTAssertEqual(state.currentRigSlot, slot.uint16Value, "\(caseName): current_rig_slot")
+        }
+        if let index = expect["current_rig_index"] as? NSNumber {
+            XCTAssertEqual(
+                state.currentRigIndex, index.uint16Value, "\(caseName): current_rig_index")
+        }
         if let mainVolume = expect["main_volume"] as? NSNumber {
             XCTAssertEqual(
                 state.output.mainVolume, mainVolume.uint16Value, "\(caseName): main_volume")
@@ -379,6 +396,29 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(
                 state.output.monitorVolume, monitorVolume.uint16Value, "\(caseName): monitor_volume"
             )
+        }
+        if let headphoneVolume = expect["headphone_volume"] as? NSNumber {
+            XCTAssertEqual(
+                state.output.headphoneVolume, headphoneVolume.uint16Value,
+                "\(caseName): headphone_volume")
+        }
+        if let masterVolume = expect["master_volume"] as? NSNumber {
+            XCTAssertEqual(
+                state.output.masterVolume, masterVolume.uint16Value, "\(caseName): master_volume")
+        }
+        if let bank = expect["bank"] as? [[String: Any]] {
+            for entry in bank {
+                let slot = state.bank.slots[entry.int("slot")]
+                if let rigName = entry["rig_name"] as? String {
+                    XCTAssertEqual(slot.rigName, rigName, "\(caseName): bank rig_name")
+                }
+                if let ampName = entry["amp_name"] as? String {
+                    XCTAssertEqual(slot.ampName, ampName, "\(caseName): bank amp_name")
+                }
+                if let cabName = entry["cabinet_name"] as? String {
+                    XCTAssertEqual(slot.cabinetName, cabName, "\(caseName): bank cabinet_name")
+                }
+            }
         }
         if let raw = expect["status_raw"] as? [NSNumber] {
             XCTAssertEqual(state.status.raw, raw.map(\.uint16Value), "\(caseName): status_raw")
@@ -400,6 +440,59 @@ final class ConformanceTests: XCTestCase {
             }
             if let typeName = effect["type_name"] as? String {
                 XCTAssertEqual(actual.typeName, typeName, "\(caseName): effect type_name")
+            }
+        }
+    }
+
+    // MARK: - cbor.json
+
+    func testCborVectors() throws {
+        let vector = try Fixtures.vector("cbor")
+
+        for entry in vector.cases("param_write") {
+            let addr = UInt32(entry.int("addr"))
+            let value = Int64(entry.int("value"))
+            XCTAssertEqual(
+                Fmt.hex(Cbor.encode(Cbor.paramWrite(addr: addr, value: value))),
+                entry.string("hex"), "param_write(\(addr), \(value))")
+        }
+        if let dump = vector["state_dump_request"] as? [String: Any] {
+            XCTAssertEqual(
+                Fmt.hex(Cbor.encode(Cbor.stateDumpRequest())), dump.string("hex"),
+                "state_dump_request")
+        } else {
+            XCTFail("cbor.json has no state_dump_request")
+        }
+
+        for entry in vector.cases("extract_snapshot") {
+            let name = entry.string("name")
+            var decoder = CBORDecoder()
+            let items = decoder.push(try hex(entry.string("stream_hex")))
+            let snap = Cbor.extractSnapshot(items)
+            guard let expect = entry["expect"] as? [String: Any] else {
+                XCTFail("case \"\(name)\" has no expect block")
+                continue
+            }
+            if let bank = expect["current_bank"] as? NSNumber {
+                XCTAssertEqual(snap.currentBank, bank.uint16Value, "\(name): current_bank")
+            } else {
+                XCTAssertNil(snap.currentBank, "\(name): current_bank")
+            }
+            if let slot = expect["current_rig_slot"] as? NSNumber {
+                XCTAssertEqual(snap.currentRigSlot, slot.uint16Value, "\(name): current_rig_slot")
+            } else {
+                XCTAssertNil(snap.currentRigSlot, "\(name): current_rig_slot")
+            }
+            if let strings = expect["strings"] as? [[String: Any]] {
+                XCTAssertEqual(snap.strings.count, strings.count, "\(name): strings count")
+                for (i, expected) in strings.enumerated() where i < snap.strings.count {
+                    XCTAssertEqual(
+                        snap.strings[i].address, UInt32(expected.int("addr")),
+                        "\(name): strings[\(i)].addr")
+                    XCTAssertEqual(
+                        snap.strings[i].text, expected.string("text"), "\(name): strings[\(i)].text"
+                    )
+                }
             }
         }
     }

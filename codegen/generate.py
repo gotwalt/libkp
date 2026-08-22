@@ -102,6 +102,7 @@ def emit_rust(d: dict) -> str:
     w(f'pub const PORT: u16 = {p["transport"]["port"]};')
     w(f'pub const CONNECT_TIMEOUT_SECS: u64 = {p["transport"]["connect_timeout_secs"]};')
     w(f'pub const SOCKET_TIMEOUT_SECS: u64 = {p["transport"]["socket_timeout_secs"]};')
+    w(f'pub const CONNECTION_COOLDOWN_MS: u64 = {p["transport"]["connection_cooldown_ms"]};')
     w("")
     w("// Discovery")
     w(f'pub const DISCOVERY_HEADER: &str = {q(p["discovery"]["header"])};')
@@ -122,6 +123,19 @@ def emit_rust(d: dict) -> str:
     w(f'pub const PROTOCOL_REQUEST_RESPONSE: &str = {q(p["protocols"]["request_response"])};')
     w(f'pub const PROTOCOL_CBOR_CONTROL: &str = {q(p["protocols"]["cbor_control"])};')
     w(f'pub const PROTOCOL_RESERVED: &str = {q(p["protocols"]["reserved"])};')
+    w("")
+    w("// CBOR channel")
+    cb = p["cbor"]
+    w(f'pub const CBOR_ITEM_TAG: u64 = {cb["item_tag"]};')
+    w(f'pub const CBOR_SELECTOR_SINGLE: i64 = {cb["selector_single"]};')
+    w(f'pub const CBOR_SELECTOR_MULTI: i64 = {cb["selector_multi"]};')
+    w(f'pub const CBOR_SELECTOR_STRING: i64 = {cb["selector_string"]};')
+    w(f'pub const CBOR_FILLER_BYTE: u8 = {cb["filler_byte"]:#04x};')
+    w(f'pub const STATE_DUMP_TRIGGER_ADDRESS: u32 = {cb["state_dump_trigger_address"]};')
+    w(f'pub const STATE_DUMP_TRIGGER_VALUE: i64 = {cb["state_dump_trigger_value"]};')
+    sens = ", ".join(str(a) for a in cb["sensitive_addresses"])
+    w(f'pub const SENSITIVE_ADDRESSES: [u32; {len(cb["sensitive_addresses"])}] = [{sens}];')
+    w(f'pub const REDACTED_PLACEHOLDER: &str = {q(cb["redacted_placeholder"])};')
     w("")
     w("// MIDI3 framing tags")
     w(f'pub const MIDI3_TAG_CONTINUATION: u8 = {p["midi3"]["tag_continuation"]:#04x};')
@@ -176,11 +190,18 @@ def emit_rust(d: dict) -> str:
         "amp_page": ("AMP_PAGE", "u8"), "amp_on_number": ("AMP_ON_NUMBER", "u8"),
         "gain_number": ("GAIN_NUMBER", "u8"), "system_page": ("SYSTEM_PAGE", "u8"),
         "main_volume_number": ("MAIN_VOLUME_NUMBER", "u8"),
-        "monitor_volume_number": ("MONITOR_VOLUME_NUMBER", "u8"), "page_morph": ("PAGE_MORPH", "u8"),
+        "headphone_volume_number": ("HEADPHONE_VOLUME_NUMBER", "u8"),
+        "monitor_volume_number": ("MONITOR_VOLUME_NUMBER", "u8"),
+        "page_bank_preview": ("PAGE_BANK_PREVIEW", "u8"), "bank_slots": ("BANK_SLOTS", "usize"),
+        "bank_rig_name_base": ("BANK_RIG_NAME_BASE", "u8"),
+        "bank_amp_name_base": ("BANK_AMP_NAME_BASE", "u8"),
+        "bank_cabinet_name_base": ("BANK_CABINET_NAME_BASE", "u8"), "page_morph": ("PAGE_MORPH", "u8"),
         "morph_number": ("MORPH_NUMBER", "u8"), "page_tuner_note": ("PAGE_TUNER_NOTE", "u8"),
         "tuner_note_number": ("TUNER_NOTE_NUMBER", "u8"),
         "tuner_in_tune_center": ("TUNER_IN_TUNE_CENTER", "u16"),
         "tuner_in_tune_window": ("TUNER_IN_TUNE_WINDOW", "u16"), "meter_count": ("METER_COUNT", "usize"),
+        "current_bank_address": ("CURRENT_BANK_ADDRESS", "u32"),
+        "current_rig_slot_address": ("CURRENT_RIG_SLOT_ADDRESS", "u32"),
     }
     for k, (const, ty) in wk_rust.items():
         val = wk[k]
@@ -226,6 +247,18 @@ def emit_rust(d: dict) -> str:
     rows = ",\n".join(f"    ({e['value']}, {q(e['name'])})" for e in
                       sorted(d["effect-types"]["effect_types"], key=lambda e: e["value"]))
     w(f"pub static EFFECT_TYPES: &[(u16, &str)] = &[\n{rows},\n];")
+    w("")
+    w("/// One category block of the effect Type value space: an inclusive range.")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+    w("pub struct EffectCategory {")
+    w("    pub min: u16,")
+    w("    pub max: u16,")
+    w("    pub name: &'static str,")
+    w("}")
+    rows = ",\n".join(
+        f"    EffectCategory {{ min: {e['min']}, max: {e['max']}, name: {q(e['name'])} }}"
+        for e in d["effect-types"]["effect_categories"])
+    w(f"pub static EFFECT_CATEGORIES: &[EffectCategory] = &[\n{rows},\n];")
     w("")
     # CC constants + slot enable
     for c in d["controls"]["cc"]:
@@ -277,6 +310,7 @@ def emit_python(d: dict) -> str:
     w(f'PORT = {p["transport"]["port"]}')
     w(f'CONNECT_TIMEOUT_SECS = {p["transport"]["connect_timeout_secs"]}')
     w(f'SOCKET_TIMEOUT_SECS = {p["transport"]["socket_timeout_secs"]}')
+    w(f'CONNECTION_COOLDOWN_MS = {p["transport"]["connection_cooldown_ms"]}')
     w("")
     w(f'DISCOVERY_HEADER = {q(p["discovery"]["header"])}')
     w(f'POLL_INTERVAL_MS = {p["discovery"]["poll_interval_ms"]}')
@@ -294,6 +328,18 @@ def emit_python(d: dict) -> str:
     w(f'PROTOCOL_REQUEST_RESPONSE = {q(p["protocols"]["request_response"])}')
     w(f'PROTOCOL_CBOR_CONTROL = {q(p["protocols"]["cbor_control"])}')
     w(f'PROTOCOL_RESERVED = {q(p["protocols"]["reserved"])}')
+    w("")
+    cb = p["cbor"]
+    w(f'CBOR_ITEM_TAG = {cb["item_tag"]}')
+    w(f'CBOR_SELECTOR_SINGLE = {cb["selector_single"]}')
+    w(f'CBOR_SELECTOR_MULTI = {cb["selector_multi"]}')
+    w(f'CBOR_SELECTOR_STRING = {cb["selector_string"]}')
+    w(f'CBOR_FILLER_BYTE = {cb["filler_byte"]:#04x}')
+    w(f'STATE_DUMP_TRIGGER_ADDRESS = {cb["state_dump_trigger_address"]}')
+    w(f'STATE_DUMP_TRIGGER_VALUE = {cb["state_dump_trigger_value"]}')
+    sens = ", ".join(str(a) for a in cb["sensitive_addresses"])
+    w(f'SENSITIVE_ADDRESSES = ({sens})')
+    w(f'REDACTED_PLACEHOLDER = {q(cb["redacted_placeholder"])}')
     w("")
     w(f'MIDI3_TAG_CONTINUATION = {p["midi3"]["tag_continuation"]:#04x}')
     w(f'MIDI3_TAG_FINAL_1 = {p["midi3"]["tag_final_1"]:#04x}')
@@ -340,14 +386,20 @@ def emit_python(d: dict) -> str:
         "tempo_bpm_scale": "TEMPO_BPM_SCALE", "rig_volume_number": "RIG_VOLUME_NUMBER",
         "amp_page": "AMP_PAGE", "amp_on_number": "AMP_ON_NUMBER", "gain_number": "GAIN_NUMBER",
         "system_page": "SYSTEM_PAGE", "main_volume_number": "MAIN_VOLUME_NUMBER",
-        "monitor_volume_number": "MONITOR_VOLUME_NUMBER", "page_morph": "PAGE_MORPH",
+        "headphone_volume_number": "HEADPHONE_VOLUME_NUMBER",
+        "monitor_volume_number": "MONITOR_VOLUME_NUMBER",
+        "page_bank_preview": "PAGE_BANK_PREVIEW", "bank_slots": "BANK_SLOTS",
+        "bank_rig_name_base": "BANK_RIG_NAME_BASE", "bank_amp_name_base": "BANK_AMP_NAME_BASE",
+        "bank_cabinet_name_base": "BANK_CABINET_NAME_BASE", "page_morph": "PAGE_MORPH",
         "morph_number": "MORPH_NUMBER", "page_tuner_note": "PAGE_TUNER_NOTE",
         "tuner_note_number": "TUNER_NOTE_NUMBER", "tuner_in_tune_center": "TUNER_IN_TUNE_CENTER",
         "tuner_in_tune_window": "TUNER_IN_TUNE_WINDOW", "meter_count": "METER_COUNT",
+        "current_bank_address": "CURRENT_BANK_ADDRESS",
+        "current_rig_slot_address": "CURRENT_RIG_SLOT_ADDRESS",
     }
     for k, const in wk_names.items():
         val = wk[k]
-        lit = f"{val:#04x}" if val < 256 and const not in ("TEMPO_BPM_SCALE", "METER_COUNT") else str(val)
+        lit = f"{val:#04x}" if val < 256 and const not in ("TEMPO_BPM_SCALE", "METER_COUNT", "BANK_SLOTS") else str(val)
         w(f"{const} = {lit}")
     w("")
     w(f'METER_PAGE = {mb["page"]:#04x}')
@@ -385,6 +437,10 @@ def emit_python(d: dict) -> str:
     rows = ",\n    ".join(f"{e['value']}: {q(e['name'])}" for e in
                           sorted(d["effect-types"]["effect_types"], key=lambda e: e["value"]))
     w(f"EFFECT_TYPES = {{\n    {rows},\n}}")
+    w("")
+    rows = ",\n    ".join(f"({e['min']}, {e['max']}, {q(e['name'])})"
+                          for e in d["effect-types"]["effect_categories"])
+    w(f"# (min, max, name) — inclusive Type value blocks\nEFFECT_CATEGORIES = [\n    {rows},\n]")
     w("")
     for c in d["controls"]["cc"]:
         w(f"{cc_const_name(c['name'])} = {c['cc']}")
@@ -433,6 +489,7 @@ def emit_swift(d: dict) -> str:
     c("port", "UInt16", p["transport"]["port"])
     c("connectTimeoutSecs", "UInt64", p["transport"]["connect_timeout_secs"])
     c("socketTimeoutSecs", "UInt64", p["transport"]["socket_timeout_secs"])
+    c("connectionCooldownMs", "UInt64", p["transport"]["connection_cooldown_ms"])
     c("discoveryHeader", "String", q(p["discovery"]["header"]))
     c("pollIntervalMs", "UInt64", p["discovery"]["poll_interval_ms"])
     c("pollMacPrefix", "String", q(p["discovery"]["poll_mac_prefix"]))
@@ -447,6 +504,17 @@ def emit_swift(d: dict) -> str:
     c("protocolRequestResponse", "String", q(p["protocols"]["request_response"]))
     c("protocolCborControl", "String", q(p["protocols"]["cbor_control"]))
     c("protocolReserved", "String", q(p["protocols"]["reserved"]))
+    cb = p["cbor"]
+    c("cborItemTag", "UInt64", cb["item_tag"])
+    c("cborSelectorSingle", "Int64", cb["selector_single"])
+    c("cborSelectorMulti", "Int64", cb["selector_multi"])
+    c("cborSelectorString", "Int64", cb["selector_string"])
+    c("cborFillerByte", "UInt8", f'{cb["filler_byte"]:#04x}')
+    c("stateDumpTriggerAddress", "UInt32", cb["state_dump_trigger_address"])
+    c("stateDumpTriggerValue", "Int64", cb["state_dump_trigger_value"])
+    sens = ", ".join(str(a) for a in cb["sensitive_addresses"])
+    c("sensitiveAddresses", "[UInt32]", f"[{sens}]")
+    c("redactedPlaceholder", "String", q(cb["redacted_placeholder"]))
     c("midi3TagContinuation", "UInt8", f'{p["midi3"]["tag_continuation"]:#04x}')
     c("midi3TagFinal1", "UInt8", f'{p["midi3"]["tag_final_1"]:#04x}')
     c("midi3TagFinal2", "UInt8", f'{p["midi3"]["tag_final_2"]:#04x}')
@@ -489,11 +557,18 @@ def emit_swift(d: dict) -> str:
         "amp_page": ("ampPage", "UInt8"), "amp_on_number": ("ampOnNumber", "UInt8"),
         "gain_number": ("gainNumber", "UInt8"), "system_page": ("systemPage", "UInt8"),
         "main_volume_number": ("mainVolumeNumber", "UInt8"),
-        "monitor_volume_number": ("monitorVolumeNumber", "UInt8"), "page_morph": ("pageMorph", "UInt8"),
+        "headphone_volume_number": ("headphoneVolumeNumber", "UInt8"),
+        "monitor_volume_number": ("monitorVolumeNumber", "UInt8"),
+        "page_bank_preview": ("pageBankPreview", "UInt8"), "bank_slots": ("bankSlots", "Int"),
+        "bank_rig_name_base": ("bankRigNameBase", "UInt8"),
+        "bank_amp_name_base": ("bankAmpNameBase", "UInt8"),
+        "bank_cabinet_name_base": ("bankCabinetNameBase", "UInt8"), "page_morph": ("pageMorph", "UInt8"),
         "morph_number": ("morphNumber", "UInt8"), "page_tuner_note": ("pageTunerNote", "UInt8"),
         "tuner_note_number": ("tunerNoteNumber", "UInt8"),
         "tuner_in_tune_center": ("tunerInTuneCenter", "UInt16"),
         "tuner_in_tune_window": ("tunerInTuneWindow", "UInt16"), "meter_count": ("meterCount", "Int"),
+        "current_bank_address": ("currentBankAddress", "UInt32"),
+        "current_rig_slot_address": ("currentRigSlotAddress", "UInt32"),
     }
     for k, (const, ty) in wk_sw.items():
         val = wk[k]
@@ -537,6 +612,10 @@ def emit_swift(d: dict) -> str:
     rows = ",\n        ".join(f"{e['value']}: {q(e['name'])}" for e in
                               sorted(d["effect-types"]["effect_types"], key=lambda e: e["value"]))
     w(f"    public static let effectTypes: [UInt16: String] = [\n        {rows},\n    ]")
+    rows = ",\n        ".join(
+        f"EffectCategory(min: {e['min']}, max: {e['max']}, name: {q(e['name'])})"
+        for e in d["effect-types"]["effect_categories"])
+    w(f"    public static let effectCategories: [EffectCategory] = [\n        {rows},\n    ]")
     rows = ", ".join(f"{q(e['slot'])}: {e['cc']}" for e in d["controls"]["slot_enable_cc"])
     w(f"    public static let slotEnableCc: [String: UInt8] = [{rows}]")
     rows = ",\n        ".join(
@@ -558,6 +637,12 @@ def emit_swift(d: dict) -> str:
     w("    public let id: String")
     w("    public let name: String")
     w("    public let render: String")
+    w("}")
+    w("")
+    w("public struct EffectCategory {")
+    w("    public let min: UInt16")
+    w("    public let max: UInt16")
+    w("    public let name: String")
     w("}")
     w("")
     return "\n".join(out) + "\n"

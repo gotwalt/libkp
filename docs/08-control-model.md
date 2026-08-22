@@ -3,7 +3,7 @@
 The same outcome can often be reached more than one way — gain is a Control
 Change *and* an NRPN parameter; an effect can be switched by either. The
 difference is not cosmetic: one is 7-bit and unobservable, the other is 14-bit
-and echoed back. This document sets out the three layers, and which one is
+and readable back. This document sets out the three layers, and which one is
 canonical for each capability.
 
 ## Three layers
@@ -31,9 +31,11 @@ Constants: [`../spec/controls.toml`](../spec/controls.toml); vectors:
 `$01` Single Parameter Change and its request forms, addressed by
 `(page, number)` — see [SysEx / NRPN dialect](05-sysex-nrpn.md). Every parameter
 the device has is reachable here, not just the ones with a CC. Values are 14-bit
-(0–16383), settable with `$01`, readable with `$41`/`$42`/`$43`, and — decisively
-— **the device echoes every change on the same stream**, including changes made
-at the front panel. That echo is what makes a consistent state model possible.
+(0–16383), settable with `$01`, and — decisively — **readable back** with
+`$41`/`$42`/`$43`, whose replies arrive on the same stream. That read-back is
+what makes a consistent state model possible. A `$01` write is applied silently:
+established by observed experimentation, the device does not echo it, so a
+client that wants its store to confirm a write issues the matching `$41`.
 
 ### 3. The DeviceModel — the curated surface
 
@@ -41,7 +43,8 @@ A single object that ingests the stream, tracks state, and exposes a small
 labelled API. Its methods split cleanly in two:
 
 - **Parameters** — NRPN-backed, 14-bit, tracked in state. Setting one updates the
-  model when the echo arrives; reading one is answered from state, not the wire.
+  model when the read-back reply arrives; reading one is answered from state, not
+  the wire.
 - **Actions** — CC-backed, momentary or expression. Nothing is stored, because
   there is nothing to store.
 
@@ -162,7 +165,9 @@ slot numbers are **clamped** to 1–5, and effect-button numbers to 1–4.
 |---|---|---|---|
 | Set gain | NRPN `$0A`/4 | CC 72 | 14-bit precision, and it reads back |
 | Rig volume | NRPN `$04`/1 | — | value with read-back |
-| Main / monitor volume | NRPN `$7F`/0, `$7F`/2 | monitor also CC 73 | precision + read-back |
+| Main / monitor / headphone volume | NRPN `$7F`/0, `$7F`/2, `$7F`/1 | monitor also CC 73 | precision + read-back |
+| Master volume (read) | NRPN `$7F`/1 = `$7F`/2 | — | the physical knob; read-only (see below) |
+| Bank rig/amp/cab names (read) | ext-string page `$96`/0–14 | — | the current bank's five-slot preview |
 | Effect on/off | NRPN `<slot>`/3 | CC 17–29 | tracked in the slot state |
 | Effect mix | NRPN `<slot>`/4 | CC 68 / 70 (delay, reverb only) | precision + read-back |
 | Effect **type** | NRPN `<slot>`/0, **read-only** | — | set by loading a rig, not over MIDI |
@@ -170,8 +175,8 @@ slot numbers are **clamped** to 1–5, and effect-button numbers to 1–4.
 | Morph position (read) | NRPN `$00`/`$0B` | — | observed state |
 | Looper transport | NRPN `$7D`/88–94 | — | latched values |
 | Freeze per module | NRPN `$7D`/107–111, 113–115 | CC 35 (global) | per-slot state |
-| **Rig select 1–5** | **CC 50–54** | — | no NRPN equivalent — an action |
-| **Rig up / down** | **CC 48 / 49** | — | navigation |
+| **Rig select 1–5** | **CC 50–54** | — | no NRPN equivalent — a momentary action |
+| **Rig up / down** | **CC 48 / 49** | — | navigation; momentary |
 | **Bank preselect** | **CC 47** | — | navigation; loads on the next rig select |
 | **Tap tempo** | **CC 30** | — | momentary event |
 | **Tuner mode** | **CC 31** | state readable at NRPN `$7F`/126 | set momentarily, read as state |
@@ -180,11 +185,57 @@ slot numbers are **clamped** to 1–5, and effect-button numbers to 1–4.
 | **Freeze / infinity / rotary** | **CC 35 / 34 / 33** | — | momentary |
 | **Wah / pitch / volume / morph pedal** | **CC 1 / 4 / 7 / 11** | — | live expression |
 
+**The navigation controls are momentary, and the release is not optional.**
+CC 48, CC 49 and CC 50–54 are button presses: value 1 presses, value 0 releases.
+A press on its own *does* take effect — the device loads the target rig and
+pushes the new bank's name preview — but if the release never arrives it
+abandons the change and reloads the previous rig about two seconds later, which
+looks exactly like the device spontaneously undoing the navigation. Sending
+value 0 alone is inert, being the release of a press that never happened. The
+`Control` type therefore renders `up`, `down` and `load_slot` as a press
+immediately followed by its release, one 6-byte message; a caller that wants to
+model a genuinely held button has to build the two Control Changes itself.
+
+**The device says where it is, in channel-voice messages.** Alongside the SysEx
+it emits a Bank Select LSB (CC 32) followed by a Program Change on every rig
+change — from the front panel as readily as from a controller. The two carry a
+flat, 0-based rig index, `128 × CC32 + program`, which divides by the five slots
+per bank into bank and slot: index 123 is bank 25, slot 4. This is the only
+position report the streaming session gives; the CBOR state dump is a one-shot
+read at connect. A Program Change with no Bank Select ahead of it is half an
+index, not a position, and is ignored.
+
+That index is also the only address that names a rig **outside** the current
+bank, so it is what navigation is computed in: ±1 is the next or previous rig,
+±5 the next or previous bank, and any rig is reachable by sending the absolute
+bank preselect (CC 47) followed by the slot load. Bank boundaries stop being
+special. Note that CC 48 / 49 are *not* a general bank control — on at least one
+device they alternate between two banks rather than stepping — so a client that
+needs to reach an arbitrary bank should use CC 47 and not step.
+
+How many rigs a device holds varies, and nothing in the protocol announces it.
+Rather than assume a ceiling, aim: the device stays put if the target does not
+exist, and its next position report says where it actually is.
+
 Two rows deserve a second look. **Effect type is read-only**: there is no way to
 change what an effect *is* over MIDI — that happens by loading a rig — so a
 client reads `<slot>`/0 and looks the value up in the effect-type table. And
 **tuner mode is split**: CC 31 sets it, NRPN `$7F`/126 reports it, so a UI that
 wants a correct toggle state must read one address while writing to another.
+
+**Master volume is a potentiometer, not a stored value.** The device's physical
+master-volume knob drives Headphone (`$7F`/1) and Monitor (`$7F`/2) together, 1:1,
+under the default output routing (Main, `$7F`/0, is independent). It has an
+absolute position — unlike every other knob, which is an endless encoder — so the
+pot is ground truth: there is no soft-takeover, and a value written to `$7F`/1 or
+`$7F`/2 is authoritative only until the knob next moves. The model therefore
+exposes master volume as a **read-only readout** (`Output.master_volume`, which
+reports Headphone and falls back to Monitor) and ships no `set_master_volume`.
+
+**Bank names are a five-slot preview.** Page `$96` (150) carries the loaded
+bank's five rig names (numbers 0–4), their amps (5–9) and cabinets (10–14). The
+device pushes the whole block on a bank change, and it is readable on demand as
+extended strings (function `$47` → `$07`). The model folds it into `state.bank`.
 
 ## The DeviceModel surface
 
@@ -207,11 +258,22 @@ delay_infinity(on)  toggle_all_modules
 wah_pedal  pitch_pedal  volume_pedal  panorama  morph_pedal
 ```
 
-A caller that wants "turn reverb off" calls `set_effect_enabled("REV", false)`
-and sees the change reflected in the model's state once the echo lands. A caller
-building a foot controller uses the actions. Anyone needing a control the model
-does not name reaches the complete raw vocabulary through the control module and
-its send-control entry point, or an arbitrary address through `set_param`.
+**Requests** — read-only, they change nothing on the device:
+
+```
+refresh_rig         refresh_bank          request_param(page, number)
+request_string(page, number)              request_render(page, number, value)
+```
+
+`refresh_bank` issues the fifteen `$47` extended-string requests for the current
+bank's rig/amp/cabinet names; `connect` runs it once alongside `refresh_rig`.
+
+A caller that wants "turn reverb off" calls `set_effect_enabled("REV", false)`,
+then `request_param(page, 3)` and sees the change reflected in the model's state
+once the reply lands. A caller building a foot controller uses the actions.
+Anyone needing a control the model does not name reaches the complete raw
+vocabulary through the control module and its send-control entry point, or an
+arbitrary address through `set_param`.
 
 ## Consequences to design around
 
@@ -221,9 +283,22 @@ Program Change on the stream. A client that wants to display the current rig mus
 **request the rig name** (`$43`, page 0, number 1) after switching. See
 [SysEx / NRPN dialect](05-sysex-nrpn.md).
 
-**Read-back is not immediate.** A `$01` write is echoed roughly a second later.
-Order state changes before read-backs, and give a confirmation poll at least a
-couple of seconds before deciding a write failed.
+**The stream never states the current *position*.** Rig-name requests tell you
+*what* is loaded, not *where* it sits. Matching the loaded name against the
+[bank preview](09-parameter-registry.md) recovers the slot, but not the bank
+number, and it is ambiguous when two slots share a name. The device's actual
+0-based bank and rig indices are only reachable over the
+[CBOR channel](06-cbor-channel.md) — request its state dump and read addresses
+100701 / 100702. `StateSnapshot::fetch` does exactly that in one call, over its
+own short-lived session; run it at boot, before opening the streaming model, to
+show the right patch immediately.
+
+**A write is not echoed.** Established by observed experimentation, the device
+applies a `$01` write without reporting it back on a plain streaming session, so
+a store that must confirm the applied value follows the write with a `$41`
+request. The reply lands roughly a second later: order state changes before
+read-backs, and give a confirmation poll at least a couple of seconds before
+deciding a write failed.
 
 **A rig change is a windfall.** The device unprompted dumps the entire new rig —
 name, author, comment, amp, cabinet, microphone, speaker, every effect slot's
@@ -239,5 +314,6 @@ The Control Change map and the NRPN parameter grammar follow the
 [Kemper MIDI Parameter Documentation](https://www.kemper-amps.com/downloads/5/User-Manuals),
 cross-checked against [PySwitch](https://github.com/Tunetown/PySwitch), which is
 credited for the tuner-mode state address and the rig/bank selection scheme. The
-absence of Program Change feedback on the network link was established by
-observed experimentation. See [../CREDITS.md](../CREDITS.md).
+absence of Program Change feedback on the network link, and the fact that a
+`$01` write is applied without being echoed, were established by observed
+experimentation. See [../CREDITS.md](../CREDITS.md).

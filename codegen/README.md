@@ -37,11 +37,13 @@ Swift). Highlights:
   `METER_BLOCK_NUMBER`, `TEMPO_BPM_SCALE`, `MORPH_NUMBER`, `TUNER_*`, …).
 - **Tables**: `FUNCTION_NAMES`, `PAGE_NAMES`, `EFFECT_SLOTS`, `EFFECT_PARAMS`,
   `NON_EFFECT_PARAMS`, `STRING_TAGS`, `PAGE0_NUMERIC`, `EFFECT_TYPES`,
-  `SLOT_ENABLE_CC`, `METER_FIELDS`, and the `CC_*` control constants.
+  `EFFECT_CATEGORIES`, `SLOT_ENABLE_CC`, `METER_FIELDS`, and the `CC_*` control
+  constants.
 
 Tables are emitted as the most natural literal per language: Rust `static`
 slices of tuples, Python `dict`/`list`, Swift `Dictionary`/`Array` (with small
-`NonEffectKey` / `MeterField` helper structs). Implementations wrap these with
+`NonEffectKey` / `MeterField` / `EffectCategory` helper structs).
+Implementations wrap these with
 thin lookup helpers (`param_name`, `effect_type_name`, …); the `params.json`
 vectors verify those helpers agree across languages.
 

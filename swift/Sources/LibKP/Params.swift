@@ -5,6 +5,7 @@ import Foundation
 // than in the generated file, which stays a pure data drop.
 extension NonEffectKey: @unchecked Sendable {}
 extension MeterField: @unchecked Sendable {}
+extension EffectCategory: @unchecked Sendable {}
 
 /// Offline name lookups over the generated spec tables.
 ///
@@ -80,10 +81,63 @@ public enum Params {
         Generated.effectTypes[value]
     }
 
+    /// The category of an effect Type value — the group of the device's type
+    /// knob it belongs to, derived from the block structure of Appendix B's
+    /// value ranges. `nil` for 0 ("empty") and for values in no block.
+    public static func effectCategoryName(_ value: UInt16) -> String? {
+        Generated.effectCategories.first { value >= $0.min && value <= $0.max }?.name
+    }
+
     /// Page 0 is dual-use: string tags via `$03`/`$43`, but *numeric* params via
     /// `$01`/`$41` (PySwitch reads the morph state this way).
     public static func page0NumericName(_ number: UInt8) -> String? {
         Generated.page0Numeric[number]
+    }
+
+    // MARK: - Bank preview
+
+    /// Page holding the loaded bank's five-slot name preview (rig/amp/cabinet).
+    public static let pageBankPreview: UInt8 = Generated.pageBankPreview
+    /// Number of rig slots in a bank.
+    public static let bankSlots: Int = Generated.bankSlots
+
+    /// Which of the three five-slot name groups on ``pageBankPreview`` to address.
+    public enum BankPreviewField: CaseIterable, Sendable {
+        /// Rig names (numbers `bankRigNameBase`..).
+        case rigName
+        /// Amp names (numbers `bankAmpNameBase`..).
+        case ampName
+        /// Cabinet names (numbers `bankCabinetNameBase`..).
+        case cabinetName
+
+        /// First controller number of this group on ``pageBankPreview``.
+        public var base: UInt8 {
+            switch self {
+            case .rigName: return Generated.bankRigNameBase
+            case .ampName: return Generated.bankAmpNameBase
+            case .cabinetName: return Generated.bankCabinetNameBase
+            }
+        }
+    }
+
+    /// Flat NRPN address (`page * 128 + number`) of a bank-preview field for a
+    /// 1-based `slot` (1...``bankSlots``). The read-on-demand address for
+    /// ``Nrpn/requestExtendedString(product:device:address:)``.
+    public static func bankPreviewAddress(_ field: BankPreviewField, slot: Int) -> UInt32 {
+        let clamped = min(max(slot, 1), bankSlots) - 1
+        return UInt32(pageBankPreview) * 128 + UInt32(field.base) + UInt32(clamped)
+    }
+
+    /// Reverse of ``bankPreviewAddress(_:slot:)``: map a ``pageBankPreview``
+    /// number (0..<15) to its `(field, 0-based slot index)`, or `nil` if out of
+    /// range.
+    public static func bankPreviewSlotField(_ number: UInt8) -> (BankPreviewField, Int)? {
+        let slots = UInt8(bankSlots)
+        for field in BankPreviewField.allCases
+        where number >= field.base && number < field.base + slots {
+            return (field, Int(number - field.base))
+        }
+        return nil
     }
 
     /// Render a "Page: Param" label for a page/number pair, falling back to hex.

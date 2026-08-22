@@ -293,6 +293,21 @@ class _CCTrigger(Control):
         return control_change(channel, self.CONTROLLER, 1)
 
 
+class _MomentaryCC(_CCTrigger):
+    """A Control Change the device treats as a button press.
+
+    Value 1 is the press; the device needs the matching value-0 release to
+    complete the gesture. Left held, it abandons the change and reloads the
+    previous rig a couple of seconds later, so both halves go out together as
+    one 6-byte message.
+    """
+
+    def message(self, channel: int = 0) -> bytes:
+        return control_change(channel, self.CONTROLLER, 1) + control_change(
+            channel, self.CONTROLLER, 0
+        )
+
+
 # Continuous controllers ----------------------------------------------------
 
 
@@ -436,15 +451,15 @@ class TapTempo(_CCTrigger):
 
 
 @dataclass(frozen=True)
-class Up(_CCTrigger):
-    """Performance/Rig up (CC48)."""
+class Up(_MomentaryCC):
+    """Performance/Rig up (CC48), as a press/release pair."""
 
     CONTROLLER: ClassVar[int] = CC_UP
 
 
 @dataclass(frozen=True)
-class Down(_CCTrigger):
-    """Performance/Rig down (CC49)."""
+class Down(_MomentaryCC):
+    """Performance/Rig down (CC49), as a press/release pair."""
 
     CONTROLLER: ClassVar[int] = CC_DOWN
 
@@ -469,13 +484,17 @@ class SlotEnable(Control):
 
 @dataclass(frozen=True)
 class LoadSlot(Control):
-    """Load a performance slot 1-5 (CC50-54, value 1). ``n`` is clamped to 1..5."""
+    """Load a performance slot 1-5 (CC50-54), as a press/release pair.
+
+    ``n`` is clamped to 1..5. The load is momentary: see :class:`_MomentaryCC`.
+    """
 
     n: int
 
     def message(self, channel: int = 0) -> bytes:
         n = min(max(self.n, 1), 5)
-        return control_change(channel, CC_LOAD_SLOT_1 + (n - 1), 1)
+        controller = CC_LOAD_SLOT_1 + (n - 1)
+        return control_change(channel, controller, 1) + control_change(channel, controller, 0)
 
 
 @dataclass(frozen=True)

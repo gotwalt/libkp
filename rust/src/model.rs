@@ -40,10 +40,13 @@
 //!
 //! [`DeviceModel`]'s command methods split into two groups:
 //!
-//! - **Parameters** (`set_*`) — settable values the device also reports back.
-//!   They go out as 14-bit NRPN `$01` Single Parameter Changes (via
-//!   [`crate::nrpn::set_single`]), so the device echoes the change on the same
-//!   stream the model ingests and [`DeviceModel::state`] stays consistent:
+//! - **Parameters** (`set_*`) — settable values the device stores. They go out
+//!   as 14-bit NRPN `$01` Single Parameter Changes (via
+//!   [`crate::nrpn::set_single`]); the device applies the write silently and
+//!   does *not* echo it back on the stream, so follow a set with
+//!   [`request_param`](DeviceModel::request_param) when [`DeviceModel::state`]
+//!   should confirm the new value — the `$41` reply flows through normal
+//!   ingest. The setters are:
 //!   [`set_gain`](DeviceModel::set_gain),
 //!   [`set_rig_volume`](DeviceModel::set_rig_volume),
 //!   [`set_main_volume`](DeviceModel::set_main_volume),
@@ -78,7 +81,8 @@ use crate::midi3::{self, Unframer};
 use crate::nrpn::{
     self, FUNCTION_EXT_STRING_PARAM, FUNCTION_MULTI_PARAM, FUNCTION_RENDERED_STRING_REPLY,
     FUNCTION_SINGLE_PARAM, FUNCTION_STRING_PARAM, NrpnHeader, PAGE_STRINGS, multi_values,
-    request_rendered_string, request_single, request_string, set_single, u14,
+    request_extended_string, request_rendered_string, request_single, request_string, set_single,
+    u14,
 };
 use crate::params::{self, EFFECT_PARAM_MIX, EFFECT_PARAM_STATE, EFFECT_PARAM_TYPE};
 use crate::session::{PROTOCOL_MIDI3_STREAM, Session};
@@ -108,8 +112,13 @@ const GAIN_NUMBER: u8 = generated::GAIN_NUMBER;
 const SYSTEM_PAGE: u8 = generated::SYSTEM_PAGE;
 /// Main Output Volume number on [`SYSTEM_PAGE`] (14-bit).
 const MAIN_VOL_NUMBER: u8 = generated::MAIN_VOLUME_NUMBER;
-/// Monitor Output Volume number on [`SYSTEM_PAGE`] (14-bit).
+/// Headphone Output Volume number on [`SYSTEM_PAGE`] (14-bit); one half of the
+/// physical Master Volume knob.
+const HEADPHONE_VOL_NUMBER: u8 = generated::HEADPHONE_VOLUME_NUMBER;
+/// Monitor Output Volume number on [`SYSTEM_PAGE`] (14-bit); the other half.
 const MONITOR_VOL_NUMBER: u8 = generated::MONITOR_VOLUME_NUMBER;
+/// Bank Preview page (`0x96`): the loaded bank's five-slot name preview.
+const PAGE_BANK_PREVIEW: u8 = generated::PAGE_BANK_PREVIEW;
 /// The maximum 14-bit NRPN value (0–16383).
 const NRPN_MAX: u16 = generated::FULL_SCALE;
 /// Morph-state page: page 0 is dual-use, morph lives at number [`MORPH_NUMBER`].
@@ -203,6 +212,12 @@ pub enum DeviceEvent {
         /// The string-tag number.
         number: u8,
     },
+    /// A bank-preview name was applied (page `0x96`): one of the current bank's
+    /// rig / amp / cabinet names. Read [`DeviceState::bank`] for the new value.
+    BankPreview {
+        /// The Bank Preview number (0..14): 0–4 rig, 5–9 amp, 10–14 cabinet.
+        number: u8,
+    },
     /// An effect slot's Type, On/Off state or Mix changed.
     EffectChanged {
         /// Index into [`crate::params::effect_slots`] (0 = A … 7 = REV).
@@ -247,6 +262,15 @@ pub enum DeviceEvent {
         value: u16,
         /// The rendered display text.
         text: String,
+    },
+    /// The device's current position was learned from the CBOR state-dump
+    /// snapshot. Read [`DeviceState::current_bank`] and
+    /// [`DeviceState::current_rig_slot`] for the new values (both 0-based).
+    CurrentPosition {
+        /// Current bank, 0-based, if the dump carried it.
+        bank: Option<u16>,
+        /// Current rig slot within the bank, 0-based, if the dump carried it.
+        slot: Option<u16>,
     },
     /// The model connected to a device.
     Connected,
@@ -318,6 +342,11 @@ impl DeviceState {
     ///   value's exact display text (see [`Self::apply_rendered_string`]). FAST.
     /// - `$06` extended and any other traffic → ignored.
     pub fn apply(&mut self, msg: &[u8]) -> ApplyOutcome {
+        // Channel-voice messages ride the same stream as the SysEx: the device
+        // announces every rig change as a Bank Select / Program Change pair.
+        if let Some(outcome) = self.apply_rig_index(msg) {
+            return outcome;
+        }
         // The extended-string ($07) address is 5×7-bit encoded and does not fit
         // the fixed `NrpnHeader` layout, so route it off the raw message first.
         if let Some((h, _)) = NrpnHeader::parse(msg) {
@@ -343,6 +372,50 @@ impl DeviceState {
     }
 
     /// Route a `$03` page-0 string tag into the tree.
+    /// Fold the device's position report into the tree.
+    ///
+    /// The device says where it is with two channel-voice messages: CC32 (Bank
+    /// Select LSB) carrying the high 7 bits, then a Program Change carrying the
+    /// low 7. Together they are a flat, 0-based rig index — `128 * msb + program`
+    /// — which divides by [`generated::BANK_SLOTS`] into bank and slot. Unlike the CBOR
+    /// snapshot, a one-shot read at connect, this arrives on every change, from
+    /// the front panel as readily as from a controller.
+    ///
+    /// Returns `None` for anything that is not one of the two messages, so NRPN
+    /// parsing carries on. A Program Change with no Bank Select ahead of it is
+    /// ignored: half an index is not a position.
+    fn apply_rig_index(&mut self, msg: &[u8]) -> Option<ApplyOutcome> {
+        match msg.first()? & 0xF0 {
+            generated::CONTROL_CHANGE_STATUS => {
+                if msg.len() < 3 || msg[1] != generated::CC_BANK_SELECT_LSB {
+                    return None;
+                }
+                self.pending_rig_index_msb = Some(msg[2] & 0x7F);
+                Some(ApplyOutcome::empty())
+            }
+            generated::PROGRAM_CHANGE_STATUS => {
+                let msb = self.pending_rig_index_msb?;
+                if msg.len() < 2 {
+                    return None;
+                }
+                self.pending_rig_index_msb = None;
+                let index = u16::from(msb) * 128 + u16::from(msg[1] & 0x7F);
+                let bank = index / generated::BANK_SLOTS as u16;
+                let slot = index % generated::BANK_SLOTS as u16;
+                if self.current_bank == Some(bank) && self.current_rig_slot == Some(slot) {
+                    return Some(ApplyOutcome::empty());
+                }
+                self.current_bank = Some(bank);
+                self.current_rig_slot = Some(slot);
+                Some(ApplyOutcome::slow(vec![DeviceEvent::CurrentPosition {
+                    bank: Some(bank),
+                    slot: Some(slot),
+                }]))
+            }
+            _ => None,
+        }
+    }
+
     fn apply_string(&mut self, number: u8, vals: &[u8]) -> ApplyOutcome {
         let text: String = vals
             .iter()
@@ -389,6 +462,9 @@ impl DeviceState {
         };
         let page = (addr / 128) as u8;
         let number = (addr % 128) as u8;
+        if page == PAGE_BANK_PREVIEW {
+            return self.apply_bank_preview(number, text);
+        }
         if page != PAGE_STRINGS {
             return ApplyOutcome::empty();
         }
@@ -401,6 +477,22 @@ impl DeviceState {
             events,
             slow_changed: tracked,
         }
+    }
+
+    /// Store one bank-preview name (page `0x96`) into [`DeviceState::bank`]. The
+    /// number selects the field (rig / amp / cabinet) and slot; an out-of-range
+    /// number is ignored. A stored value is a SLOW change.
+    fn apply_bank_preview(&mut self, number: u8, text: String) -> ApplyOutcome {
+        let Some((field, slot)) = params::bank_preview_slot_field(number) else {
+            return ApplyOutcome::empty();
+        };
+        let target = &mut self.bank.slots[slot];
+        match field {
+            params::BankPreviewField::RigName => target.rig_name = Some(text),
+            params::BankPreviewField::AmpName => target.amp_name = Some(text),
+            params::BankPreviewField::CabinetName => target.cabinet_name = Some(text),
+        }
+        ApplyOutcome::slow(vec![DeviceEvent::BankPreview { number }])
     }
 
     /// Route one decoded numeric address/value pair into the tree. Shared by
@@ -449,6 +541,10 @@ impl DeviceState {
         // System output volumes (SLOW).
         if page == SYSTEM_PAGE && number == MAIN_VOL_NUMBER {
             self.output.main_volume = Some(value);
+            return ApplyOutcome::slow(vec![generic(page, number, value)]);
+        }
+        if page == SYSTEM_PAGE && number == HEADPHONE_VOL_NUMBER {
+            self.output.headphone_volume = Some(value);
             return ApplyOutcome::slow(vec![generic(page, number, value)]);
         }
         if page == SYSTEM_PAGE && number == MONITOR_VOL_NUMBER {
@@ -621,6 +717,7 @@ impl DeviceModel {
         };
         // Read-only sync so the snapshot populates from the replies.
         let _ = model.refresh_rig().await;
+        let _ = model.refresh_bank().await;
         Ok(model)
     }
 
@@ -732,6 +829,58 @@ impl DeviceModel {
         Ok(())
     }
 
+    /// Request the current bank's five-slot name preview (rig / amp / cabinet
+    /// names) as extended strings (`$47`). The `$07` replies fold into
+    /// [`DeviceState::bank`]. Read-only: it changes nothing on the device. The
+    /// device also pushes this block unasked on a bank change, so a controller
+    /// need only call this once at connect.
+    pub async fn refresh_bank(&self) -> Result<(), CommandError> {
+        use params::BankPreviewField::{AmpName, CabinetName, RigName};
+        for field in [RigName, AmpName, CabinetName] {
+            for slot in 1..=params::BANK_SLOTS as u8 {
+                let addr = params::bank_preview_address(field, slot);
+                self.enqueue(request_extended_string(PRODUCT, DEVICE, addr))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold a [`StateSnapshot`](crate::cbor::StateSnapshot)'s current bank and
+    /// rig slot into the state tree, emitting a
+    /// [`DeviceEvent::CurrentPosition`] and broadcasting a fresh snapshot.
+    ///
+    /// The MIDI3 stream never reports these indices; a controller learns them by
+    /// running [`StateSnapshot::fetch`](crate::cbor::StateSnapshot::fetch) over a
+    /// separate CBOR session — which the device wants done *before* this streaming
+    /// session opens, not concurrently — and applying the result here. Only the
+    /// `Some` fields overwrite; a `None` leaves the current value untouched.
+    pub fn set_current_position(&self, bank: Option<u16>, slot: Option<u16>) {
+        {
+            let mut st = write_state(&self.state);
+            if bank.is_some() {
+                st.current_bank = bank;
+            }
+            if slot.is_some() {
+                st.current_rig_slot = slot;
+            }
+        }
+        let _ = self
+            .events
+            .send(DeviceEvent::CurrentPosition { bank, slot });
+        let _ = self.snapshots.send(read_state(&self.state).clone());
+    }
+
+    /// Request one numeric parameter's current value (function `$41`). The
+    /// device answers with a `$01` message on the same stream, which the ingest
+    /// task folds into the snapshot. Read-only: it changes nothing on the
+    /// device. This is the read-back to issue after a
+    /// [`set_param`](Self::set_param), which the device applies without echoing.
+    pub async fn request_param(&self, page: u8, number: u8) -> Result<(), CommandError> {
+        self.enqueue(request_single(PRODUCT, DEVICE, page, number))
+            .await
+    }
+
     /// Request a parameter value rendered to its exact display text (function
     /// `$7C`) — ask the device for the string a value shows on screen (e.g.
     /// `"5.2"`, `"120 BPM"`, `"<0.0>"`) instead of a generic percentage.
@@ -782,6 +931,24 @@ impl DeviceModel {
     pub async fn bank(&self, n: u16) -> Result<(), CommandError> {
         self.send_control(Control::BankPreselect(n.saturating_sub(1) as u8))
             .await
+    }
+
+    /// Load a rig by its flat, 0-based index — the device's own numbering, and
+    /// the only address that reaches a rig outside the current bank.
+    ///
+    /// Sent as the documented pair: the absolute bank preselect (CC47) followed
+    /// by the slot load (CC50–54) that commits it. The index divides by
+    /// [`generated::BANK_SLOTS`], so index 123 is bank 25, slot 4.
+    ///
+    /// Nothing here assumes how many banks a device has. Aim past the end and
+    /// the device simply stays where it is — and says so in the Bank Select /
+    /// Program Change report that follows, so
+    /// [`DeviceState::current_rig_index`](crate::state::DeviceState::current_rig_index)
+    /// always reflects where it actually landed, not where this aimed.
+    pub async fn select_rig_index(&self, index: u16) -> Result<(), CommandError> {
+        let slots = generated::BANK_SLOTS as u16;
+        self.bank(index / slots + 1).await?;
+        self.select_rig((index % slots) as u8 + 1).await
     }
 
     /// Tap the tempo (CC30). Mutating — advances the tap-tempo clock.
@@ -1277,6 +1444,52 @@ mod tests {
         // A $07 addressed to a non-string page is not routed.
         let msg = ext_string(0x0A, 0, b"nope");
         assert_eq!(st.apply(&msg), ApplyOutcome::empty());
+    }
+
+    #[test]
+    fn ext_string_populates_bank_preview() {
+        let mut st = DeviceState::new();
+        // Bank Preview page 0x96: number 0 = slot 1 rig name, number 5 = slot 1
+        // amp name, number 12 = slot 3 cabinet name.
+        let out = st.apply(&ext_string(PAGE_BANK_PREVIEW, 0, b"AC30"));
+        assert!(out.slow_changed);
+        assert_eq!(out.events, vec![DeviceEvent::BankPreview { number: 0 }]);
+        st.apply(&ext_string(PAGE_BANK_PREVIEW, 5, b"Vox AC30TB"));
+        st.apply(&ext_string(PAGE_BANK_PREVIEW, 12, b"2x12"));
+        assert_eq!(st.bank.slots[0].rig_name.as_deref(), Some("AC30"));
+        assert_eq!(st.bank.slots[0].amp_name.as_deref(), Some("Vox AC30TB"));
+        assert_eq!(st.bank.slots[2].cabinet_name.as_deref(), Some("2x12"));
+        // An out-of-range bank number is ignored.
+        assert_eq!(
+            st.apply(&ext_string(PAGE_BANK_PREVIEW, 15, b"x")),
+            ApplyOutcome::empty()
+        );
+    }
+
+    #[test]
+    fn headphone_volume_feeds_master() {
+        let mut st = DeviceState::new();
+        assert_eq!(st.output.master_volume(), None);
+        // Monitor alone answers for master until headphone is seen.
+        st.apply(&set_single(
+            0x00,
+            0x00,
+            SYSTEM_PAGE,
+            MONITOR_VOL_NUMBER,
+            5000,
+        ));
+        assert_eq!(st.output.master_volume(), Some(5000));
+        let out = st.apply(&set_single(
+            0x00,
+            0x00,
+            SYSTEM_PAGE,
+            HEADPHONE_VOL_NUMBER,
+            9000,
+        ));
+        assert!(out.slow_changed);
+        assert_eq!(st.output.headphone_volume, Some(9000));
+        // Headphone wins once present.
+        assert_eq!(st.output.master_volume(), Some(9000));
     }
 
     #[test]

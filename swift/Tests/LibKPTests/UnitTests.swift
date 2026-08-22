@@ -233,6 +233,18 @@ final class NrpnTests: XCTestCase {
         }
     }
 
+    func testRequestExtendedString() {
+        // Bank Preview page 0x96, rig-name slot 1: flat address 0x96 * 128 = 19200.
+        let address = Params.bankPreviewAddress(.rigName, slot: 1)
+        XCTAssertEqual(address, 19200)
+        let message = Nrpn.requestExtendedString(
+            product: Generated.productProfiler, device: Generated.deviceOmni, address: address)
+        XCTAssertEqual(
+            message,
+            [0xF0, 0x00, 0x20, 0x33, 0x00, 0x7F, 0x47, 0x00, 0x00, 0x00, 0x01, 0x16, 0x00, 0xF7])
+        XCTAssertEqual(UInt32(Nrpn.extDecode(Array(message[8..<13]))), address)
+    }
+
     func testParseExtendedString() {
         var message: [UInt8] = [0xF0, 0x00, 0x20, 0x33, 0x02, 0x00, 0x07, 0x00]
         message += Nrpn.extEncode(1, count: 5)
@@ -291,8 +303,8 @@ final class ControlTests: XCTestCase {
     func testMomentaryActions() {
         XCTAssertEqual(Control.tapTempo.message(), [0xB0, 30, 1])
         XCTAssertEqual(Control.toggleAllModules.message(), [0xB0, 16, 1])
-        XCTAssertEqual(Control.up.message(), [0xB0, 48, 1])
-        XCTAssertEqual(Control.down.message(), [0xB0, 49, 1])
+        XCTAssertEqual(Control.up.message(), [0xB0, 48, 1, 0xB0, 48, 0])
+        XCTAssertEqual(Control.down.message(), [0xB0, 49, 1, 0xB0, 49, 0])
     }
 
     func testSwitchVariantsEmitOneOrZero() {
@@ -307,11 +319,11 @@ final class ControlTests: XCTestCase {
     }
 
     func testLoadSlotClampsIntoRange() {
-        XCTAssertEqual(Control.loadSlot(3).message(), [0xB0, 52, 1])
-        XCTAssertEqual(Control.loadSlot(1).message(), [0xB0, 50, 1])
-        XCTAssertEqual(Control.loadSlot(5).message(), [0xB0, 54, 1])
-        XCTAssertEqual(Control.loadSlot(0).message(), [0xB0, 50, 1])
-        XCTAssertEqual(Control.loadSlot(99).message(), [0xB0, 54, 1])
+        XCTAssertEqual(Control.loadSlot(3).message(), [0xB0, 52, 1, 0xB0, 52, 0])
+        XCTAssertEqual(Control.loadSlot(1).message(), [0xB0, 50, 1, 0xB0, 50, 0])
+        XCTAssertEqual(Control.loadSlot(5).message(), [0xB0, 54, 1, 0xB0, 54, 0])
+        XCTAssertEqual(Control.loadSlot(0).message(), [0xB0, 50, 1, 0xB0, 50, 0])
+        XCTAssertEqual(Control.loadSlot(99).message(), [0xB0, 54, 1, 0xB0, 54, 0])
     }
 
     func testEffectButtonClampsIntoRange() {
@@ -388,10 +400,38 @@ final class ParamsTests: XCTestCase {
         XCTAssertFalse(Params.isEffectPage(0x04))
     }
 
+    func testBankPreviewAddressesAndNames() {
+        XCTAssertEqual(Params.pageName(0x96), "Bank Preview")
+        XCTAssertEqual(Params.paramName(page: 0x96, number: 0), "Bank Rig Name")
+        XCTAssertEqual(Params.paramName(page: 0x96, number: 7), "Bank Amp Name")
+        XCTAssertEqual(Params.paramName(page: 0x96, number: 14), "Bank Cabinet Name")
+        XCTAssertNil(Params.paramName(page: 0x96, number: 15))
+        XCTAssertEqual(Params.bankPreviewAddress(.rigName, slot: 1), 19200)
+        XCTAssertEqual(Params.bankPreviewAddress(.cabinetName, slot: 5), 19214)
+        // Out-of-range slots clamp into 1...bankSlots.
+        XCTAssertEqual(Params.bankPreviewAddress(.ampName, slot: 0), 19205)
+        XCTAssertEqual(Params.bankPreviewAddress(.ampName, slot: 9), 19209)
+        // The reverse map recovers (field, 0-based slot).
+        XCTAssertTrue(Params.bankPreviewSlotField(3).map { $0.0 == .rigName && $0.1 == 3 } ?? false)
+        XCTAssertTrue(Params.bankPreviewSlotField(9).map { $0.0 == .ampName && $0.1 == 4 } ?? false)
+        XCTAssertTrue(
+            Params.bankPreviewSlotField(10).map { $0.0 == .cabinetName && $0.1 == 0 } ?? false)
+        XCTAssertNil(Params.bankPreviewSlotField(15))
+    }
+
     func testEffectTypes() {
         XCTAssertEqual(Params.effectTypeName(32), "Kemper Drive")
         XCTAssertEqual(Params.effectTypeName(193), "Spring Reverb")
         XCTAssertNil(Params.effectTypeName(5))
+    }
+
+    func testEffectCategories() {
+        XCTAssertEqual(Params.effectCategoryName(16), "Wah")
+        XCTAssertEqual(Params.effectCategoryName(17), "Shaper")
+        // A type with no name still resolves to its block.
+        XCTAssertEqual(Params.effectCategoryName(76), "Modulation")
+        XCTAssertNil(Params.effectCategoryName(0))
+        XCTAssertNil(Params.effectCategoryName(300))
     }
 
     func testRealtimePageAddresses() {
@@ -526,6 +566,36 @@ final class StateTests: XCTestCase {
         effect.kind = 179
         XCTAssertFalse(effect.isEmpty)
         XCTAssertEqual(effect.typeName, "Easy Reverb")
+    }
+
+    func testExtStringPopulatesBankPreview() {
+        var state = DeviceState()
+        // Page 0x96: number 0 = slot 1 rig, 5 = slot 1 amp, 12 = slot 3 cabinet.
+        let outcome = state.apply(extString(page: 0x96, number: 0, text: "AC30"))
+        XCTAssertTrue(outcome.slowChanged)
+        XCTAssertEqual(outcome.events, [.bankPreview(number: 0)])
+        state.apply(extString(page: 0x96, number: 5, text: "Vox AC30TB"))
+        state.apply(extString(page: 0x96, number: 12, text: "2x12"))
+        XCTAssertEqual(state.bank.slots[0].rigName, "AC30")
+        XCTAssertEqual(state.bank.slots[0].ampName, "Vox AC30TB")
+        XCTAssertEqual(state.bank.slots[2].cabinetName, "2x12")
+        // An out-of-range bank number is ignored.
+        let ignored = state.apply(extString(page: 0x96, number: 15, text: "x"))
+        XCTAssertEqual(ignored, ApplyOutcome())
+    }
+
+    func testHeadphoneVolumeFeedsMaster() {
+        var state = DeviceState()
+        XCTAssertNil(state.output.masterVolume)
+        // Monitor alone answers for master until headphone is seen.
+        state.apply(Nrpn.setSingle(product: 0, device: 0, page: 0x7F, number: 2, value: 5000))
+        XCTAssertEqual(state.output.masterVolume, 5000)
+        let outcome = state.apply(
+            Nrpn.setSingle(product: 0, device: 0, page: 0x7F, number: 1, value: 9000))
+        XCTAssertTrue(outcome.slowChanged)
+        XCTAssertEqual(state.output.headphoneVolume, 9000)
+        // Headphone wins once present.
+        XCTAssertEqual(state.output.masterVolume, 9000)
     }
 
     func testTunerInTuneWindow() {
@@ -873,5 +943,69 @@ final class FmtTests: XCTestCase {
     func testAsciiOrHex() {
         XCTAssertEqual(Fmt.asciiOrHex(Array("AC30".utf8)), "\"AC30\"")
         XCTAssertEqual(Fmt.asciiOrHex([0xF0, 0x00]), "[f0 00]")
+    }
+}
+
+// MARK: - CBOR channel
+
+final class CborTests: XCTestCase {
+    func testEncodesWithMinimalLengthHeads() {
+        XCTAssertEqual(
+            Fmt.hex(Cbor.encode(Cbor.paramWrite(addr: 15953, value: 0))), "c18301193e5100")
+        XCTAssertEqual(
+            Fmt.hex(Cbor.encode(Cbor.paramWrite(addr: 102405, value: 19))), "c183011a0001900513")
+    }
+
+    func testEncodesTheStateDumpRequest() {
+        XCTAssertEqual(Fmt.hex(Cbor.encode(Cbor.stateDumpRequest())), "c183011a0001908001")
+    }
+
+    func testRoundTripsThroughTheDecoder() {
+        for item in [
+            Cbor.paramWrite(addr: 102528, value: 1),
+            Cbor.paramWrite(addr: 0, value: 0),
+            Cbor.paramWrite(addr: 16383, value: -1),
+        ] {
+            var decoder = CBORDecoder()
+            XCTAssertEqual(decoder.push(Cbor.encode(item)), [item])
+            XCTAssertEqual(decoder.pending, 0)
+        }
+    }
+
+    func testDecoderSkipsInterItemFiller() {
+        var bytes: [UInt8] = [Generated.cborFillerByte, Generated.cborFillerByte]
+        let item = Cbor.paramWrite(addr: 1412, value: 8629)
+        bytes.append(contentsOf: Cbor.encode(item))
+        var decoder = CBORDecoder()
+        XCTAssertEqual(decoder.push(bytes), [item])
+        XCTAssertEqual(decoder.fillerBytes, 2)
+    }
+
+    func testExtractsPositionFromAMultiRun() {
+        // tag(1)([2, 100700, 0, 1, 2]): 100700, then bank 100701 and slot 100702.
+        let run = CBORValue.tag(
+            1, .array([.uint(2), .uint(100_700), .uint(0), .uint(1), .uint(2)]))
+        let snap = Cbor.extractSnapshot([run])
+        XCTAssertEqual(snap.currentBank, 1)
+        XCTAssertEqual(snap.currentRigSlot, 2)
+        XCTAssertTrue(snap.isComplete)
+    }
+
+    func testExtractsPositionFromSingleItems() {
+        let snap = Cbor.extractSnapshot([
+            Cbor.paramWrite(addr: 100_701, value: 3),
+            Cbor.paramWrite(addr: 100_702, value: 4),
+        ])
+        XCTAssertEqual(snap.currentBank, 3)
+        XCTAssertEqual(snap.currentRigSlot, 4)
+    }
+
+    func testCollectsStringsAndRedactsSecrets() {
+        let name = CBORValue.tag(1, .array([.uint(4), .uint(1), .text("Maz 18 Pushed")]))
+        let secret = CBORValue.tag(
+            1, .array([.uint(4), .uint(UInt64(Generated.sensitiveAddresses[0])), .text("hunter2")]))
+        let snap = Cbor.extractSnapshot([name, secret])
+        XCTAssertEqual(snap.string(1), "Maz 18 Pushed")
+        XCTAssertEqual(snap.string(Generated.sensitiveAddresses[0]), Generated.redactedPlaceholder)
     }
 }
