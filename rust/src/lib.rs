@@ -8,6 +8,8 @@
 //! - [`discovery`] — UDP broadcast discovery ([`discovery::discover`]).
 //! - [`session`] — TCP connect + the line-based protocol handshake.
 //! - [`midi3`] — the 4-byte stream framing that carries MIDI over the session.
+//! - [`cbor`] — the device's native CBOR channel and the state-dump snapshot
+//!   ([`cbor::StateSnapshot::fetch`]) that reads the current bank and rig slot.
 //! - [`nrpn`] — Kemper SysEx/NRPN builders and parsers.
 //! - [`control`] — the 7-bit CC / PC / Bank Select control vocabulary.
 //! - [`params`] / [`registry`] — offline name and descriptor lookups.
@@ -35,6 +37,7 @@
 //! # }
 //! ```
 
+pub mod cbor;
 pub mod control;
 pub mod discovery;
 pub mod error;
@@ -55,6 +58,7 @@ pub const PORT: u16 = generated::PORT;
 /// The version of the shared protocol spec this crate was generated against.
 pub const SPEC_VERSION: &str = generated::SPEC_VERSION;
 
+pub use cbor::{StateSnapshot, extract_snapshot, param_write, state_dump_request};
 pub use control::{Control, ModuleSlot, program_change, slot_enable_cc};
 pub use discovery::{Options, Reply, discover, find_first};
 pub use error::{DiscoverError, ParseError, SessionError};
@@ -67,5 +71,8 @@ pub use nrpn::{
 };
 pub use protocol::{DISCOVERY_PORT, DSCV_HEADER, TagStream, build_poll_request};
 pub use registry::{ParamDescriptor, ParamKind, descriptor, format_value};
-pub use session::{HandshakeOutcome, PROTOCOL_MIDI3_STREAM, PROTOCOL_REQUEST_RESPONSE, Session};
+pub use session::{
+    CONNECTION_COOLDOWN, HandshakeOutcome, PROTOCOL_CBOR_CONTROL, PROTOCOL_MIDI3_STREAM,
+    PROTOCOL_REQUEST_RESPONSE, Session,
+};
 pub use state::{Amp, Cabinet, Connection, DeviceState, Effect, Output, Rig, Tuner};

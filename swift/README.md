@@ -7,8 +7,9 @@ Pure Swift: Foundation plus the `Network` framework for TCP/UDP. No SwiftPM
 dependencies, no C bridging, no code generation at build time.
 
 ```sh
-swift build                  # the library and the example
+swift build                  # the library and the examples
 swift build --product meters # just the example
+swift run MetersApp          # the SwiftUI app example
 swift test                   # unit tests + the shared conformance suite
 ```
 
@@ -31,6 +32,7 @@ Requires Swift 6.0 or newer and macOS 13+.
 | `Sources/LibKP/State.swift` | The state tree and its decode routing |
 | `Sources/LibKP/DeviceModel.swift` | The `actor` that owns the session and publishes state |
 | `Sources/meters/main.swift` | A live full-screen terminal view |
+| `Sources/MetersApp/` | The same dashboard as a native SwiftUI macOS app |
 
 Everything the conformance vectors exercise — framing, builders, parsers, name
 lookups, and `DeviceState.apply` — is pure and imports no networking, so it is
@@ -78,7 +80,6 @@ if let device = try await Discovery.findFirst(listenFor: 3) {
     print(device.name ?? "unnamed", device.host)
 }
 ```
-
 ### Fast vs slow state
 
 State is classified into two lanes. **FAST** is the meter `RealtimeStatus`
@@ -89,9 +90,11 @@ block, the beat pulse and tuner deviance — high-rate data best polled through
 ### Parameters vs actions
 
 - **Parameters** (`setGain`, `setEffectEnabled`, `setTempoBpm`, `setParam`, …)
-  are settable values the device reports back. They go out as 14-bit NRPN `$01`
-  Single Parameter Changes, so the device echoes the change on the same stream
-  the model ingests and the snapshot stays consistent.
+  are settable values the device stores. They go out as 14-bit NRPN `$01`
+  Single Parameter Changes; the device applies the write silently and does *not*
+  echo it back, so follow a set with `requestParam` when the snapshot should
+  confirm the new value — the `$41` reply flows through normal ingest, which is
+  what `MetersApp` does when you click an effect block.
 - **Actions** (`tapTempo`, `rigUp`, `selectRig`, `send(control:)`, …) are
   momentary presses and live expression. They go out as 7-bit Control Change
   messages and are *not* reflected in state.
@@ -122,6 +125,24 @@ tuner strobe with an in-tune/sharp/flat verdict derived from the phase drift
 rate; level bars with peak-hold; a tempo pulse; and the last parameter seen.
 Ctrl-C restores the terminal.
 
+## The `MetersApp` example
+
+The same dashboard as a native SwiftUI macOS app: the rig name, author and
+tempo; the amp and cabinet; the eight effect blocks with their on/off state,
+effect type, category and mix; the tuner strobe with its in-tune/sharp/flat
+verdict; level meters with peak-hold; and the tempo pulse. Clicking a
+signal-chain block toggles that effect on or off — the one write it performs;
+everything else it sends is a value request.
+
+```sh
+swift run MetersApp
+```
+
+It discovers a device on the LAN by default. Settings (⌘,) switches to a manual
+IP for a device discovery cannot reach, and toggles the level list between the
+three bar meters and all eleven raw fields. When the device drops the
+connection the app says so and reconnects on its own.
+
 ## Tests
 
 `swift test` runs two things:
@@ -138,6 +159,8 @@ Ctrl-C restores the terminal.
 ## Provenance
 
 Parameter maps, the SysEx/NRPN grammar, effect types, string tags, the CC map
-and the beacon come from the Kemper MIDI Parameter Documentation and PySwitch.
-Discovery, the handshake, the stream framing, session encapsulation and the
-realtime status field identities were established by observed experimentation.
+and the beacon come from the Kemper MIDI Parameter Documentation and PySwitch;
+the effect-type category blocks are inferred from the value-range structure of
+its Appendix B. Discovery, the handshake, the stream framing, session
+encapsulation and the realtime status field identities were established by
+observed experimentation.

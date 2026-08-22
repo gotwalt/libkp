@@ -16,6 +16,8 @@ languages that stay in lockstep:
 
 Each implementation ships the same example — **`meters`**, a live terminal view
 of the current rig, its effect blocks, the tuner strobe, and the output meters.
+The Swift implementation additionally ships **`MetersApp`**, the same dashboard
+as a native SwiftUI macOS app.
 
 ## Documentation
 
@@ -26,7 +28,7 @@ The protocol is documented in [`docs/`](docs/):
 3. [Handshake](docs/03-handshake.md) — the TCP GUID negotiation
 4. [MIDI3 framing](docs/04-midi3-framing.md)
 5. [SysEx / NRPN dialect](docs/05-sysex-nrpn.md)
-6. [The CBOR channel](docs/06-cbor-channel.md) — experimental
+6. [The CBOR channel](docs/06-cbor-channel.md) — the current bank/rig snapshot
 7. [Realtime status & meters](docs/07-realtime-status.md)
 8. [Control model](docs/08-control-model.md) — CC vs NRPN vs the device model
 9. [Parameter registry](docs/09-parameter-registry.md)
@@ -57,8 +59,10 @@ See [docs/10](docs/10-versioning-and-compatibility.md) for the full mechanism.
 
 `libkp` implements the fully-validated MIDI3 surface: discovery, session,
 framing, NRPN read/write, CC control, the realtime meter/tuner decode, a typed
-parameter registry, and an observable device model. The device's native CBOR
-control channel is documented (docs/06) but not implemented.
+parameter registry, and an observable device model. It also speaks the device's
+native CBOR channel for one purpose — the state-dump snapshot that reads the
+current bank and rig (docs/06); the channel's wider management grammar is not
+implemented.
 
 ## Attribution
 
@@ -67,7 +71,9 @@ the control-change map — follows the official
 [Kemper MIDI Parameter Documentation](https://www.kemper-amps.com/downloads/5/User-Manuals),
 cross-checked against the excellent [PySwitch](https://github.com/Tunetown/PySwitch)
 project, whose Kemper client is credited for confirming addresses and the
-bidirectional beacon. The transport envelope — discovery, the handshake, MIDI3
+bidirectional beacon. The effect-type **category** blocks are inferred from the
+value-range structure of that documentation's Appendix B rather than transcribed
+from a printed table. The transport envelope — discovery, the handshake, MIDI3
 framing, session encapsulation, and the CBOR channel — was characterized through
 observed experimentation. See [CREDITS.md](CREDITS.md).
 
