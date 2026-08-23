@@ -1,0 +1,415 @@
+# The state routing table: which addresses the device-state tree tracks, and how.
+#
+# A value reaches libkp on one of two wires — a MIDI3 SysEx message or a CBOR
+# item — but both name the same thing: a flat address (`page * 128 + number`,
+# or a bare extended address) and a value. This table is the single answer to
+# "what does the tree do with address N": every implementation's fold consumes
+# the generated `STATE_ROUTES` instead of hand-writing the same page/number
+# switch three times. An address with no row here is untracked: it leaves the
+# snapshot alone (the stream still surfaces it as a generic `ParamChanged`).
+#
+# Addresses are never written here as numbers when `[well_known]` in
+# parameters.toml already names them — that table stays the single home for
+# addresses, and this one only adds routing. Add a key there first if a routed
+# address lacks one.
+#
+# Each `[[route]]` row has:
+#
+#   name      A stable snake_case identifier, unique across rows. It becomes one
+#             variant of the generated `Field` enum, so it names the tree field
+#             the row writes (`rig_name`, `amp_gain`, `current_bank`, ...).
+#
+#   Exactly one address form:
+#     address = 100701 | "current_bank_address"
+#             One flat address, literal or a `[well_known]` key.
+#     page = "amp_page", number = "amp_on_number"
+#             A page/number pair (each literal or a `[well_known]` key); the flat
+#             address is `page * 128 + number`. Add `span = 11` (or a key such
+#             as "meter_count") for that many consecutive addresses: the row
+#             expands to one generated entry per address, `slot` = its index.
+#     effect_param = "type"
+#             One entry per slot in `effect_slots`, on that slot's page, at the
+#             number `[effect_param_numbers]` gives the key; `slot` = the slot's
+#             index in signal-chain order (0 = A .. 7 = REV).
+#     bank_preview = "bank_rig_name_base"
+#             One entry per bank slot on `page_bank_preview`, from the named
+#             base; `slot` = the 0-based bank slot.
+#
+#   kind      How the value decodes before it is stored:
+#               u14   the 14-bit parameter value, 0..=16383, stored as is
+#               u16   an extended-parameter count (a bank or slot index) that
+#                     must fit 16 bits; anything larger is dropped, not
+#                     truncated
+#               u7    the low seven bits of the value (the tuner's note index)
+#               bool  nonzero = on
+#               text  a string (page-0 tags, the bank preview)
+#               bpm   the wire value divided by `tempo_bpm_scale`
+#               multi one element of a block the fold decodes as a unit (the
+#                     meter frame); `slot` is the element's index in the block
+#             Page 0 is dual-use — the same numbers are string tags via $03/$43
+#             and numerics via $01/$41 — so `kind` also says which of the two a
+#             row accepts: a numeric arriving at a `text` address (or the
+#             reverse) is untracked.
+#
+#   lane      "fast" for the high-rate values a UI polls per animation frame
+#             (they raise an event and never republish the snapshot); "slow" for
+#             everything that drives the coalesced snapshot stream.
+#
+#   event     The `DeviceEvent` the row raises, snake_case. Informational — the
+#             hand-written fold in each language raises it — but pinned here so
+#             the table reads as the whole contract. The rig-name row raises
+#             `rig_changed` after its `string_tag`; that is the one row that
+#             raises two.
+#
+#   wire      Which channel may write the row: "stream" (MIDI3 only — the
+#             realtime page and the momentaries, which the control channel
+#             also carries but as a different, unwanted feed), "control" (CBOR
+#             only — the morph position, which the stream never carries), or
+#             "both" (last writer wins).
+#
+#   dedupe    true when an update carrying the value already stored is a
+#             no-op (no event, no snapshot). false for the momentaries and the
+#             periodic meter frame, whose every arrival is the information.
+#
+#   request   true when the connect-time sync asks the device for this row.
+
+# ---------------------------------------------------------------------------
+# Page 0: the rig / amp / cabinet string tags ($03 / $43, and $07 on the dump).
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "rig_name"
+page = "page_strings"
+number = "string_rig_name"
+kind = "text"
+lane = "slow"
+event = "string_tag"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "rig_author"
+page = "page_strings"
+number = "string_rig_author"
+kind = "text"
+lane = "slow"
+event = "string_tag"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "rig_date"
+page = "page_strings"
+number = "string_rig_date"
+kind = "text"
+lane = "slow"
+event = "string_tag"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "rig_comment"
+page = "page_strings"
+number = "string_rig_comment"
+kind = "text"
+lane = "slow"
+event = "string_tag"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "amp_name"
+page = "page_strings"
+number = "string_amp_name"
+kind = "text"
+lane = "slow"
+event = "string_tag"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "cabinet_name"
+page = "page_strings"
+number = "string_cabinet_name"
+kind = "text"
+lane = "slow"
+event = "string_tag"
+wire = "both"
+dedupe = true
+request = true
+
+# ---------------------------------------------------------------------------
+# Page 0 numerics: the morph. The button is a momentary the device reports on
+# press and release; the position is the fader it drives, which only the CBOR
+# channel carries (parameters.toml, `[well_known]`).
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "morph_button"
+page = "page_morph"
+number = "morph_button_number"
+kind = "bool"
+lane = "fast"
+event = "morph_button"
+wire = "stream"
+dedupe = false
+request = false
+
+[[route]]
+name = "morph_position"
+page = "page_morph"
+number = "morph_number"
+kind = "u14"
+lane = "slow"
+event = "morph_changed"
+wire = "control"
+dedupe = true
+request = false
+
+# ---------------------------------------------------------------------------
+# Rig Settings (page 0x04).
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "tempo_bpm"
+page = "page_rig_settings"
+number = "tempo_number"
+kind = "bpm"
+lane = "slow"
+event = "tempo_bpm"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "rig_volume"
+page = "page_rig_settings"
+number = "rig_volume_number"
+kind = "u14"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = true
+
+# ---------------------------------------------------------------------------
+# Amplifier (page 0x0A) and Cabinet (page 0x0C).
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "amp_on"
+page = "amp_page"
+number = "amp_on_number"
+kind = "bool"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "amp_gain"
+page = "amp_page"
+number = "gain_number"
+kind = "u14"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "cabinet_on"
+page = "cabinet_page"
+number = "cabinet_on_number"
+kind = "bool"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = false
+
+# ---------------------------------------------------------------------------
+# The eight effect slots: Type, On/Off and Mix, one entry per slot.
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "effect_type"
+effect_param = "type"
+kind = "u14"
+lane = "slow"
+event = "effect_changed"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "effect_on"
+effect_param = "state"
+kind = "bool"
+lane = "slow"
+event = "effect_changed"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "effect_mix"
+effect_param = "mix"
+kind = "u14"
+lane = "slow"
+event = "effect_changed"
+wire = "both"
+dedupe = true
+request = false
+
+# ---------------------------------------------------------------------------
+# System / Global (page 0x7F): the output volumes.
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "main_volume"
+page = "system_page"
+number = "main_volume_number"
+kind = "u14"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "headphone_volume"
+page = "system_page"
+number = "headphone_volume_number"
+kind = "u14"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "monitor_volume"
+page = "system_page"
+number = "monitor_volume_number"
+kind = "u14"
+lane = "slow"
+event = "param_changed"
+wire = "both"
+dedupe = true
+request = true
+
+# ---------------------------------------------------------------------------
+# Realtime (page 0x7C) and the tuner note (page 0x7D). The control channel
+# carries its own strobe and beat feeds at other addresses; these rows are the
+# stream's.
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "beat_pulse"
+page = "page_realtime"
+number = "beat_pulse_number"
+kind = "bool"
+lane = "fast"
+event = "beat_pulse"
+wire = "stream"
+dedupe = false
+request = false
+
+[[route]]
+name = "tuner_deviance"
+page = "page_realtime"
+number = "tuner_deviance_number"
+kind = "u14"
+lane = "fast"
+event = "tuner_deviance"
+wire = "stream"
+dedupe = true
+request = false
+
+[[route]]
+name = "status"
+page = "page_realtime"
+number = "meter_block_number"
+span = "meter_count"
+kind = "multi"
+lane = "fast"
+event = "status"
+wire = "stream"
+dedupe = false
+request = false
+
+[[route]]
+name = "tuner_note"
+page = "page_tuner_note"
+number = "tuner_note_number"
+kind = "u7"
+lane = "slow"
+event = "tuner_note"
+wire = "stream"
+dedupe = true
+request = false
+
+# ---------------------------------------------------------------------------
+# Bank Preview (page 0x96): the loaded bank's five-slot name preview.
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "bank_rig_name"
+bank_preview = "bank_rig_name_base"
+kind = "text"
+lane = "slow"
+event = "bank_preview"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "bank_amp_name"
+bank_preview = "bank_amp_name_base"
+kind = "text"
+lane = "slow"
+event = "bank_preview"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "bank_cabinet_name"
+bank_preview = "bank_cabinet_name_base"
+kind = "text"
+lane = "slow"
+event = "bank_preview"
+wire = "both"
+dedupe = true
+request = true
+
+# ---------------------------------------------------------------------------
+# The device's position: two extended addresses, both 0-based.
+# ---------------------------------------------------------------------------
+
+[[route]]
+name = "current_bank"
+address = "current_bank_address"
+kind = "u16"
+lane = "slow"
+event = "current_position"
+wire = "both"
+dedupe = true
+request = true
+
+[[route]]
+name = "current_rig_slot"
+address = "current_rig_slot_address"
+kind = "u16"
+lane = "slow"
+event = "current_position"
+wire = "both"
+dedupe = true
+request = true

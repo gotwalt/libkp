@@ -17,6 +17,10 @@ Every protocol constant and lookup table lives once, in [`../spec`](../spec):
   blocks the values are allocated in.
 - `controls.toml` — the Control Change vocabulary.
 - `meters.toml` — the realtime status / meter block.
+- `state.toml` — the state routing table: which addresses the device model
+  stores, how each decodes, which lane and wire it belongs to, and whether the
+  connect-time sync requests it (see
+  [State routing](09-parameter-registry.md#state-routing)).
 
 No constant is defined in any implementation's own source. If a value is wrong,
 it is wrong in exactly one place.
@@ -37,6 +41,11 @@ These are committed so that consumers never need the toolchain. CI runs
 committed module differs. The constant tables are therefore **provably
 identical** across the three languages at all times — a divergence cannot merge.
 
+The modules are data only. That holds for the routing table too: `state.toml`
+becomes `STATE_ROUTES` plus the `Field` / `Kind` / `Lane` / `Wire` enums, and
+the fold that consumes them is hand-written in each language, where the
+compiler's exhaustiveness check over `Field` keeps it complete.
+
 ## 3. Shared conformance vectors
 
 Constants being equal is necessary but not sufficient: the hand-written logic
@@ -53,9 +62,16 @@ hex inputs paired with expected structured or hex outputs:
 | `controls.json` | Control op → MIDI bytes |
 | `params.json` | offline name lookups |
 | `state.json` | applying messages to the device state |
+| `cbor.json` | the CBOR control channel: the state-dump write, and reading position, strings and morph out of a decoded dump |
 
 Each implementation's test suite loads these files and asserts byte-for-byte
 agreement. A behavioral drift in any language fails its own build.
+
+Every vector file is written by [`../codegen/gen_vectors.py`](../codegen/gen_vectors.py),
+which carries one reference implementation of each builder (SysEx, MIDI3
+framing, the CBOR items) and cross-checks it inline against hardware-validated
+bytes before serializing. CI reruns the script and fails if `spec/vectors`
+changes, so the committed vectors always match the script.
 
 ### Replay captures
 
@@ -80,11 +96,32 @@ the harness contract.
 that all three report the same value. Bump it whenever a spec change alters
 generated data or wire behavior.
 
+### Bumping the spec version
+
+A bump touches one file and three literals, and every one of them is checked:
+
+1. `spec/version.toml` — `spec_version`.
+2. The literal each conformance suite pins, so a stale library fails its own
+   tests rather than silently running against a newer spec:
+   `rust/tests/conformance.rs` (`spec_version_matches`),
+   `python/tests/test_conformance.py` (`test_spec_version_matches`), and
+   `swift/Tests/LibKPTests/ConformanceTests.swift` (`testSpecVersionMatches`).
+3. `python3 codegen/generate.py` to carry the version into the three generated
+   modules, and `python3 codegen/gen_vectors.py` if the change touched any
+   vector input.
+
+A new well-known address or routing row is a minor bump; a constant that only
+tunes timing is a patch bump.
+
 ## What this means in practice
 
 - **To add or fix a parameter, effect type, or CC**: edit the relevant
   `spec/*.toml`, run `codegen/generate.py`, and commit. All three languages gain
   it at once.
+- **To track a new field in the device state**: add its address to
+  `[well_known]` in `parameters.toml` if it lacks a key, add a `[[route]]` row to
+  `state.toml`, regenerate, then teach each language's fold the new `Field`
+  variant — the compiler (or Python's coverage test) points at the gap.
 - **To change wire behavior**: update the logic in each implementation and add a
   vector to `spec/vectors/` that pins the new behavior. The vector is the
   contract; the three implementations follow it.

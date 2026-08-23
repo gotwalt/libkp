@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.6.0")
+        XCTAssertEqual(Generated.specVersion, "0.7.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file

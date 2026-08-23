@@ -3,7 +3,7 @@
 import Foundation
 
 public enum Generated {
-    public static let specVersion: String = "0.6.0"
+    public static let specVersion: String = "0.7.0"
     public static let port: UInt16 = 5727
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15
@@ -98,6 +98,13 @@ public enum Generated {
     public static let meterCount: Int = 11
     public static let currentBankAddress: UInt32 = 100701
     public static let currentRigSlotAddress: UInt32 = 100702
+    public static let stringRigAuthor: UInt8 = 0x02
+    public static let stringRigDate: UInt8 = 0x03
+    public static let stringRigComment: UInt8 = 0x04
+    public static let stringAmpName: UInt8 = 0x0a
+    public static let stringCabinetName: UInt8 = 0x20
+    public static let cabinetPage: UInt8 = 0x0c
+    public static let cabinetOnNumber: UInt8 = 0x02
     public static let meterPage: UInt8 = 0x7c
     public static let meterFirstNumber: UInt8 = 0x4e
     public static let meterUpdateRateHz: Int = 20
@@ -429,6 +436,80 @@ public enum Generated {
         MeterField(index: 9, number: 87, id: "loudness", name: "Loudness (slow RMS)", render: "bar"),
         MeterField(index: 10, number: 88, id: "unused_v10", name: "(unused)", render: "extra"),
     ]
+    /// The state routing table, sorted by address (spec/state.toml).
+    public static let stateRoutes: [Route] = [
+        Route(address: 1, field: .rigName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 2, field: .rigAuthor, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 3, field: .rigDate, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 4, field: .rigComment, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 10, field: .ampName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 32, field: .cabinetName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 80, field: .morphButton, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 119, field: .morphPosition, slot: nil, kind: .u14, lane: .slow, wire: .control, dedupe: true, request: false),
+        Route(address: 512, field: .tempoBpm, slot: nil, kind: .bpm, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 513, field: .rigVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 1282, field: .ampOn, slot: nil, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 1284, field: .ampGain, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 1538, field: .cabinetOn, slot: nil, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 6400, field: .effectType, slot: 0, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6403, field: .effectOn, slot: 0, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6404, field: .effectMix, slot: 0, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 6528, field: .effectType, slot: 1, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6531, field: .effectOn, slot: 1, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6532, field: .effectMix, slot: 1, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 6656, field: .effectType, slot: 2, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6659, field: .effectOn, slot: 2, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6660, field: .effectMix, slot: 2, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 6784, field: .effectType, slot: 3, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6787, field: .effectOn, slot: 3, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 6788, field: .effectMix, slot: 3, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 7168, field: .effectType, slot: 4, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7171, field: .effectOn, slot: 4, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7172, field: .effectMix, slot: 4, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 7424, field: .effectType, slot: 5, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7427, field: .effectOn, slot: 5, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7428, field: .effectMix, slot: 5, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 7680, field: .effectType, slot: 6, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7683, field: .effectOn, slot: 6, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7684, field: .effectMix, slot: 6, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 7808, field: .effectType, slot: 7, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7811, field: .effectOn, slot: 7, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 7812, field: .effectMix, slot: 7, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
+        Route(address: 15872, field: .beatPulse, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15887, field: .tunerDeviance, slot: nil, kind: .u14, lane: .fast, wire: .stream, dedupe: true, request: false),
+        Route(address: 15950, field: .status, slot: 0, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15951, field: .status, slot: 1, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15952, field: .status, slot: 2, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15953, field: .status, slot: 3, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15954, field: .status, slot: 4, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15955, field: .status, slot: 5, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15956, field: .status, slot: 6, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15957, field: .status, slot: 7, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15958, field: .status, slot: 8, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15959, field: .status, slot: 9, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 15960, field: .status, slot: 10, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
+        Route(address: 16084, field: .tunerNote, slot: nil, kind: .u7, lane: .slow, wire: .stream, dedupe: true, request: false),
+        Route(address: 16256, field: .mainVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 16257, field: .headphoneVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 16258, field: .monitorVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19200, field: .bankRigName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19201, field: .bankRigName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19202, field: .bankRigName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19203, field: .bankRigName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19204, field: .bankRigName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19205, field: .bankAmpName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19206, field: .bankAmpName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19207, field: .bankAmpName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19208, field: .bankAmpName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19209, field: .bankAmpName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19210, field: .bankCabinetName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19211, field: .bankCabinetName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19212, field: .bankCabinetName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19213, field: .bankCabinetName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 19214, field: .bankCabinetName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 100701, field: .currentBank, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 100702, field: .currentRigSlot, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true),
+    ]
 }
 
 public struct NonEffectKey: Hashable {
@@ -449,5 +530,82 @@ public struct EffectCategory {
     public let min: UInt16
     public let max: UInt16
     public let name: String
+}
+
+/// One row of the state routing table: a flat address and how the tree folds it.
+public struct Route: Hashable, Sendable {
+    /// A field of the device-state tree that a routed address writes (spec/state.toml).
+    public enum Field: String, CaseIterable, Hashable, Sendable {
+        case rigName = "rig_name"
+        case rigAuthor = "rig_author"
+        case rigDate = "rig_date"
+        case rigComment = "rig_comment"
+        case ampName = "amp_name"
+        case cabinetName = "cabinet_name"
+        case morphButton = "morph_button"
+        case morphPosition = "morph_position"
+        case tempoBpm = "tempo_bpm"
+        case rigVolume = "rig_volume"
+        case ampOn = "amp_on"
+        case ampGain = "amp_gain"
+        case cabinetOn = "cabinet_on"
+        case effectType = "effect_type"
+        case effectOn = "effect_on"
+        case effectMix = "effect_mix"
+        case beatPulse = "beat_pulse"
+        case tunerDeviance = "tuner_deviance"
+        case status = "status"
+        case tunerNote = "tuner_note"
+        case mainVolume = "main_volume"
+        case headphoneVolume = "headphone_volume"
+        case monitorVolume = "monitor_volume"
+        case bankRigName = "bank_rig_name"
+        case bankAmpName = "bank_amp_name"
+        case bankCabinetName = "bank_cabinet_name"
+        case currentBank = "current_bank"
+        case currentRigSlot = "current_rig_slot"
+    }
+
+    /// How a routed value decodes before it is stored.
+    public enum Kind: String, CaseIterable, Hashable, Sendable {
+        case u14 = "u14"
+        case u16 = "u16"
+        case u7 = "u7"
+        case bool = "bool"
+        case text = "text"
+        case bpm = "bpm"
+        case multi = "multi"
+    }
+
+    /// Which update lane a route feeds: FAST (event only) or SLOW (snapshot).
+    public enum Lane: String, CaseIterable, Hashable, Sendable {
+        case fast = "fast"
+        case slow = "slow"
+    }
+
+    /// Which channel may write a route: the MIDI3 stream, the CBOR control channel, or both.
+    public enum Wire: String, CaseIterable, Hashable, Sendable {
+        case stream = "stream"
+        case control = "control"
+        case both = "both"
+    }
+
+    public let address: UInt32
+    public let field: Field
+    /// The per-slot index for expanded rows: effect slot, bank-preview slot, or
+    /// element index within a spanned block.
+    public let slot: UInt8?
+    public let kind: Kind
+    public let lane: Lane
+    public let wire: Wire
+    public let dedupe: Bool
+    public let request: Bool
+    public init(
+        address: UInt32, field: Field, slot: UInt8?, kind: Kind, lane: Lane, wire: Wire,
+        dedupe: Bool, request: Bool
+    ) {
+        self.address = address; self.field = field; self.slot = slot; self.kind = kind
+        self.lane = lane; self.wire = wire; self.dedupe = dedupe; self.request = request
+    }
 }
 
