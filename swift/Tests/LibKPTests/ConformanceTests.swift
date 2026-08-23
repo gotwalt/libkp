@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.5.0")
+        XCTAssertEqual(Generated.specVersion, "0.6.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file
@@ -184,6 +184,24 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(Nrpn.extDecode(bytes), expected, "ext_decode \(entry.string("bytes"))")
             // The inverse must reproduce the input bytes.
             XCTAssertEqual(Nrpn.extEncode(expected, count: bytes.count), bytes)
+        }
+
+        for entry in vector.cases("request_extended_param") {
+            let built = Nrpn.requestExtendedParam(
+                product: UInt8(entry.int("product")), device: UInt8(entry.int("device")),
+                address: UInt32(entry.int("address")))
+            XCTAssertEqual(Fmt.hex(built), entry.string("hex"), "request_extended_param")
+        }
+
+        for entry in vector.cases("parse_extended_param") {
+            let message = try hex(entry.string("hex"))
+            let parsed = Nrpn.parseExtendedParam(message)
+            guard let expected = entry["expected"] as? [String: Any] else {
+                XCTAssertNil(parsed, "parse_extended_param should reject \(entry.string("hex"))")
+                continue
+            }
+            XCTAssertEqual(parsed?.address, UInt32(expected.int("address")))
+            XCTAssertEqual(parsed?.value, UInt64(expected.int("value")))
         }
 
         for entry in vector.cases("parse_extended_string") {
@@ -368,8 +386,10 @@ final class ConformanceTests: XCTestCase {
         if let gain = expect["amp_gain"] as? NSNumber {
             XCTAssertEqual(state.amp.gain, gain.uint16Value, "\(caseName): amp_gain")
         }
-        if let morph = expect["morph"] as? NSNumber {
-            XCTAssertEqual(state.morph, morph.uint16Value, "\(caseName): morph")
+        // A JSON null asserts the morph is still unset — the MIDI3 stream never
+        // carries the position, so most messages must leave it alone.
+        if let morph = expect["morph"] {
+            XCTAssertEqual(state.morph, (morph as? NSNumber)?.uint16Value, "\(caseName): morph")
         }
         if let note = expect["tuner_note"] as? NSNumber {
             XCTAssertEqual(state.tuner.note, note.uint8Value, "\(caseName): tuner_note")
@@ -378,15 +398,21 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(
                 state.tuner.deviance, deviance.uint16Value, "\(caseName): tuner_deviance")
         }
-        if let bank = expect["current_bank"] as? NSNumber {
-            XCTAssertEqual(state.currentBank, bank.uint16Value, "\(caseName): current_bank")
-        }
-        if let slot = expect["current_rig_slot"] as? NSNumber {
-            XCTAssertEqual(state.currentRigSlot, slot.uint16Value, "\(caseName): current_rig_slot")
-        }
-        if let index = expect["current_rig_index"] as? NSNumber {
+        // A JSON null here asserts the half is still unknown — the device pushes
+        // only the index that changed.
+        if let bank = expect["current_bank"] {
             XCTAssertEqual(
-                state.currentRigIndex, index.uint16Value, "\(caseName): current_rig_index")
+                state.currentBank, (bank as? NSNumber)?.uint16Value, "\(caseName): current_bank")
+        }
+        if let slot = expect["current_rig_slot"] {
+            XCTAssertEqual(
+                state.currentRigSlot, (slot as? NSNumber)?.uint16Value,
+                "\(caseName): current_rig_slot")
+        }
+        if let index = expect["current_rig_index"] {
+            XCTAssertEqual(
+                state.currentRigIndex, (index as? NSNumber)?.uint16Value,
+                "\(caseName): current_rig_index")
         }
         if let mainVolume = expect["main_volume"] as? NSNumber {
             XCTAssertEqual(
@@ -483,6 +509,8 @@ final class ConformanceTests: XCTestCase {
             } else {
                 XCTAssertNil(snap.currentRigSlot, "\(name): current_rig_slot")
             }
+            XCTAssertEqual(
+                snap.morph, (expect["morph"] as? NSNumber)?.uint16Value, "\(name): morph")
             if let strings = expect["strings"] as? [[String: Any]] {
                 XCTAssertEqual(snap.strings.count, strings.count, "\(name): strings count")
                 for (i, expected) in strings.enumerated() where i < snap.strings.count {

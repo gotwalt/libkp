@@ -17,8 +17,14 @@ the interest is in how they stack.
 
 Discovery and the session share the same port number; the client broadcasts its
 poll from UDP 5727 and reads replies there, then opens a TCP connection to the
-discovered address on the same port. Only one controller may hold a session at a
-time — a Profiler that is already connected refuses new sessions.
+discovered address on the same port.
+
+**Several sessions may be open at once.** A client that wants the whole device
+holds two — the MIDI3 stream and the CBOR channel — because neither carries
+everything; see [Channels and data paths](11-channels-and-data-paths.md). What
+the device will not survive is connection *churn*: opening and closing in quick
+succession stops it accepting TCP until it is power-cycled. Space connections by
+`connection_cooldown_ms` and leave them open.
 
 Source: [`../spec/protocol.toml`](../spec/protocol.toml), `[transport]`.
 
@@ -30,6 +36,8 @@ Source: [`../spec/protocol.toml`](../spec/protocol.toml), `[transport]`.
   ├───────────────────────────────────────────────────────────┤
   │  Message universe       Kemper SysEx  F0 00 20 33 … F7     │  docs 05, 07
   │                         + raw MIDI CC / Program Change     │
+  │                         (the CBOR channel replaces these   │  docs 06, 11
+  │                          two layers with CBOR items)       │
   ├───────────────────────────────────────────────────────────┤
   │  Framing                MIDI3  4-byte frames [tag][b0b1b2] │  doc 04
   ├───────────────────────────────────────────────────────────┤

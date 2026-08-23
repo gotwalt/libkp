@@ -28,11 +28,14 @@ non-mutating.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import struct
+from collections import deque
 from dataclasses import dataclass, field
 
 from . import _generated as gen
-from .errors import ConnectionClosedError
+from ._broadcast import Broadcast
+from .errors import ConnectionClosedError, SessionError
 from .protocol import PORT
 from .session import PROTOCOL_CBOR_CONTROL, Session
 
@@ -46,7 +49,9 @@ __all__ = [
     "is_sensitive",
     "StateSnapshot",
     "extract_snapshot",
+    "numeric_values",
     "fetch_state_snapshot",
+    "CborSession",
 ]
 
 #: Nesting limit — guards the recursive descent against hostile/desynced input.
@@ -486,23 +491,42 @@ def is_sensitive(addr: int) -> bool:
 
 @dataclass(slots=True)
 class StateSnapshot:
-    """The device's current position and the names carried alongside it, read out
-    of a state dump. Both indices are 0-based; either is ``None`` if the dump did
-    not carry it."""
+    """The device's current position and the values carried alongside it, read
+    out of a state dump. Both indices are 0-based; any field is ``None`` if the
+    dump did not carry it."""
 
     #: Current bank, 0-based (:data:`libkp._generated.CURRENT_BANK_ADDRESS`).
     current_bank: int | None = None
     #: Current rig slot within the bank, 0-based
     #: (:data:`libkp._generated.CURRENT_RIG_SLOT_ADDRESS`).
     current_rig_slot: int | None = None
+    #: The morph position (0 = base, 16383 = fully morphed), at
+    #: :data:`libkp._generated.MORPH_ADDRESS`.
+    #:
+    #: This dump is the only way a client that is not holding a CBOR session open
+    #: can learn it: the position is never sent on the MIDI3 stream, and answers
+    #: neither a ``$41`` nor a ``$46`` request. It is a live value, so it is true
+    #: as of the read and stale the moment anyone morphs.
+    morph: int | None = None
     #: String parameters the dump carried, as ``(address, text)`` in document
     #: order, with any sensitive value redacted. Useful for the current rig name
     #: (address 1) and the bank name.
     strings: list[tuple[int, str]] = field(default_factory=list)
 
     def is_complete(self) -> bool:
-        """True once both indices are known — the reader can stop early."""
-        return self.current_bank is not None and self.current_rig_slot is not None
+        """True once every value this snapshot reads is known -- the point at
+        which the reader may stop before the dump has finished streaming.
+
+        The morph counts: it arrives later in the dump than the two indices, so
+        stopping at those would truncate the read just short of it and leave
+        :attr:`morph` ``None`` on a device that reported it perfectly well. Every
+        dump observed carries all three, at base as readily as morphed.
+        """
+        return (
+            self.current_bank is not None
+            and self.current_rig_slot is not None
+            and self.morph is not None
+        )
 
     def string(self, addr: int) -> str | None:
         """The string parameter at ``addr``, if the dump carried one."""
@@ -519,19 +543,46 @@ def _note_index(snap: StateSnapshot, addr: int, value: int) -> None:
         snap.current_bank = v
     elif addr == gen.CURRENT_RIG_SLOT_ADDRESS:
         snap.current_rig_slot = v
+    elif addr == gen.MORPH_ADDRESS:
+        snap.morph = v
 
 
 def extract_snapshot(items: list) -> StateSnapshot:
-    """Read the current bank, rig slot and string parameters out of decoded dump
-    items.
+    """Read the current bank, rig slot, morph and string parameters out of decoded
+    dump items."""
+    snap = StateSnapshot()
 
-    Scans the two index-bearing shapes: a single ``[1, addr, value]``, and a
+    def numeric(addr: int, value: int) -> None:
+        _note_index(snap, addr, value)
+
+    def text(addr: int, value: str) -> None:
+        snap.strings.append((addr, gen.REDACTED_PLACEHOLDER if is_sensitive(addr) else value))
+
+    _walk(items, numeric, text)
+    return snap
+
+
+def numeric_values(items: list) -> list[tuple[int, int]]:
+    """Every numeric ``(address, value)`` pair the items carry, in document order.
+
+    The dump and a session's live pushes are the same shapes, so this is what a
+    :class:`CborSession` folds into a state tree as values move.
+    """
+    out: list[tuple[int, int]] = []
+    _walk(items, lambda addr, value: out.append((addr, value)), lambda addr, value: None)
+    return out
+
+
+def _walk(items: list, numeric, text) -> None:
+    """Walk decoded items, handing each numeric and string element to a callback.
+
+    Scans the value-bearing shapes: a single ``[1, addr, value]``, a
     consecutive-run ``[2, base, v0, v1, …]`` where the whole run is walked because
     the target address can fall anywhere inside it (at session open the position
-    arrives inside one run). A leading negative source-flag word, if present, is
-    skipped exactly as :func:`param_write` never emits one.
+    arrives inside one run), and a string ``[4, addr, text]``. A leading negative
+    source-flag word, if present, is skipped exactly as :func:`param_write` never
+    emits one.
     """
-    snap = StateSnapshot()
     for item in items:
         fields = _as_array(item)
         if fields is None:
@@ -546,20 +597,17 @@ def extract_snapshot(items: list) -> StateSnapshot:
         if selector == gen.CBOR_SELECTOR_SINGLE:
             value = _as_int(rest[2]) if len(rest) > 2 else None
             if addr is not None and value is not None:
-                _note_index(snap, addr, value)
+                numeric(addr, value)
         elif selector == gen.CBOR_SELECTOR_MULTI:
             if addr is not None:
                 for i, raw in enumerate(rest[2:]):
                     v = _as_int(raw)
                     if v is not None:
-                        _note_index(snap, addr + i, v)
+                        numeric(addr + i, v)
         elif selector == gen.CBOR_SELECTOR_STRING:
-            text = rest[2] if len(rest) > 2 else None
-            if addr is not None and isinstance(text, str) and text:
-                snap.strings.append(
-                    (addr, gen.REDACTED_PLACEHOLDER if is_sensitive(addr) else text)
-                )
-    return snap
+            value = rest[2] if len(rest) > 2 else None
+            if addr is not None and isinstance(value, str) and value:
+                text(addr, value)
 
 
 #: Default time to keep reading the dump before giving up on the indices.
@@ -570,13 +618,16 @@ async def fetch_state_snapshot(
     ip: str, *, port: int = PORT, timeout: float = DEFAULT_TIMEOUT
 ) -> StateSnapshot:
     """Open a fresh CBOR session to ``ip``, trigger the state dump, and read back
-    the current bank and rig slot.
+    the current bank, rig slot and morph position.
 
     This opens its **own** short-lived connection, independent of any
     :class:`libkp.model.DeviceModel`, and closes it on return. The device crashes
-    under connection churn, so run this sequentially — before, not concurrently
-    with, a streaming session — and sparingly. Returns as soon as both indices are
-    known or ``timeout`` elapses.
+    under connection churn, so run this sparingly. Returns as soon as every value
+    it reads is known (see :meth:`StateSnapshot.is_complete`) or ``timeout``
+    elapses.
+
+    For a *live* view, and to run alongside a streaming session rather than
+    before it, use :class:`CborSession`.
     """
     session = await Session.connect(ip, port)
     try:
@@ -605,3 +656,126 @@ async def fetch_state_snapshot(
         return extract_snapshot(items)
     finally:
         await session.close()
+
+
+class CborSession:
+    """A **live** session on the native CBOR channel: it opens, asks for the state
+    dump, and then streams every value the device pushes until it is closed.
+
+    This is the counterpart to :func:`fetch_state_snapshot`, which reads one dump
+    and hangs up. Hold this open instead when you want to *watch* the values the
+    MIDI3 stream never carries -- the morph position above all, which is pushed
+    here at about 40 Hz while a morph ramps and is unreachable by any request on
+    the streaming session.
+
+    **It may run alongside a** :class:`~libkp.model.DeviceModel`. The device's
+    fragility is about connection *churn*, not concurrency: two read-only sessions
+    coexist happily, and the pair is how a client gets both the meter lane and the
+    morph. Space the two connections by
+    :data:`~libkp.session.CONNECTION_COOLDOWN` when opening them, and do not
+    reopen either in a tight loop.
+
+    Read-only. The one thing it writes is the state-dump trigger, which is a flag
+    the device already carries -- see ``docs/06``.
+    """
+
+    #: How long a read waits before looping. Short, so :meth:`close` takes effect
+    #: promptly.
+    READ_IDLE = 0.25
+    #: How many pre-subscription values to hold. The state dump is a couple of
+    #: thousand; this keeps the most recent of them rather than growing without
+    #: bound if nobody ever subscribes.
+    BACKLOG_LIMIT = 4096
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._decoder = Decoder()
+        self._updates = Broadcast()
+        self._task: asyncio.Task | None = None
+        self._closed = False
+        #: Values decoded before anyone subscribed, replayed to the first
+        #: subscriber. :meth:`connect` returns only after the dump has been asked
+        #: for, so the opening burst can land before the caller has had a chance
+        #: to call :meth:`updates` -- and that burst is the only place several
+        #: values, the morph among them, appear until something moves them.
+        self._backlog: deque[tuple[int, int]] = deque(maxlen=self.BACKLOG_LIMIT)
+
+    @classmethod
+    async def connect(cls, ip: str, port: int = PORT) -> CborSession:
+        """Connect to ``ip:port``, open the CBOR protocol, ask for the state dump,
+        and start streaming.
+
+        Returns once the session is established; values arrive on
+        :meth:`updates`. Subscribe *before* awaiting them, or the dump's own burst
+        is missed.
+        """
+        session = await Session.connect(ip, port)
+        # Everything up to the spawned task is inside the guard: a socket left
+        # open with no owner is exactly the churn this device dies of.
+        try:
+            outcome = await session.handshake([PROTOCOL_CBOR_CONTROL], _READ_IDLE)
+            await session.write_session_preamble()
+            self = cls(session)
+            self._emit(self._decoder.push(outcome.response_tail()))
+            # Writing one item asks for the whole state; the reply is the burst
+            # the stream opens with.
+            await session.write_all(to_vec(state_dump_request()))
+            loop = asyncio.get_running_loop()
+            self._task = loop.create_task(self._ingest())
+            return self
+        except BaseException:
+            await session.close()
+            raise
+
+    def updates(self) -> asyncio.Queue:
+        """A queue of ``(address, value)`` pairs, in arrival order.
+
+        The first subscriber also receives whatever arrived before it subscribed,
+        so the state dump is not lost to the gap between :meth:`connect` and this
+        call.
+        """
+        queue = self._updates.subscribe()
+        while self._backlog:
+            queue.put_nowait(self._backlog.popleft())
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        """Drop a queue returned by :meth:`updates`."""
+        self._updates.unsubscribe(queue)
+
+    async def close(self) -> None:
+        """Close the socket and finish the stream."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+        await self._session.close()
+
+    async def __aenter__(self) -> CborSession:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+    async def _ingest(self) -> None:
+        try:
+            while True:
+                try:
+                    chunk = await self._session.read_once(self.READ_IDLE, 64 * 1024)
+                except SessionError:
+                    return
+                if chunk:
+                    self._emit(self._decoder.push(chunk))
+        except asyncio.CancelledError:
+            raise
+
+    def _emit(self, items: list) -> None:
+        for pair in numeric_values(items):
+            if self._updates.empty():
+                self._backlog.append(pair)
+            else:
+                self._updates.send(pair)

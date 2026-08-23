@@ -1,6 +1,6 @@
 """GENERATED FILE — DO NOT EDIT. Edit spec/*.toml and run codegen/generate.py."""
 
-SPEC_VERSION = "0.5.0"
+SPEC_VERSION = "0.6.0"
 
 PORT = 5727
 CONNECT_TIMEOUT_SECS = 5
@@ -56,6 +56,7 @@ FN_RENDERED_STRING_REPLY = 0x3c
 FN_REQUEST_SINGLE = 0x41
 FN_REQUEST_MULTI = 0x42
 FN_REQUEST_STRING = 0x43
+FN_REQUEST_EXT_PARAM = 0x46
 FN_REQUEST_EXT_STRING = 0x47
 FN_REQUEST_RENDERED_STRING = 0x7c
 FN_BEACON = 0x7e
@@ -95,7 +96,9 @@ BANK_RIG_NAME_BASE = 0x00
 BANK_AMP_NAME_BASE = 0x05
 BANK_CABINET_NAME_BASE = 0x0a
 PAGE_MORPH = 0x00
-MORPH_NUMBER = 0x0b
+MORPH_NUMBER = 0x77
+MORPH_BUTTON_NUMBER = 0x50
+MORPH_ADDRESS = 0x77
 PAGE_TUNER_NOTE = 0x7d
 TUNER_NOTE_NUMBER = 0x54
 TUNER_IN_TUNE_CENTER = 8192
@@ -277,7 +280,7 @@ NON_EFFECT_PARAMS = {
 
 STRING_TAGS = {1: "Rig Name", 2: "Rig Author", 3: "Rig Creation Date", 4: "Rig Comment", 10: "Amp Name", 11: "Amp Author", 14: "Amp Location", 15: "Amp Manufacturer", 16: "Amp Comment", 18: "Amp Model", 19: "Amp Channel", 20: "Pickup Type", 21: "Year of Production", 32: "Cabinet Name", 33: "Cabinet Author", 36: "Cabinet Location", 37: "Cabinet Manufacturer", 38: "Microphone Model", 39: "Cabinet Comment", 40: "Microphone Position", 41: "Speaker Configuration", 42: "Cabinet Model", 44: "Speaker Manufacturer", 45: "Speaker Model"}
 
-PAGE0_NUMERIC = {0x0b: "Morph State"}
+PAGE0_NUMERIC = {0x50: "Morph Button", 0x77: "Morph Position"}
 
 EFFECT_TYPES = {
     0: "empty",

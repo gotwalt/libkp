@@ -11,8 +11,10 @@ from libkp.state import (
     ApplyOutcome,
     BeatPulse,
     Connection,
+    CurrentPosition,
     DeviceState,
     EffectChanged,
+    MorphButton,
     MorphChanged,
     ParamChanged,
     RealtimeStatus,
@@ -325,5 +327,59 @@ def test_non_kemper_messages_are_ignored():
     assert state.apply(b"") == ApplyOutcome.empty()
     # A $01 with no value pair is ignored.
     assert state.apply(sysex(0x00, 0x00, 0x01, 0x0A, 4, b"")) == ApplyOutcome.empty()
-    # $06 extended params are not decoded.
+    # A $06 too short to carry its 5-byte address and value is ignored.
     assert state.apply(sysex(0x00, 0x00, 0x06, 0x0A, 4, b"\x00\x00")) == ApplyOutcome.empty()
+
+
+def test_morph_position_is_slow():
+    state = DeviceState()
+    out = state.apply(set_single(0x00, 0x00, gen.PAGE_MORPH, gen.MORPH_NUMBER, 8192))
+    assert out.slow_changed
+    assert out.events == [MorphChanged(8192)]
+    assert state.morph == 8192
+
+
+def test_morph_button_is_momentary():
+    state = DeviceState()
+    press = state.apply(set_single(0x00, 0x00, gen.PAGE_MORPH, gen.MORPH_BUTTON_NUMBER, 1))
+    assert press.events == [MorphButton(on=True)]
+    assert not press.slow_changed, "the button stores nothing"
+    release = state.apply(set_single(0x00, 0x00, gen.PAGE_MORPH, gen.MORPH_BUTTON_NUMBER, 0))
+    assert release.events == [MorphButton(on=False)]
+    # The button says a morph happened; it never says where the fader sits.
+    assert state.morph is None
+
+
+def test_morph_is_not_at_0x0b():
+    """0x0B came from a third-party mapping and is wrong: the device answers a
+    request there with a constant 0 whether the rig is morphed or at base, and
+    never pushes it. Nothing may land in ``morph`` from it, or the same silent
+    mistake returns -- a value that simply never moves."""
+    state = DeviceState()
+    out = state.apply(set_single(0x00, 0x00, gen.PAGE_MORPH, 0x0B, 16383))
+    assert state.morph is None
+    assert not out.slow_changed
+    assert out.events == [ParamChanged(0x00, 0x0B, 16383)]
+
+
+def test_apply_cbor_routes_the_same_as_the_stream():
+    """The two channels are one event universe: a value arriving over CBOR lands
+    in the same field, and raises the same event, as one arriving over MIDI3."""
+    state = DeviceState()
+    morph = state.apply_cbor(gen.MORPH_ADDRESS, 8192)
+    assert morph.events == [MorphChanged(8192)]
+    assert morph.slow_changed
+    assert state.morph == 8192
+
+    bank = state.apply_cbor(gen.CURRENT_BANK_ADDRESS, 3)
+    assert bank.events == [CurrentPosition(bank=3, slot=None)]
+    slot = state.apply_cbor(gen.CURRENT_RIG_SLOT_ADDRESS, 4)
+    assert slot.events == [CurrentPosition(bank=3, slot=4)]
+    assert state.current_rig_index == 19
+
+    # An unchanged value is not a change, and an unknown address is ignored.
+    assert state.apply_cbor(gen.MORPH_ADDRESS, 8192) == ApplyOutcome.empty()
+    assert state.apply_cbor(102_405, 31) == ApplyOutcome.empty()
+    # A value too wide for the field is dropped, not truncated.
+    assert state.apply_cbor(gen.MORPH_ADDRESS, 70_000) == ApplyOutcome.empty()
+    assert state.morph == 8192

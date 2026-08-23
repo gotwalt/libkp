@@ -9,7 +9,8 @@
 //! - [`session`] — TCP connect + the line-based protocol handshake.
 //! - [`midi3`] — the 4-byte stream framing that carries MIDI over the session.
 //! - [`cbor`] — the device's native CBOR channel and the state-dump snapshot
-//!   ([`cbor::StateSnapshot::fetch`]) that reads the current bank and rig slot.
+//!   ([`cbor::StateSnapshot::fetch`]) that reads the current bank, rig slot and
+//!   morph, and a live [`cbor::CborSession`] that streams what MIDI3 omits.
 //! - [`nrpn`] — Kemper SysEx/NRPN builders and parsers.
 //! - [`control`] — the 7-bit CC / PC / Bank Select control vocabulary.
 //! - [`params`] / [`registry`] — offline name and descriptor lookups.
@@ -58,7 +59,10 @@ pub const PORT: u16 = generated::PORT;
 /// The version of the shared protocol spec this crate was generated against.
 pub const SPEC_VERSION: &str = generated::SPEC_VERSION;
 
-pub use cbor::{StateSnapshot, extract_snapshot, param_write, state_dump_request};
+pub use cbor::{
+    CborSession, CborUpdate, StateSnapshot, extract_snapshot, numeric_values, param_write,
+    state_dump_request,
+};
 pub use control::{Control, ModuleSlot, program_change, slot_enable_cc};
 pub use discovery::{DiscoveryPort, Options, Reply, discover, find_first};
 pub use error::{DiscoverError, ParseError, SessionError};

@@ -39,19 +39,22 @@ def test_connect_performs_the_read_only_initial_sync():
         async with FakeDevice() as device:
             model = await DeviceModel.connect("127.0.0.1", device.port)
             try:
-                await wait_for(lambda: len(device.received) >= 37)
+                await wait_for(lambda: len(device.received) >= 39)
             finally:
                 await model.close()
             return device.received
 
     received = run(scenario())
-    # Six string-tag requests, a Type + On/Off request per effect slot, then the
-    # 15 bank-preview extended-string requests (5 slots x rig/amp/cabinet).
-    assert len(received) == 6 + 16 + 15
-    assert all(m[6] in (0x43, 0x41, 0x47) for m in received), "sync must be read-only"
+    # Six string-tag requests, a Type + On/Off request per effect slot, the 15
+    # bank-preview extended-string requests (5 slots x rig/amp/cabinet), then the
+    # two extended-param requests for the current bank and rig slot.
+    assert len(received) == 6 + 16 + 15 + 2
+    assert all(m[6] in (0x43, 0x41, 0x46, 0x47) for m in received), "sync must be read-only"
     assert received[0] == bytes.fromhex("f0002033007f43000001f7")  # Rig Name
     assert received[6][6] == 0x41
     assert received[22][6] == 0x47  # first bank-preview ext-string request
+    assert received[37][6] == 0x46  # current bank
+    assert received[38][6] == 0x46  # current rig slot
 
 
 def test_connect_can_skip_the_initial_sync():

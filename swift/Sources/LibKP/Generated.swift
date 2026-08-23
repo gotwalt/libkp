@@ -3,7 +3,7 @@
 import Foundation
 
 public enum Generated {
-    public static let specVersion: String = "0.5.0"
+    public static let specVersion: String = "0.6.0"
     public static let port: UInt16 = 5727
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15
@@ -51,6 +51,7 @@ public enum Generated {
     public static let fnRequestSingle: UInt8 = 0x41
     public static let fnRequestMulti: UInt8 = 0x42
     public static let fnRequestString: UInt8 = 0x43
+    public static let fnRequestExtParam: UInt8 = 0x46
     public static let fnRequestExtString: UInt8 = 0x47
     public static let fnRequestRenderedString: UInt8 = 0x7c
     public static let fnBeacon: UInt8 = 0x7e
@@ -87,7 +88,9 @@ public enum Generated {
     public static let bankAmpNameBase: UInt8 = 0x05
     public static let bankCabinetNameBase: UInt8 = 0x0a
     public static let pageMorph: UInt8 = 0x00
-    public static let morphNumber: UInt8 = 0x0b
+    public static let morphNumber: UInt8 = 0x77
+    public static let morphButtonNumber: UInt8 = 0x50
+    public static let morphAddress: UInt32 = 119
     public static let pageTunerNote: UInt8 = 0x7d
     public static let tunerNoteNumber: UInt8 = 0x54
     public static let tunerInTuneCenter: UInt16 = 8192
@@ -306,7 +309,7 @@ public enum Generated {
         NonEffectKey(0x96, 14): "Bank Cabinet Name",
     ]
     public static let stringTags: [UInt8: String] = [1: "Rig Name", 2: "Rig Author", 3: "Rig Creation Date", 4: "Rig Comment", 10: "Amp Name", 11: "Amp Author", 14: "Amp Location", 15: "Amp Manufacturer", 16: "Amp Comment", 18: "Amp Model", 19: "Amp Channel", 20: "Pickup Type", 21: "Year of Production", 32: "Cabinet Name", 33: "Cabinet Author", 36: "Cabinet Location", 37: "Cabinet Manufacturer", 38: "Microphone Model", 39: "Cabinet Comment", 40: "Microphone Position", 41: "Speaker Configuration", 42: "Cabinet Model", 44: "Speaker Manufacturer", 45: "Speaker Model"]
-    public static let page0Numeric: [UInt8: String] = [0x0b: "Morph State"]
+    public static let page0Numeric: [UInt8: String] = [0x50: "Morph Button", 0x77: "Morph Position"]
     public static let effectTypes: [UInt16: String] = [
         0: "empty",
         1: "Wah Wah",

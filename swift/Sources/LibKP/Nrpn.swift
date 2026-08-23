@@ -86,6 +86,27 @@ public enum Nrpn {
         )
     }
 
+    /// Request an extended-address numeric parameter (function `$46`) at a flat
+    /// address (`page * 128 + number`, or an extended address at or above
+    /// 16384). The device replies with a `$06` Extended Parameter — or a plain
+    /// `$01` when the address fits in 14 bits. Read-only.
+    ///
+    /// Layout mirrors `$06` minus the value:
+    /// `F0 00 20 33 <prod> <dev> 46 <inst=00> <5-byte address> F7`. This is how
+    /// the device's current bank and rig slot are read on the streaming session
+    /// — the addresses are ``Generated/currentBankAddress`` and
+    /// ``Generated/currentRigSlotAddress``.
+    public static func requestExtendedParam(
+        product: UInt8, device: UInt8, address: UInt32
+    ) -> [UInt8] {
+        var msg: [UInt8] = [0xF0]
+        msg.append(contentsOf: Generated.manufacturerId)
+        msg.append(contentsOf: [product, device, Generated.fnRequestExtParam, 0x00])
+        msg.append(contentsOf: extEncode(UInt64(address), count: 5))
+        msg.append(0xF7)
+        return msg
+    }
+
     /// Request an extended string parameter (function `$47`) at a flat address
     /// (`page * 128 + number`). The device replies with a `$07` extended string —
     /// or a plain `$03` when the address is below 16384. Read-only.
@@ -222,6 +243,25 @@ public enum Nrpn {
         else { return nil }
         let address = UInt32(truncatingIfNeeded: extDecode(Array(msg[8..<13])))
         return (address, Fmt.textUntilNul(msg[13..<(msg.count - 1)]))
+    }
+
+    /// Parse a function-`$06` Extended Parameter message:
+    /// `F0 00 20 33 <prod> <dev> 06 <inst> <5-byte address> <5-byte value> F7`.
+    ///
+    /// Both fields use the 5×7 extended scheme, so the value spans 35 bits
+    /// rather than the 14 a `$01` carries — hence the 64-bit value. The device sends these unasked when
+    /// an extended-address parameter changes, and in reply to
+    /// ``requestExtendedParam(product:device:address:)``.
+    public static func parseExtendedParam(_ msg: [UInt8]) -> (address: UInt32, value: UInt64)? {
+        // F0 + mfr(3) + prod + dev + fn + inst + addr(5) + value(5) + F7 = 19.
+        guard msg.count >= 19,
+            msg[0] == 0xF0,
+            Array(msg[1..<4]) == Generated.manufacturerId,
+            msg[6] == Generated.fnExtParam,
+            msg[msg.count - 1] == 0xF7
+        else { return nil }
+        let address = UInt32(truncatingIfNeeded: extDecode(Array(msg[8..<13])))
+        return (address, extDecode(Array(msg[13..<18])))
     }
 
     /// Parse a `$3C` Rendered String reply — the response to

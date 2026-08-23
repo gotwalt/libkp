@@ -60,7 +60,8 @@ public actor DeviceModel {
     // MARK: - Lifecycle
 
     /// Connect to `host:5727`, open the streaming protocol, start the ingest
-    /// loop, and kick off a read-only initial sync (rig strings + effect slots).
+    /// loop, and kick off a read-only initial sync (rig strings + effect slots +
+    /// the device's current bank and rig slot).
     ///
     /// Returns once the session is established; the state fills in as the
     /// device's replies stream back. Subscribe *before* awaiting fresh events.
@@ -77,6 +78,7 @@ public actor DeviceModel {
         await model.start(tail: outcome.responseTail)
         try? await model.refreshRig()
         try? await model.refreshBank()
+        try? await model.refreshPosition()
         return model
     }
 
@@ -287,20 +289,49 @@ public actor DeviceModel {
         }
     }
 
+    /// Ask the device where it is: the current bank and rig slot, as two `$46`
+    /// extended-parameter requests. The `$06` replies fold into
+    /// ``DeviceState/currentBank`` and ``DeviceState/currentRigSlot``. Read-only.
+    ///
+    /// Only needed once, at connect: the device pushes an unsolicited `$06` for
+    /// whichever of the two changed on every subsequent rig change, whoever
+    /// caused it.
+    public func refreshPosition() async throws {
+        for address in [Generated.currentBankAddress, Generated.currentRigSlotAddress] {
+            try await send(
+                Nrpn.requestExtendedParam(
+                    product: DeviceModel.product, device: DeviceModel.device, address: address
+                ))
+        }
+    }
+
     /// Fold a ``StateSnapshot``'s current bank and rig slot into the state tree,
     /// emitting a ``DeviceEvent/currentPosition(bank:slot:)`` and broadcasting a
     /// fresh snapshot.
     ///
-    /// The MIDI3 stream never reports these indices; a controller learns them by
-    /// running ``StateSnapshot/fetch(host:port:timeout:)`` over a separate CBOR
-    /// session — which the device wants done *before* this streaming session
-    /// opens, not concurrently — and applying the result here. Only the non-`nil`
-    /// fields overwrite; a `nil` leaves the current value untouched.
+    /// For a client that already holds a ``StateSnapshot`` — read over the CBOR
+    /// channel *before* this streaming session opened — this seeds the tree
+    /// without waiting for a reply. A session that is already up should call
+    /// ``refreshPosition()`` instead and let the device answer. Only the
+    /// non-`nil` fields overwrite; a `nil` leaves the current value untouched.
     public func setCurrentPosition(bank: UInt16?, slot: UInt16?) {
         if bank != nil { state.currentBank = bank }
         if slot != nil { state.currentRigSlot = slot }
         emit(.currentPosition(bank: bank, slot: slot))
         publishSnapshot()
+    }
+
+    /// Fold one value from a ``CborSession`` into this model's state tree,
+    /// emitting whatever events it raises and republishing the snapshot.
+    ///
+    /// The two channels are one event universe in two wire formats, so a client
+    /// holding both hands the CBOR side's pushes here and reads a single tree.
+    /// This is how the morph position reaches a model whose own session cannot
+    /// carry it.
+    public func applyCbor(address: UInt32, value: Int64) {
+        let outcome = state.applyCbor(address: address, value: value)
+        for event in outcome.events { emit(event) }
+        if outcome.slowChanged { publishSnapshot() }
     }
 
     /// Request one numeric parameter's current value (function `$41`). The
@@ -375,9 +406,9 @@ public actor DeviceModel {
     /// ``Params/bankSlots``, so index 123 is bank 25, slot 4.
     ///
     /// Nothing here assumes how many banks a device has. Aim past the end and
-    /// the device simply stays where it is — and says so in the Bank Select /
-    /// Program Change report that follows, so ``DeviceState/currentRigIndex``
-    /// always reflects where it actually landed, not where this aimed.
+    /// the device simply stays where it is — and says so in the `$06` position
+    /// push that follows, so ``DeviceState/currentRigIndex`` always reflects
+    /// where it actually landed, not where this aimed.
     public func selectRigIndex(_ index: UInt16) async throws {
         let slots = UInt16(Params.bankSlots)
         try await bank(index / slots + 1)

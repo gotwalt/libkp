@@ -128,10 +128,10 @@ final class DeviceStore: ObservableObject {
     @Published private(set) var state = DeviceState()
     /// The latest rendered FAST frame.
     @Published private(set) var meters = MeterFrame()
-    /// The slot (1–5) this app selected last, for immediate feedback on a tap.
-    /// The device does not report its rig index over the network, so this is
-    /// app-local; it clears when the rig changes from anywhere else (front panel,
-    /// another controller) so ``deviceSlot`` can take over.
+    /// The slot (1–5) this app selected last, for immediate feedback on a tap —
+    /// the device's own report follows a beat later. App-local; it clears when
+    /// the rig changes from anywhere else (front panel, another controller) so
+    /// the device's report takes over.
     @Published private(set) var selectedSlot: Int? {
         didSet {
             guard selectedSlot != oldValue else { return }
@@ -139,10 +139,10 @@ final class DeviceStore: ObservableObject {
         }
     }
     /// The bank the device is on, 1-based, or `nil` before the first position
-    /// report. Read straight from the state tree: seeded at connect from the
-    /// CBOR snapshot, then kept live by the Bank Select / Program Change pair
-    /// the device sends on every rig change — including changes made at the
-    /// front panel. Never stepped or inferred by this app.
+    /// report. Read straight from the state tree: asked for at connect
+    /// (``LibKP/DeviceModel/refreshPosition()``) and kept live by the `$06` the
+    /// device pushes on every rig change — including changes made at the front
+    /// panel. Never stepped or inferred by this app.
     var bank: Int? { state.currentBank.map { Int($0) + 1 } }
 
     /// The slot the device has loaded, 1-based, from the same live report.
@@ -168,11 +168,33 @@ final class DeviceStore: ObservableObject {
     }
 
     /// Which slot the rig navigator highlights: this app's optimistic last tap
-    /// while it is fresh, then the device's own reported slot while it is still
-    /// valid, then the name-matched inference.
+    /// until the device reports where it actually landed, then the device's own
+    /// slot, then the name-matched inference.
     var highlightedSlot: Int? { selectedSlot ?? slot ?? deviceSlot }
 
+    /// The flat rig index navigation steps *from*: this app's own un-confirmed
+    /// aim while it is fresh, otherwise the device's reported position.
+    ///
+    /// The device takes a moment to report a move, so two taps inside that
+    /// window would both step from the same stale index and the second would
+    /// re-send the first one's target — a second press of Bank Up that does
+    /// nothing. Stepping from the aim instead makes them compose.
+    ///
+    /// The aim expires rather than being trusted indefinitely: aim past the last
+    /// rig and the device stays put and reports nothing, so there is no
+    /// confirmation to wait for. After ``pendingWindow`` the device's own
+    /// position is the truth again.
+    private var navigationIndex: UInt16? {
+        if let pending, Date().timeIntervalSince(pending.at) < DeviceStore.pendingWindow {
+            return pending.index
+        }
+        return rigIndex
+    }
+
     private var model: DeviceModel?
+    /// The CBOR channel held alongside ``model``, when it opened. It carries the
+    /// morph position, which the streaming session never reports.
+    private var cborSession: CborSession?
     private var tasks: [Task<Void, Never>] = []
     private var epoch = 0
     /// The UDP discovery port, taken on first use and held for as long as this
@@ -189,7 +211,30 @@ final class DeviceStore: ObservableObject {
     /// When this app last navigated rigs, so a rig change arriving well after
     /// it can be recognized as externally driven.
     private var lastNavigation = Date.distantPast
+    /// Where this app last aimed, and when. Cleared by the device's next
+    /// position report — see ``navigationIndex``.
+    private var pending: (index: UInt16, at: Date)?
+    /// The move currently on the wire, if any.
+    private var navigationTask: Task<Void, Never>?
+    /// Whether a move is on the wire and not yet settled. While it is, taps only
+    /// move the aim — see ``navigate(to:why:)``.
+    private var moveInFlight = false
+    /// The last aim actually sent, so a settled aim is not sent twice.
+    private var sentIndex: UInt16?
 
+    /// How long a rig load is left alone before the read-back follows it. The
+    /// device reports its new position about 200 ms in; this is comfortably past
+    /// that. See ``navigate(to:why:)``.
+    private static let loadSettle: TimeInterval = 0.5
+    /// How long the read-back's replies are left to drain before another move
+    /// may be sent.
+    private static let readBackSettle: TimeInterval = 0.5
+
+    /// How long an un-confirmed aim stands in for the device's own position.
+    /// Comfortably longer than the ~150 ms the device takes to report a move,
+    /// short enough that an aim past the last rig — which is never confirmed,
+    /// because nothing moved — stops mattering quickly.
+    private static let pendingWindow: TimeInterval = 1.5
     /// How long to wait before another attempt after a failure.
     private static let retryDelay: TimeInterval = 4
     /// Breathing room between one connection closing and the next opening — the
@@ -206,12 +251,15 @@ final class DeviceStore: ObservableObject {
 
     /// The handful of values the header shows that the initial rig sync does
     /// not cover. These are requests, so nothing on the device changes.
+    ///
+    /// The morph position is deliberately absent: it is CBOR-only, so a request
+    /// for it on this session draws no reply and this app cannot show it. See
+    /// ``RigHeaderView``.
     private static let extraParams: [(page: UInt8, number: UInt8)] = [
         (Generated.ampPage, Generated.ampOnNumber),
         (Generated.ampPage, Generated.gainNumber),
         (Generated.pageRigSettings, Generated.tempoNumber),
         (Generated.pageRigSettings, Generated.rigVolumeNumber),
-        (Generated.pageMorph, Generated.morphNumber),
         (Generated.systemPage, Generated.mainVolumeNumber),
         // Headphone + Monitor together are the physical Master Volume knob.
         (Generated.systemPage, Generated.headphoneVolumeNumber),
@@ -236,6 +284,16 @@ final class DeviceStore: ObservableObject {
 
         for task in tasks { task.cancel() }
         tasks.removeAll()
+        if let cborSession {
+            self.cborSession = nil
+            Task { await cborSession.close() }
+        }
+        navigationTask?.cancel()
+        navigationTask = nil
+        moveInFlight = false
+        sentIndex = nil
+        pending = nil
+        selectedSlot = nil
         // Hand the outgoing model to the connect loop so it can close it *before*
         // — and spaced from — the next connection, rather than racing a
         // fire-and-forget close against the new CBOR fetch.
@@ -259,8 +317,7 @@ final class DeviceStore: ObservableObject {
     ///
     /// `closing` is the previous session, if any. The device refuses a new
     /// session that follows a close too closely, so it is closed and spaced
-    /// before the first connection attempt — which starts with the CBOR
-    /// snapshot.
+    /// before the first connection attempt.
     private func runConnectLoop(epoch: Int, closing: DeviceModel?) async {
         if let closing {
             await closing.close()
@@ -317,31 +374,6 @@ final class DeviceStore: ObservableObject {
 
             phase = .connecting(host: host)
 
-            // Learn the device's real current bank/rig first, over the CBOR
-            // channel, on its own short-lived connection. The device is fragile
-            // under concurrent sockets, so this completes and closes *before* the
-            // streaming session opens; a failure is non-fatal — the name-matched
-            // fallback still runs — so it never blocks the connect.
-            Log.conn("fetching CBOR state snapshot from \(host)")
-            let snapshot = try? await StateSnapshot.fetch(host: host)
-            guard epoch == self.epoch else { return }
-            if let snapshot {
-                Log.conn(
-                    """
-                    snapshot: bank \(Log.opt(snapshot.currentBank)) \
-                    slot \(Log.opt(snapshot.currentRigSlot)) (both 0-based)
-                    """)
-            } else {
-                Log.conn("snapshot unavailable — falling back to name matching")
-            }
-            // Let that socket settle before opening the streaming session — the
-            // device will not greet one that follows too closely.
-            if snapshot != nil {
-                try? await Task.sleep(
-                    nanoseconds: UInt64(DeviceStore.connectionSpacing * 1_000_000_000))
-                guard epoch == self.epoch else { return }
-            }
-
             do {
                 let model = try await DeviceModel.connect(host: host)
                 guard epoch == self.epoch else {
@@ -360,15 +392,19 @@ final class DeviceStore: ObservableObject {
 
                 attachStreams(to: model, epoch: epoch)
 
-                // Seed the current position from the snapshot, now that the store
-                // is subscribed: fold the indices into the model's state (which
-                // publishes a snapshot the views pick up) and show the real bank
-                // on the stepper.
-                if let snapshot {
-                    Log.conn("seeding position from snapshot")
-                    await model.setCurrentPosition(
-                        bank: snapshot.currentBank, slot: snapshot.currentRigSlot)
-                }
+                // `DeviceModel.connect` asked the device where it is as part of
+                // its sync; the `$06` replies land on the stream we just
+                // subscribed to. Ask again, so a reply that beat the
+                // subscription is not the only one.
+                try? await model.refreshPosition()
+
+                // Then the second channel. Neither one carries everything: the
+                // meter lane and the momentary events are MIDI3-only, while the
+                // morph position is CBOR-only. Holding both is the only way to
+                // show the whole device. Two read-only sessions coexist happily
+                // — it is connection *churn* the device objects to — so they are
+                // spaced by the cooldown and then simply left open.
+                await openCborSession(host: host, epoch: epoch)
                 return
             } catch {
                 guard epoch == self.epoch else { return }
@@ -376,6 +412,38 @@ final class DeviceStore: ObservableObject {
                 phase = .failed(message: "Could not connect to \(host): \(error)")
                 await waitBeforeRetry()
             }
+        }
+    }
+
+    /// Open the CBOR channel alongside the streaming session and pipe its values
+    /// into the model, so one state tree carries what both channels know.
+    ///
+    /// Non-fatal: if it fails the app runs on MIDI3 alone, which costs the morph
+    /// readout and nothing else. It is deliberately not retried in a loop — the
+    /// device is fragile under reconnection churn, and a missing morph is not
+    /// worth risking the session that carries the meters.
+    private func openCborSession(host: String, epoch: Int) async {
+        try? await Task.sleep(nanoseconds: UInt64(DeviceStore.connectionSpacing * 1_000_000_000))
+        guard epoch == self.epoch else { return }
+        do {
+            let session = try await CborSession.connect(host: host)
+            guard epoch == self.epoch else {
+                await session.close()
+                return
+            }
+            cborSession = session
+            Log.conn("CBOR channel open alongside the stream")
+            tasks.append(
+                Task {
+                    for await update in await session.updates() {
+                        guard epoch == self.epoch else { return }
+                        guard let model = self.model else { continue }
+                        await model.applyCbor(address: update.address, value: update.value)
+                    }
+                    Log.conn("CBOR channel closed")
+                })
+        } catch {
+            Log.conn("CBOR channel unavailable (\(error)) — morph will not be shown")
         }
     }
 
@@ -451,6 +519,35 @@ final class DeviceStore: ObservableObject {
 
     // MARK: - Commands
 
+    /// Whether the rig is morphed — its position is past halfway.
+    ///
+    /// `nil` until the CBOR channel reports a position; the streaming session
+    /// never does, so a MIDI3-only run has no morph state to show.
+    var isMorphed: Bool? {
+        state.morph.map { $0 > Generated.fullScale / 2 }
+    }
+
+    /// Morph to the rig's morphed sound, or back to its base.
+    ///
+    /// Sent as the morph pedal (CC 11), which sets an absolute position, rather
+    /// than the morph button (CC 80), which ramps over about two seconds and
+    /// alternates direction per press. A toggle wants a destination, not a
+    /// direction, and the pedal is the control that names one.
+    ///
+    /// The device does not echo the write; the position comes back on the CBOR
+    /// channel, so the readout follows the device rather than this call.
+    func setMorphed(_ morphed: Bool) {
+        guard let model else { return }
+        Log.cmd("setMorphed \(morphed) (CC11 -> \(morphed ? 127 : 0))")
+        Task {
+            do {
+                try await model.morphPedal(morphed ? 127 : 0)
+            } catch {
+                Log.cmd("setMorphed failed: \(error)")
+            }
+        }
+    }
+
     /// Ask the device to flip an effect slot on or off, then read the state
     /// back. The device applies a `$01` write without echoing it, so the
     /// read-back is what updates the card — the UI always shows the device's
@@ -471,30 +568,51 @@ final class DeviceStore: ObservableObject {
         }
     }
 
-    /// Load slot 1–5 (CC50–54) and remember the choice as the selected-slot hint.
+    /// Load slot 1–5 of the bank the device is on.
     ///
-    /// When a bank has been preselected, re-arm it (CC47) immediately before the
-    /// rig-select, in one ordered burst — the device's preselect does not persist
-    /// across the gap between a bank tap and a later slot tap, so a stale
-    /// preselect would drop the load into whatever bank is still loaded. Sending
-    /// the pair back-to-back is the sequence the device is documented to honour;
-    /// re-arming the already-current bank is harmless.
+    /// Addressed as a flat index like every other move, so the bank preselect
+    /// (CC47) is re-armed immediately before the slot load: the device's
+    /// preselect does not persist across the gap between a bank tap and a later
+    /// slot tap, so a bare slot load would drop into whatever bank is still
+    /// loaded. Re-arming the already-current bank is harmless. Before the first
+    /// position report there is no bank to name, so the slot load goes on its
+    /// own.
     func selectSlot(_ slot: Int) {
-        guard let model, (1...5).contains(slot) else { return }
-        selectedSlot = slot
-        lastNavigation = Date()
-        Log.cmd("selectSlot \(slot) (CC\(49 + slot) press/release)")
-        Task {
-            do {
-                try await model.selectRig(UInt8(slot))
-                // The device does not volunteer the landing rig's strings after a CC
-                // rig-select, so read them back to refresh the header/amp/cab/effects.
-                try await model.refreshRig()
-                Log.cmd("selectSlot \(slot) sent, rig read-back requested")
-            } catch {
-                Log.cmd("selectSlot \(slot) failed: \(error)")
+        guard let model, (1...Params.bankSlots).contains(slot) else { return }
+        // The bank this app is aiming at, which is the device's own only once a
+        // bank step has settled. Reading `state.currentBank` here instead would
+        // address the slot to the bank the device has *left*, silently undoing a
+        // Bank Up tapped a moment earlier — the stale-index bug that
+        // ``navigationIndex`` exists to prevent.
+        guard let bank = navigationIndex.map({ $0 / UInt16(Params.bankSlots) }) else {
+            // No position yet, so there is no bank to name and the slot load
+            // goes bare. Still takes the in-flight gate: a rig load that lands
+            // on top of another is what kills the device.
+            guard !moveInFlight else {
+                Log.cmd("selectSlot \(slot) dropped — a move is in flight and there is no bank yet")
+                return
             }
+            selectedSlot = slot
+            lastNavigation = Date()
+            moveInFlight = true
+            Log.cmd("selectSlot \(slot) (CC\(49 + slot)) — no bank reported yet, sending bare")
+            navigationTask = Task { [weak self] in
+                defer {
+                    self?.moveInFlight = false
+                    self?.pump()
+                }
+                do {
+                    try await model.selectRig(UInt8(slot))
+                    await self?.sleep(DeviceStore.loadSettle)
+                    try await model.refreshRig()
+                    await self?.sleep(DeviceStore.readBackSettle)
+                } catch {
+                    Log.cmd("selectSlot \(slot) failed: \(error)")
+                }
+            }
+            return
         }
+        navigate(to: bank * UInt16(Params.bankSlots) + UInt16(slot - 1), why: "selectSlot \(slot)")
     }
 
     /// Step `delta` rigs from where the device says it is, and load the result.
@@ -510,29 +628,91 @@ final class DeviceStore: ObservableObject {
     /// device holds varies and nothing here knows it. Aiming past the end leaves
     /// the device where it is, and its position report says so.
     func stepRig(by delta: Int) {
-        guard let model, let current = rigIndex else {
+        guard let current = navigationIndex else {
             Log.cmd("stepRig \(delta) ignored — no position reported yet")
             return
         }
         let target = UInt16(max(Int(current) + delta, 0))
         guard target != current else { return }
+        navigate(to: target, why: "stepRig \(delta > 0 ? "+" : "")\(delta) from \(current)")
+    }
+
+    /// Aim at a flat rig index, and load it — one move at a time, never
+    /// overlapping the last one.
+    ///
+    /// The aim lands immediately, so the buttons and the readout answer every
+    /// tap; only the *sending* is rationed. A tap while the device is idle goes
+    /// out at once. A tap while a move is still in flight just moves the aim,
+    /// and ``pump()`` sends wherever the aim ended up once the previous move has
+    /// settled — so a burst of taps costs two rig loads however long it is.
+    ///
+    /// This is not tidiness. A rig load makes the device replay its whole
+    /// parameter tree, and each one here is followed by a read-back of a couple
+    /// of dozen requests. Two of those issued 8 ms apart is enough to kill the
+    /// device: it answers the first normally, then closes the session about
+    /// twenty seconds later and stops accepting connections until it is power
+    /// cycled. The fuse is delayed, so nothing about the reply to a burst says
+    /// it did any harm.
+    private func navigate(to target: UInt16, why: String) {
+        guard model != nil else { return }
         let slots = UInt16(Params.bankSlots)
+        let now = Date()
         selectedSlot = Int(target % slots) + 1
-        lastNavigation = Date()
+        lastNavigation = now
+        pending = (target, now)
         Log.cmd(
-            "stepRig \(delta > 0 ? "+" : "")\(delta): index \(current) -> \(target) "
-                + "(bank \(target / slots + 1), slot \(target % slots + 1))")
-        Task {
-            do {
-                try await model.selectRigIndex(target)
-                // The device does not volunteer the landing rig's strings, so
-                // read them back for the header, amp, cab and effects.
-                try await model.refreshRig()
-                Log.cmd("stepRig sent, rig read-back requested")
-            } catch {
-                Log.cmd("stepRig failed: \(error)")
-            }
+            "\(why): aim index \(target) (bank \(target / slots + 1), slot \(target % slots + 1))"
+                + (moveInFlight ? " — holding, a move is in flight" : ""))
+        pump()
+    }
+
+    /// Send the current aim, if the device is idle and is not already there.
+    private func pump() {
+        guard !moveInFlight, model != nil, let pending else { return }
+        // Nothing to send if the device is already there, or if this same aim
+        // has been sent and the device did not move — which is what aiming past
+        // the last rig looks like, and re-sending it would loop forever.
+        guard pending.index != rigIndex, pending.index != sentIndex else { return }
+        moveInFlight = true
+        sentIndex = pending.index
+        navigationTask = Task { [weak self] in
+            await self?.performMove(pending.index)
         }
+    }
+
+    /// One move, start to finish: the absolute bank preselect plus slot load,
+    /// a pause for the device to land it and say so, then the read-back that
+    /// refreshes the header, amp, cabinet and effects — and another pause before
+    /// anything else is allowed on the wire.
+    ///
+    /// The pauses are what keep the load and the read-back from arriving on top
+    /// of each other. They are generous on purpose: the failure they avoid costs
+    /// a power cycle, and the cost of being wrong the other way is a burst of
+    /// taps taking an extra second to land.
+    private func performMove(_ target: UInt16) async {
+        defer {
+            moveInFlight = false
+            pump()
+        }
+        guard let model else { return }
+        do {
+            try await model.selectRigIndex(target)
+            Log.cmd("navigate to \(target) sent")
+        } catch {
+            Log.cmd("navigate to \(target) failed: \(error)")
+            return
+        }
+        await sleep(DeviceStore.loadSettle)
+        guard !Task.isCancelled else { return }
+        // The device does not volunteer the landing rig's amp, cabinet or effect
+        // state, so read them back — now that the load itself has gone quiet.
+        try? await model.refreshRig()
+        Log.cmd("navigate to \(target): rig read-back requested")
+        await sleep(DeviceStore.readBackSettle)
+    }
+
+    private func sleep(_ seconds: TimeInterval) async {
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
     /// Step one bank, keeping the slot — ``Params/bankSlots`` rigs at a time.
@@ -559,6 +739,26 @@ final class DeviceStore: ObservableObject {
             if sinceNavigation > 3 {
                 selectedSlot = nil
             }
+        case .currentPosition:
+            // The device has said where it is. That retires this app's guesses —
+            // but only once it agrees with them: mid-burst the device is still
+            // reporting the moves before the last one, and treating those as the
+            // truth would make every tap after the first step from a stale
+            // index. An aim the device never confirms (one past the last rig, so
+            // nothing moved and nothing is reported) expires instead — see
+            // ``navigationIndex``.
+            if let pending, pending.index == state.currentRigIndex {
+                self.pending = nil
+            }
+            if let slot, slot == selectedSlot {
+                selectedSlot = nil
+            }
+            // The send-once guard exists to stop an aim the device *ignored*
+            // from being re-sent forever (aiming past the last rig moves nothing
+            // and reports nothing). A report means the device did move, so the
+            // guard has done its job — holding it would refuse a later, genuine
+            // move back to the same index, say after a front-panel change.
+            sentIndex = nil
         default:
             break
         }

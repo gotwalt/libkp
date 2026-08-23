@@ -71,7 +71,7 @@
     {
       "name": "morph + tuner note + main vol",
       "messages": [
-        "f000203300000100000b2000f7",
+        "f00020330000010000772000f7",
         "f0002033000001007d540009f7",
         "f0002033000001007f005d60f7"
       ],
@@ -82,10 +82,28 @@
       }
     },
     {
-      "name": "rig index, single byte",
+      "name": "morph button leaves the position alone",
       "messages": [
-        "b02000",
-        "c07b"
+        "f00020330000010000500001f7"
+      ],
+      "expect": {
+        "morph": null
+      }
+    },
+    {
+      "name": "0x0B is not the morph",
+      "messages": [
+        "f000203300000100000b7f7ff7"
+      ],
+      "expect": {
+        "morph": null
+      }
+    },
+    {
+      "name": "position from extended params",
+      "messages": [
+        "f000203302000600000006125d0000000018f7",
+        "f000203302000600000006125e0000000003f7"
       ],
       "expect": {
         "current_bank": 24,
@@ -94,10 +112,22 @@
       }
     },
     {
-      "name": "rig index, two bytes",
+      "name": "position, bank alone",
       "messages": [
-        "b02001",
-        "c048"
+        "f000203302000600000006125d0000000028f7"
+      ],
+      "expect": {
+        "current_bank": 40,
+        "current_rig_slot": null,
+        "current_rig_index": null
+      }
+    },
+    {
+      "name": "position, halves pushed apart",
+      "messages": [
+        "f000203302000600000006125e0000000002f7",
+        "f000203302000600000006125d0000000028f7",
+        "f000203302000600000006125e0000000000f7"
       ],
       "expect": {
         "current_bank": 40,
@@ -106,16 +136,15 @@
       }
     },
     {
-      "name": "rig index ignores an unpaired program change",
+      "name": "position ignores an untracked extended address",
       "messages": [
-        "b02000",
-        "c07b",
-        "c005"
+        "f000203302000600000006125d0000000018f7",
+        "f0002033020006000000062005000000001ff7"
       ],
       "expect": {
         "current_bank": 24,
-        "current_rig_slot": 3,
-        "current_rig_index": 123
+        "current_rig_slot": null,
+        "current_rig_index": null
       }
     }
   ]

@@ -447,6 +447,42 @@ public enum Cbor {
     /// source-flag word, if present, is skipped.
     public static func extractSnapshot(_ items: [CBORValue]) -> StateSnapshot {
         var snap = StateSnapshot()
+        walk(
+            items,
+            numeric: { note(&snap, address: $0, value: $1) },
+            text: { address, text in
+                let ua = UInt32(truncatingIfNeeded: address)
+                let value = isSensitive(ua) ? Generated.redactedPlaceholder : text
+                snap.strings.append(SnapshotString(address: ua, text: value))
+            })
+        return snap
+    }
+
+    /// Every numeric address/value pair the items carry, in document order.
+    ///
+    /// The dump and a session's live pushes are the same shapes, so this is what
+    /// a ``CborSession`` folds into a state tree as values move.
+    public static func numericValues(_ items: [CBORValue]) -> [(address: UInt32, value: Int64)] {
+        var out: [(address: UInt32, value: Int64)] = []
+        walk(
+            items,
+            numeric: { out.append((UInt32(truncatingIfNeeded: $0), $1)) },
+            text: { _, _ in })
+        return out
+    }
+
+    /// Walk decoded items, handing each numeric and string element to a callback.
+    ///
+    /// Scans the value-bearing shapes: a single `[1, addr, value]`, a
+    /// consecutive-run `[2, base, v0, v1, …]` where the whole run is walked
+    /// because the target address can fall anywhere inside it, and a string
+    /// `[4, addr, text]`. A leading negative source-flag word, if present, is
+    /// skipped.
+    private static func walk(
+        _ items: [CBORValue],
+        numeric: (Int64, Int64) -> Void,
+        text: (Int64, String) -> Void
+    ) {
         for item in items {
             guard let fields = item.asArray else { continue }
             // Skip a leading negative source-flags word.
@@ -460,24 +496,19 @@ public enum Cbor {
             let addr = rest.count > 1 ? rest[1].asInt : nil
 
             if selector == Generated.cborSelectorSingle {
-                if let a = addr, rest.count > 2, let v = rest[2].asInt {
-                    note(&snap, address: a, value: v)
-                }
+                if let a = addr, rest.count > 2, let v = rest[2].asInt { numeric(a, v) }
             } else if selector == Generated.cborSelectorMulti {
                 if let base = addr {
                     for (i, element) in rest.dropFirst(2).enumerated() {
-                        if let v = element.asInt { note(&snap, address: base + Int64(i), value: v) }
+                        if let v = element.asInt { numeric(base + Int64(i), v) }
                     }
                 }
             } else if selector == Generated.cborSelectorString {
                 if let a = addr, rest.count > 2, case .text(let t) = rest[2], !t.isEmpty {
-                    let ua = UInt32(truncatingIfNeeded: a)
-                    let text = isSensitive(ua) ? Generated.redactedPlaceholder : t
-                    snap.strings.append(SnapshotString(address: ua, text: text))
+                    text(a, t)
                 }
             }
         }
-        return snap
     }
 
     /// Record the value at one address into the snapshot's indices.
@@ -487,6 +518,8 @@ public enum Cbor {
             snap.currentBank = v
         } else if address == Int64(Generated.currentRigSlotAddress) {
             snap.currentRigSlot = v
+        } else if address == Int64(Generated.morphAddress) {
+            snap.morph = v
         }
     }
 }
@@ -504,30 +537,47 @@ public struct SnapshotString: Sendable, Equatable {
     }
 }
 
-/// The device's current position and the names carried alongside it, read out of
-/// a state dump. Both indices are 0-based; either is `nil` if the dump did not
-/// carry it.
+/// The device's current position and the values carried alongside it, read out
+/// of a state dump. Both indices are 0-based; any field is `nil` if the dump did
+/// not carry it.
 public struct StateSnapshot: Sendable, Equatable {
     /// Current bank, 0-based (``Generated/currentBankAddress``).
     public var currentBank: UInt16?
     /// Current rig slot within the bank, 0-based
     /// (``Generated/currentRigSlotAddress``).
     public var currentRigSlot: UInt16?
+    /// The morph position (0 = base, 16383 = fully morphed), at
+    /// ``Generated/morphAddress``.
+    ///
+    /// This dump is the only way a client that is not holding a CBOR session
+    /// open can learn it: the position is never sent on the MIDI3 stream, and
+    /// answers neither a `$41` nor a `$46` request. It is a live value, so it is
+    /// true as of the read and stale the moment anyone morphs.
+    public var morph: UInt16?
     /// String parameters the dump carried, in document order, sensitive values
     /// redacted. Useful for the current rig name (address 1) and the bank name.
     public var strings: [SnapshotString]
 
     public init(
-        currentBank: UInt16? = nil, currentRigSlot: UInt16? = nil,
+        currentBank: UInt16? = nil, currentRigSlot: UInt16? = nil, morph: UInt16? = nil,
         strings: [SnapshotString] = []
     ) {
         self.currentBank = currentBank
         self.currentRigSlot = currentRigSlot
+        self.morph = morph
         self.strings = strings
     }
 
-    /// True once both indices are known — the reader can stop early.
-    public var isComplete: Bool { currentBank != nil && currentRigSlot != nil }
+    /// True once every value this snapshot reads is known — the point at which
+    /// the reader may stop before the dump has finished streaming.
+    ///
+    /// The morph counts: it arrives later in the dump than the two indices, so
+    /// stopping at those would truncate the read just short of it and leave
+    /// ``morph`` `nil` on a device that reported it perfectly well. Every dump
+    /// observed carries all three, at base as readily as morphed.
+    public var isComplete: Bool {
+        currentBank != nil && currentRigSlot != nil && morph != nil
+    }
 
     /// The string parameter at `addr`, if the dump carried one.
     public func string(_ addr: UInt32) -> String? {
@@ -538,13 +588,15 @@ public struct StateSnapshot: Sendable, Equatable {
     public static let defaultTimeout: TimeInterval = 3
 
     /// Open a fresh CBOR session to `host`, trigger the state dump, and read back
-    /// the current bank and rig slot.
+    /// the current bank, rig slot and morph position.
     ///
     /// This opens its **own** short-lived connection, independent of any
     /// ``DeviceModel``, and closes it on return. The device is fragile under
-    /// connection churn, so run this sequentially — before, not concurrently with,
-    /// a streaming session — and sparingly. Returns as soon as both indices are
-    /// known or `timeout` elapses.
+    /// connection churn, so run this sparingly. Returns as soon as every value it
+    /// reads is known (see ``StateSnapshot/isComplete``) or `timeout` elapses.
+    ///
+    /// For a *live* view, and to run alongside a streaming session rather than
+    /// before it, use ``CborSession``.
     public static func fetch(
         host: String,
         port: UInt16 = Generated.port,
@@ -577,5 +629,153 @@ public struct StateSnapshot: Sendable, Equatable {
             }
         }
         return Cbor.extractSnapshot(items)
+    }
+}
+
+// MARK: - Live session
+
+/// One value the device pushed on the CBOR channel.
+public struct CborUpdate: Sendable, Equatable {
+    /// The flat address, in the same space the NRPN pages decompose into.
+    public let address: UInt32
+    /// The value, as the channel encodes it (35-bit range, so wider than `$01`).
+    public let value: Int64
+
+    public init(address: UInt32, value: Int64) {
+        self.address = address
+        self.value = value
+    }
+}
+
+/// A **live** session on the native CBOR channel: it opens, asks for the state
+/// dump, and then streams every value the device pushes until it is closed.
+///
+/// This is the counterpart to ``StateSnapshot/fetch(host:port:timeout:)``, which
+/// reads one dump and hangs up. Hold this open instead when you want to *watch*
+/// the values the MIDI3 stream never carries — the morph position above all,
+/// which is pushed here at about 40 Hz while a morph ramps and is unreachable by
+/// any request on the streaming session.
+///
+/// **It may run alongside a ``DeviceModel``.** The device's fragility is about
+/// connection *churn*, not concurrency: two read-only sessions coexist happily,
+/// and the pair is how a client gets both the meter lane and the morph. Space
+/// the two connections by ``Session/connectionCooldown`` when opening them, and
+/// do not reopen either in a tight loop.
+///
+/// Read-only. The one thing it writes is the state-dump trigger, which is a flag
+/// the device already carries — see [docs/06](../../../docs/06-cbor-channel.md).
+public actor CborSession {
+    private let session: Session
+    private var decoder = CBORDecoder()
+    private var ingestTask: Task<Void, Never>?
+    private var continuations: [UUID: AsyncStream<CborUpdate>.Continuation] = [:]
+    private var closed = false
+    /// Values decoded before anyone subscribed, replayed to the first
+    /// subscriber. `connect` returns only after the dump has been asked for, so
+    /// the opening burst can land before the caller has had a chance to call
+    /// ``updates()`` — and that burst is the only place several values, the
+    /// morph among them, appear until something moves them.
+    private var backlog: [CborUpdate] = []
+
+    /// How long a read waits before looping. Short, so `close()` takes effect
+    /// promptly.
+    private static let readIdle: TimeInterval = 0.25
+    /// How many pre-subscription values to hold. The state dump is a couple of
+    /// thousand; this keeps the most recent of them rather than growing without
+    /// bound if nobody ever subscribes.
+    private static let backlogLimit = 4096
+
+    private init(session: Session) {
+        self.session = session
+    }
+
+    /// Connect to `host:5727`, open the CBOR protocol, ask for the state dump,
+    /// and start streaming.
+    ///
+    /// Returns once the session is established; values arrive on ``updates()``.
+    /// Subscribe *before* awaiting them, or the dump's own burst is missed.
+    public static func connect(
+        host: String, port: UInt16 = Generated.port
+    ) async throws -> CborSession {
+        let session = try await Session.connect(host: host, port: port)
+        do {
+            let outcome = try await session.handshake(
+                preferred: [Session.protocolCborControl], idle: 0.03)
+            try await session.writeSessionPreamble()
+            let model = CborSession(session: session)
+            await model.start(tail: outcome.responseTail)
+            return model
+        } catch {
+            session.close()
+            throw error
+        }
+    }
+
+    private func start(tail: [UInt8]) async {
+        emit(decoder.push(tail))
+        // Writing one item asks for the whole state; the reply is the burst the
+        // stream opens with.
+        try? await session.writeAll(Cbor.encode(Cbor.stateDumpRequest()))
+        ingestTask = Task { [weak self] in
+            await self?.ingestLoop()
+        }
+    }
+
+    private func ingestLoop() async {
+        while !Task.isCancelled {
+            do {
+                let chunk = try await session.readOnce(wait: CborSession.readIdle)
+                if chunk.isEmpty { continue }
+                emit(decoder.push(chunk))
+            } catch {
+                finish()
+                return
+            }
+        }
+    }
+
+    /// Every value the device pushes, in arrival order.
+    public func updates() -> AsyncStream<CborUpdate> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<CborUpdate>.makeStream(
+            bufferingPolicy: .bufferingNewest(1024)
+        )
+        for update in backlog { continuation.yield(update) }
+        backlog.removeAll()
+        continuations[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.drop(id) }
+        }
+        return stream
+    }
+
+    private func drop(_ id: UUID) { continuations[id] = nil }
+
+    private func emit(_ items: [CBORValue]) {
+        for pair in Cbor.numericValues(items) {
+            let update = CborUpdate(address: pair.address, value: pair.value)
+            guard !continuations.isEmpty else {
+                backlog.append(update)
+                if backlog.count > CborSession.backlogLimit { backlog.removeFirst() }
+                continue
+            }
+            for (_, continuation) in continuations { continuation.yield(update) }
+        }
+    }
+
+    /// Close the socket and finish the stream.
+    public func close() {
+        ingestTask?.cancel()
+        ingestTask = nil
+        session.close()
+        finish()
+    }
+
+    private func finish() {
+        guard !closed else { return }
+        closed = true
+        backlog.removeAll()
+        for (_, continuation) in continuations { continuation.finish() }
+        continuations.removeAll()
     }
 }

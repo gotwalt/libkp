@@ -19,7 +19,7 @@ from libkp.state import DeviceState
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.5.0"
+    assert gen.SPEC_VERSION == "0.6.0"
 
 
 def test_every_vector_file_is_covered():
@@ -191,6 +191,22 @@ def test_ext_decode(case):
     data = bytes.fromhex(case["bytes"])
     assert nrpn.ext_decode(data) == case["value"]
     assert nrpn.ext_encode(case["value"], len(data)) == data
+
+
+@pytest.mark.parametrize("case", _NRPN["request_extended_param"], ids=_ids(["address"]))
+def test_request_extended_param(case):
+    built = nrpn.request_extended_param(case["product"], case["device"], case["address"])
+    assert built.hex() == case["hex"]
+
+
+@pytest.mark.parametrize("case", _NRPN["parse_extended_param"], ids=lambda c: c["hex"][:24])
+def test_parse_extended_param(case):
+    got = nrpn.parse_extended_param(bytes.fromhex(case["hex"]))
+    expected = case["expected"]
+    if expected is None:
+        assert got is None
+    else:
+        assert got == (expected["address"], expected["value"])
 
 
 @pytest.mark.parametrize("case", _NRPN["parse_extended_string"], ids=lambda c: c["hex"][:24])
@@ -365,6 +381,7 @@ def test_cbor_extract_snapshot(case):
     expect = case["expect"]
     assert snap.current_bank == expect["current_bank"]
     assert snap.current_rig_slot == expect["current_rig_slot"]
+    assert snap.morph == expect["morph"]
     if "strings" in expect:
         want = [(s["addr"], s["text"]) for s in expect["strings"]]
         assert snap.strings == want

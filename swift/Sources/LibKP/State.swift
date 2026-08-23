@@ -208,8 +208,17 @@ public enum DeviceEvent: Sendable, Equatable {
     case beatPulse(on: Bool)
     /// The tempo changed, in whole beats per minute.
     case tempoBpm(UInt16)
-    /// The morph position changed (0–16383).
+    /// The morph position changed (0 = base, 16383 = fully morphed).
+    ///
+    /// Only a CBOR session ever sees this: the position is never sent on the
+    /// MIDI3 stream, even while a morph is ramping. See ``morphButton(on:)``.
     case morphChanged(UInt16)
+    /// The morph button was pressed (`true`) or released (`false`) — momentary,
+    /// so nothing about it is stored in the snapshot.
+    ///
+    /// This is what a MIDI3 client sees of a morph: *that* one happened, and
+    /// what it did to the audio parameters, but never where the fader sits.
+    case morphButton(on: Bool)
     /// The tuner pitch deviance changed (8192 = in tune).
     case tunerDeviance(UInt16)
     /// The tuner's detected note changed.
@@ -217,9 +226,10 @@ public enum DeviceEvent: Sendable, Equatable {
     /// A rendered-string reply arrived (`$3C`), carrying a value's exact display
     /// text. Transient — not stored in the snapshot tree.
     case renderedString(page: UInt8, number: UInt8, value: UInt16, text: String)
-    /// The device's current position was learned from the CBOR state-dump
-    /// snapshot. Read ``DeviceState/currentBank`` and
-    /// ``DeviceState/currentRigSlot`` for the new values (both 0-based).
+    /// The device's current position changed, or was learned for the first
+    /// time. Read ``DeviceState/currentBank`` and ``DeviceState/currentRigSlot``
+    /// for the new values (both 0-based); a `nil` here is a half not yet known,
+    /// not a cleared one.
     case currentPosition(bank: UInt16?, slot: UInt16?)
     /// The model connected to a device.
     case connected
@@ -279,17 +289,18 @@ public struct DeviceState: Sendable, Equatable {
     public var output: Output
     /// The loaded bank's five-slot name preview (page `0x96`).
     public var bank: Bank
-    /// Current bank, 0-based, once known. Seeded from the CBOR state-dump
-    /// snapshot (``StateSnapshot/fetch(host:port:timeout:)``) via
-    /// ``DeviceModel/setCurrentPosition(bank:slot:)``, then kept live by the
-    /// Bank Select / Program Change pair the device sends on every rig change.
+    /// Current bank, 0-based, once known. Kept live by the `$06` Extended
+    /// Parameter the device sends at ``Generated/currentBankAddress`` whenever
+    /// the bank changes — from the front panel as readily as from a controller —
+    /// and by the reply to ``DeviceModel/refreshPosition()``. Can also be seeded
+    /// before a session opens, from the CBOR state-dump snapshot
+    /// (``StateSnapshot/fetch(host:port:timeout:)``) via
+    /// ``DeviceModel/setCurrentPosition(bank:slot:)``.
     public var currentBank: UInt16?
     /// Current rig slot within the bank, 0-based, once known. Same source as
-    /// ``currentBank``; slot 0 is rig slot 1.
+    /// ``currentBank``, at ``Generated/currentRigSlotAddress``; slot 0 is rig
+    /// slot 1.
     public var currentRigSlot: UInt16?
-    /// The high 7 bits of a rig index, held between the Bank Select that carries
-    /// them and the Program Change that completes the pair.
-    private var pendingRigIndexMsb: UInt8?
     /// The flat, 0-based rig index — `currentBank * bankSlots + currentRigSlot`
     /// — once both halves are known. This is the device's own numbering, and the
     /// only address that can name a rig outside the current bank.
@@ -297,7 +308,11 @@ public struct DeviceState: Sendable, Equatable {
         guard let currentBank, let currentRigSlot else { return nil }
         return currentBank * UInt16(Params.bankSlots) + currentRigSlot
     }
-    /// Latest morph position (0–16383), once seen.
+    /// Latest morph position (0 = base, 16383 = fully morphed), once seen.
+    ///
+    /// Filled only from a CBOR source — the state dump
+    /// (``StateSnapshot/morph``) or a CBOR session's live pushes. A MIDI3-only
+    /// client never learns it, so this stays `nil` there.
     public var morph: UInt16?
     /// The most recent realtime status / meter frame (the FAST lane).
     public var status: RealtimeStatus
@@ -341,17 +356,17 @@ extension DeviceState {
     ///   consecutive address routed like a single-param.
     /// - `$07` ext-string on the string page → the amp/cab/author tags the
     ///   rig-load dump sends as extended strings.
+    /// - `$06` extended param → the device's current bank / rig slot.
     /// - `$3C` rendered-string reply → a transient event (FAST).
-    /// - `$06` extended and any other traffic → ignored.
+    /// - Anything else → ignored.
     @discardableResult
     public mutating func apply(_ msg: [UInt8]) -> ApplyOutcome {
-        // Channel-voice messages ride the same stream as the SysEx: the device
-        // announces every rig change as a Bank Select / Program Change pair.
-        if let outcome = applyRigIndex(msg) { return outcome }
         guard let (header, values) = NrpnHeader.parse(msg) else { return .empty }
 
-        // The extended-string ($07) address is 5×7-bit encoded and does not fit
-        // the fixed header layout, so route it off the raw message.
+        // The extended ($06) and extended-string ($07) addresses are 5×7-bit
+        // encoded and do not fit the fixed header layout, so route both off the
+        // raw message.
+        if header.function == Generated.fnExtParam { return applyExtParam(msg) }
         if header.function == Generated.fnExtStringParam { return applyExtString(msg) }
 
         switch header.function {
@@ -366,41 +381,59 @@ extension DeviceState {
         case Generated.fnRenderedStringReply:
             return applyRenderedString(msg)
         default:
-            return .empty  // $06 extended, and anything else, ignored.
+            return .empty
         }
     }
 
-    /// Fold the device's position report into the tree.
+    /// Fold a `$06` Extended Parameter into the tree.
     ///
-    /// The device says where it is with two channel-voice messages: CC32 (Bank
-    /// Select LSB) carrying the high 7 bits, then a Program Change carrying the
-    /// low 7. Together they are a flat, 0-based rig index — `128 * msb + program`
-    /// — which divides by ``Params/bankSlots`` into bank and slot. Unlike the
-    /// CBOR snapshot, which is a one-shot read at connect, this arrives on every
-    /// change, from the front panel as readily as from a controller.
+    /// This is the device's position report. It carries a 5×7-bit address and a
+    /// 5×7-bit value; the two addresses that matter here are the current bank
+    /// and the current rig slot, both 0-based. The device pushes whichever of
+    /// the two changed on every rig change — including changes made at the front
+    /// panel — and answers ``DeviceModel/refreshPosition()`` with both.
     ///
-    /// Returns `nil` for anything that is not one of the two messages, so NRPN
-    /// parsing carries on. A Program Change with no Bank Select ahead of it is
-    /// ignored: half an index is not a position.
-    private mutating func applyRigIndex(_ msg: [UInt8]) -> ApplyOutcome? {
-        guard let status = msg.first else { return nil }
-        switch status & 0xF0 {
-        case Generated.controlChangeStatus:
-            guard msg.count >= 3, msg[1] == Generated.ccBankSelectLsb else { return nil }
-            pendingRigIndexMsb = msg[2] & 0x7F
-            return .empty
-        case Generated.programChangeStatus:
-            guard msg.count >= 2, let msb = pendingRigIndexMsb else { return nil }
-            pendingRigIndexMsb = nil
-            let index = UInt16(msb) * 128 + UInt16(msg[1] & 0x7F)
-            let bank = index / UInt16(Params.bankSlots)
-            let slot = index % UInt16(Params.bankSlots)
-            guard currentBank != bank || currentRigSlot != slot else { return .empty }
-            currentBank = bank
-            currentRigSlot = slot
-            return .slow([.currentPosition(bank: bank, slot: slot)])
+    /// Any other extended address is ignored, and a value too large for the
+    /// 16-bit field is dropped rather than truncated into a bogus position.
+    private mutating func applyExtParam(_ msg: [UInt8]) -> ApplyOutcome {
+        guard let (address, raw) = Nrpn.parseExtendedParam(msg), raw <= UInt64(UInt16.max)
+        else { return .empty }
+        return applyAddress(address, UInt16(raw))
+    }
+
+    /// Fold one **CBOR** address/value into the tree.
+    ///
+    /// The CBOR channel and the MIDI3 stream are two wire formats over one event
+    /// universe, so a value arriving either way lands in the same field and
+    /// raises the same event. This is the entry point for a ``CborSession``'s
+    /// live pushes and for a state dump's items.
+    ///
+    /// A value outside the 16-bit range is dropped rather than truncated into a
+    /// bogus reading.
+    @discardableResult
+    public mutating func applyCbor(address: UInt32, value: Int64) -> ApplyOutcome {
+        guard let value = UInt16(exactly: value) else { return .empty }
+        return applyAddress(address, value)
+    }
+
+    /// Route one flat address to the field that tracks it, whichever transport
+    /// carried it. Unknown addresses change nothing.
+    private mutating func applyAddress(_ address: UInt32, _ value: UInt16) -> ApplyOutcome {
+        switch address {
+        case Generated.currentBankAddress:
+            guard currentBank != value else { return .empty }
+            currentBank = value
+            return .slow([.currentPosition(bank: value, slot: currentRigSlot)])
+        case Generated.currentRigSlotAddress:
+            guard currentRigSlot != value else { return .empty }
+            currentRigSlot = value
+            return .slow([.currentPosition(bank: currentBank, slot: value)])
+        case Generated.morphAddress:
+            guard morph != value else { return .empty }
+            morph = value
+            return .slow([.morphChanged(value)])
         default:
-            return nil
+            return .empty
         }
     }
 
@@ -515,10 +548,14 @@ extension DeviceState {
             output.monitorVolume = value
             return .slow([.paramChanged(page: page, number: number, value: value)])
         }
-        // Morph position (page 0 is dual-use with the string page) (SLOW).
+        // Morph (page 0 is dual-use with the string page). The position is SLOW;
+        // the button is momentary, so it is an event and nothing more.
         if page == Generated.pageMorph && number == Generated.morphNumber {
             morph = value
             return .slow([.morphChanged(value)])
+        }
+        if page == Generated.pageMorph && number == Generated.morphButtonNumber {
+            return .fast(.morphButton(on: value != 0))
         }
         // Tuner detected note (SLOW).
         if page == Generated.pageTunerNote && number == Generated.tunerNoteNumber {

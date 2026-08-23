@@ -1,5 +1,5 @@
 {
-  "description": "The native CBOR control channel: the state-dump write, and reading the current bank/rig position out of a decoded dump.",
+  "description": "The native CBOR control channel: the state-dump write, and reading the current bank/rig position and morph out of a decoded dump.",
   "param_write": [
     {
       "addr": 15953,
@@ -27,7 +27,8 @@
       "expect": {
         "current_bank": 1,
         "current_rig_slot": 2,
-        "strings": []
+        "strings": [],
+        "morph": null
       }
     },
     {
@@ -37,9 +38,16 @@
         "current_bank": 3,
         "current_rig_slot": 4,
         "strings": [
-          { "addr": 1, "text": "Maz 18 Pushed" },
-          { "addr": 200008, "text": "[redacted]" }
-        ]
+          {
+            "addr": 1,
+            "text": "Maz 18 Pushed"
+          },
+          {
+            "addr": 200008,
+            "text": "[redacted]"
+          }
+        ],
+        "morph": null
       }
     },
     {
@@ -48,6 +56,17 @@
       "expect": {
         "current_bank": null,
         "current_rig_slot": null,
+        "strings": [],
+        "morph": null
+      }
+    },
+    {
+      "name": "the dump carries the morph position alongside the indices",
+      "stream_hex": "c183011a0001895d01c183011a0001895e02c183011877193fff",
+      "expect": {
+        "current_bank": 1,
+        "current_rig_slot": 2,
+        "morph": 16383,
         "strings": []
       }
     }

@@ -172,7 +172,8 @@ slot numbers are **clamped** to 1–5, and effect-button numbers to 1–4.
 | Effect mix | NRPN `<slot>`/4 | CC 68 / 70 (delay, reverb only) | precision + read-back |
 | Effect **type** | NRPN `<slot>`/0, **read-only** | — | set by loading a rig, not over MIDI |
 | Tempo in BPM | NRPN `$04`/0 (bpm × 64) | — | it is a value; tapping is the action |
-| Morph position (read) | NRPN `$00`/`$0B` | — | observed state |
+| Morph position (read) | NRPN `$00`/`$77` | — | CBOR-only; see [the morph](05-sysex-nrpn.md#the-morph) |
+| Morph button (read) | NRPN `$00`/`$50` | — | momentary; the press/release the device reports |
 | Looper transport | NRPN `$7D`/88–94 | — | latched values |
 | Freeze per module | NRPN `$7D`/107–111, 113–115 | CC 35 (global) | per-slot state |
 | **Rig select 1–5** | **CC 50–54** | — | no NRPN equivalent — a momentary action |
@@ -196,14 +197,12 @@ value 0 alone is inert, being the release of a press that never happened. The
 immediately followed by its release, one 6-byte message; a caller that wants to
 model a genuinely held button has to build the two Control Changes itself.
 
-**The device says where it is, in channel-voice messages.** Alongside the SysEx
-it emits a Bank Select LSB (CC 32) followed by a Program Change on every rig
-change — from the front panel as readily as from a controller. The two carry a
-flat, 0-based rig index, `128 × CC32 + program`, which divides by the five slots
-per bank into bank and slot: index 123 is bank 25, slot 4. This is the only
-position report the streaming session gives; the CBOR state dump is a one-shot
-read at connect. A Program Change with no Bank Select ahead of it is half an
-index, not a position, and is ignored.
+**The device says where it is, at two extended addresses.** Its current bank
+(100701) and rig slot (100702), both 0-based, read with a `$46` request and
+pushed unasked as `$06` whenever either moves — from the front panel as readily
+as from a controller. Together they are a flat rig index, `bank × 5 + slot`:
+index 123 is bank 25, slot 4. A client reads them once at connect and then
+listens. See [the position report](05-sysex-nrpn.md#the-position-report).
 
 That index is also the only address that names a rig **outside** the current
 bank, so it is what navigation is computed in: ±1 is the next or previous rig,
@@ -279,19 +278,19 @@ arbitrary address through `set_param`.
 
 **Program Change feedback does not come back.** Program Change, Note On and Note
 Off are inert in the device's network MIDI encoder — switching rigs produces no
-Program Change on the stream. A client that wants to display the current rig must
-**request the rig name** (`$43`, page 0, number 1) after switching. See
-[SysEx / NRPN dialect](05-sysex-nrpn.md).
+Program Change on the stream, and nothing but SysEx ever comes back. A client
+that wants to display the current rig must **request the rig name** (`$43`,
+page 0, number 1) after switching. See [SysEx / NRPN dialect](05-sysex-nrpn.md).
 
-**The stream never states the current *position*.** Rig-name requests tell you
-*what* is loaded, not *where* it sits. Matching the loaded name against the
-[bank preview](09-parameter-registry.md) recovers the slot, but not the bank
-number, and it is ambiguous when two slots share a name. The device's actual
-0-based bank and rig indices are only reachable over the
-[CBOR channel](06-cbor-channel.md) — request its state dump and read addresses
-100701 / 100702. `StateSnapshot::fetch` does exactly that in one call, over its
-own short-lived session; run it at boot, before opening the streaming model, to
-show the right patch immediately.
+**The rig name is not a position.** It tells you *what* is loaded, not *where* it
+sits. Matching the loaded name against the [bank preview](09-parameter-registry.md)
+recovers the slot, but not the bank number, and it is ambiguous when two slots
+share a name. The position itself comes from the two extended addresses above —
+`refresh_position` reads them, and the device pushes them thereafter. Before a
+streaming session exists the same two values are in the
+[CBOR channel](06-cbor-channel.md) state dump, which is what
+`StateSnapshot::fetch` reads; a client that opens the streaming session anyway
+does not need it.
 
 **A write is not echoed.** Established by observed experimentation, the device
 applies a `$01` write without reporting it back on a plain streaming session, so

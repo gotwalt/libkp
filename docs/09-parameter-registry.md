@@ -214,7 +214,10 @@ string_tag_name(99)  →  null
 
 The string tags cover rig, amp and cabinet metadata: name, author, creation
 date, comment, manufacturer, model, microphone, speaker. The numeric side of
-page 0 is sparse — the notable member is number `$0B`, **Morph State**.
+page 0 is sparse — its members are number `$50`, the **Morph Button**, and
+number `$77`, the **Morph Position**. Number `$0B` is *not* the morph: it reads
+a constant 0 whether the rig is morphed or at base. See
+[the morph](05-sysex-nrpn.md#the-morph).
 
 ## Where the data comes from
 
@@ -249,7 +252,9 @@ The page/number map, the shared effect-module parameter list, the string tags,
 and the effect-type table are transcribed from the
 [Kemper MIDI Parameter Documentation](https://www.kemper-amps.com/downloads/5/User-Manuals);
 the effect-type category blocks are inferred from the value-range structure of
-its Appendix B and the device's type-knob grouping. The Fixed-FX page, several tuner and tempo addresses, and the numeric morph-state
-parameter are credited to [PySwitch](https://github.com/Tunetown/PySwitch). The
-page `$7C` meter-field identities were established by observed experimentation.
+its Appendix B and the device's type-knob grouping. The Fixed-FX page and
+several tuner and tempo addresses are credited to
+[PySwitch](https://github.com/Tunetown/PySwitch). The page `$7C` meter-field
+identities and the page-0 morph addresses were established by observed
+experimentation.
 See [../CREDITS.md](../CREDITS.md).

@@ -144,7 +144,7 @@ with DiscoveryPort.acquire() as port:  # raises PortUnavailableError if taken
 | `libkp.discovery` | Async UDP broadcast discovery (`discover`, `find_first`). |
 | `libkp.session` | TCP connect plus the line-based protocol-selection handshake. |
 | `libkp.midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
-| `libkp.cbor` | The native CBOR channel: codec plus `fetch_state_snapshot`, the state-dump read of the current bank/rig. |
+| `libkp.cbor` | The native CBOR channel: codec, `fetch_state_snapshot` (a one-shot read of the current bank/rig/morph) and `CborSession` (a live session streaming what MIDI3 omits). |
 | `libkp.nrpn` | Kemper SysEx/NRPN builders and parsers, plus the beacon. |
 | `libkp.control` | The 7-bit CC / PC / Bank Select vocabulary. |
 | `libkp.params` | Offline `page/number → name` lookups. |
@@ -191,13 +191,34 @@ bank's five-slot rig/amp/cabinet name preview — and are what `connect()` runs 
 the initial sync. The bank preview lands in `state.bank`; the master-volume knob
 reads back through `state.output.master_volume`.
 
-The device's **current bank and rig position** is not on the MIDI3 stream at all.
-`await fetch_state_snapshot(ip)` reads it over the native CBOR channel (docs/06):
-it opens its own short-lived session, triggers the device's state dump, and
-returns the 0-based `current_bank` / `current_rig_slot`. Run it at boot *before*
-`DeviceModel.connect` — the device dislikes concurrent connections — then feed
-the result in with `model.set_current_position(bank, slot)`, which folds the
-indices into `state.current_bank` / `state.current_rig_slot`.
+The device's **current bank and rig position** lives at two extended addresses.
+`await model.refresh_position()` reads both with a `$46` request, and the device
+pushes a `$06` for whichever changes on every rig change — including changes made
+at the front panel — so `state.current_bank` / `state.current_rig_slot` stay live
+on their own. `connect()` runs it as part of the initial sync.
+
+Before a session exists the same two indices are in the CBOR state dump (docs/06):
+`await fetch_state_snapshot(ip)` opens its own short-lived session and returns
+them, to feed in with `model.set_current_position(bank, slot)`.
+
+The **morph position** is the other way round: it is CBOR-only, and never
+appears on the MIDI3 stream. Hold a `CborSession` open alongside the model and
+fold its values in, and one state tree carries both channels:
+
+```python
+async with await CborSession.connect(ip) as cbor:
+    queue = cbor.updates()
+    while True:
+        address, value = await queue.get()
+        model.apply_cbor(address, value)
+```
+
+`model.state()` hands back an independent copy, so folding into *that* would
+change nothing; `apply_cbor` on the model writes the live tree and broadcasts the
+snapshot.
+
+Neither channel is a superset of the other: the meter block is MIDI3-only, the
+morph position is CBOR-only, and the device is happy to serve both at once.
 
 ## Decoding without a device
 

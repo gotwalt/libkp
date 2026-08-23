@@ -45,6 +45,7 @@ from collections.abc import Callable, Iterable
 from . import _generated as gen
 from . import control as control_mod
 from . import midi3, nrpn, params
+from ._broadcast import Broadcast as _Broadcast
 from .control import Control
 from .errors import DisconnectedError, SessionError, UnknownSlotError
 from .protocol import PORT
@@ -72,40 +73,8 @@ CC_CHANNEL: int = 0
 READ_IDLE: float = 0.03
 #: Max bytes per stream read.
 READ_MAX: int = 64 * 1024
-#: Depth of each subscriber queue before the oldest item is dropped.
-QUEUE_DEPTH: int = 256
 #: String tags requested by the initial read-only sync, in request order.
 SYNC_STRING_TAGS: tuple[int, ...] = (1, 2, 4, 3, 10, 32)
-
-
-class _Broadcast:
-    """Fan-out of values to per-subscriber queues, dropping the oldest on overflow.
-
-    A slow consumer never blocks the ingest task; for snapshots, dropping an
-    intermediate value loses nothing because the latest is always complete.
-    """
-
-    __slots__ = ("_queues",)
-
-    def __init__(self) -> None:
-        self._queues: list[asyncio.Queue] = []
-
-    def subscribe(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_DEPTH)
-        self._queues.append(queue)
-        return queue
-
-    def unsubscribe(self, queue: asyncio.Queue) -> None:
-        with contextlib.suppress(ValueError):
-            self._queues.remove(queue)
-
-    def send(self, value: object) -> None:
-        for queue in self._queues:
-            if queue.full():
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-            with contextlib.suppress(asyncio.QueueFull):
-                queue.put_nowait(value)
 
 
 class DeviceModel:
@@ -183,6 +152,7 @@ class DeviceModel:
         if sync:
             await model.refresh_rig()
             await model.refresh_bank()
+            await model.refresh_position()
         return model
 
     async def close(self) -> None:
@@ -337,6 +307,35 @@ class DeviceModel:
                 address = params.bank_preview_address(field_, slot)
                 await self._enqueue(nrpn.request_extended_string(PRODUCT, DEVICE, address))
 
+    async def refresh_position(self) -> None:
+        """Ask the device where it is: the current bank and rig slot, as two
+        ``$46`` extended-parameter requests. The ``$06`` replies fold into
+        :attr:`DeviceState.current_bank` and :attr:`DeviceState.current_rig_slot`.
+        Read-only.
+
+        Only needed once, at connect: the device pushes an unsolicited ``$06``
+        for whichever of the two changed on every subsequent rig change, whoever
+        caused it.
+        """
+        for address in (gen.CURRENT_BANK_ADDRESS, gen.CURRENT_RIG_SLOT_ADDRESS):
+            await self._enqueue(nrpn.request_extended_param(PRODUCT, DEVICE, address))
+
+    def apply_cbor(self, address: int, value: int) -> None:
+        """Fold one value from a :class:`~libkp.cbor.CborSession` into this
+        model's state tree, emitting whatever events it raises and republishing
+        the snapshot.
+
+        The two channels are one event universe in two wire formats, so a client
+        holding both hands the CBOR side's pushes here and reads a single tree.
+        This is how the morph position reaches a model whose own session cannot
+        carry it.
+        """
+        outcome = self._state.apply_cbor(address, value)
+        for event in outcome.events:
+            self._emit(event)
+        if outcome.slow_changed:
+            self._snapshots.send(self._state.snapshot())
+
     def set_current_position(self, bank: int | None, slot: int | None) -> None:
         """Fold a :class:`~libkp.cbor.StateSnapshot`'s current bank and rig slot
         into the state tree, emitting a
@@ -411,8 +410,8 @@ class DeviceModel:
         it. The index divides by ``BANK_SLOTS``, so index 123 is bank 25, slot 4.
 
         Nothing here assumes how many banks a device has. Aim past the end and
-        the device simply stays where it is -- and says so in the Bank Select /
-        Program Change report that follows, so
+        the device simply stays where it is -- and says so in the ``$06``
+        position push that follows, so
         :attr:`~libkp.state.DeviceState.current_rig_index` always reflects where
         it actually landed, not where this aimed.
         """
