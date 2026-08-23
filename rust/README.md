@@ -55,7 +55,7 @@ let replies = port.poll(&libkp::Options::default()).await?;
 | `generated` | **Data only** — constants and lookup tables emitted from the shared `spec/` by `codegen/generate.py`. Never edited by hand. |
 | `protocol` | The tag-stream wire encoding and the `DSCV` discovery poll packet. |
 | `discovery` | Async UDP broadcast discovery (`DiscoveryPort`, `discover`, `find_first`). |
-| `session` | TCP connect, the protocol-list handshake, and the stream preamble. |
+| `session` | TCP connect, the protocol-list handshake, and the stream preamble. Every open passes the process-wide connection ledger, which waits out `CONNECTION_COOLDOWN` since the last open or close to the same device. |
 | `midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
 | `cbor` | The native CBOR channel: codec, `StateSnapshot::fetch` (a one-shot read of the current bank/rig/morph) and `CborSession` (a live session streaming what MIDI3 omits). |
 | `nrpn` | Kemper SysEx/NRPN builders and parsers (14-bit values, string tags, extended strings, the beacon). |

@@ -6,7 +6,8 @@
 //!   from the shared `spec/`. Never edit it by hand.
 //! - [`protocol`] — the tag-stream wire encoding + discovery poll packet.
 //! - [`discovery`] — UDP broadcast discovery ([`discovery::discover`]).
-//! - [`session`] — TCP connect + the line-based protocol handshake.
+//! - [`session`] — TCP connect + the line-based protocol handshake, behind
+//!   the process-wide connection ledger that spaces opens to one device.
 //! - [`midi3`] — the 4-byte stream framing that carries MIDI over the session.
 //! - [`cbor`] — the device's native CBOR channel and the state-dump snapshot
 //!   ([`cbor::StateSnapshot::fetch`]) that reads the current bank, rig slot and

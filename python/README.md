@@ -217,6 +217,13 @@ async with await CborSession.connect(ip) as cbor:
 change nothing; `apply_cbor` on the model writes the live tree and broadcasts the
 snapshot.
 
+Opening the second session needs no pacing on the caller's part. `Session.connect`
+keeps a per-peer ledger of the last open and close to each `(ip, port)` and waits
+out `CONNECTION_COOLDOWN` from the later of the two before dialing, so neither
+`fetch_state_snapshot` nor `CborSession.connect` nor `DeviceModel.connect` can
+open a socket inside the cooldown of the last one — the connection churn the
+device does not survive (docs/06, docs/11).
+
 Neither channel is a superset of the other: the meter block is MIDI3-only, the
 morph position is CBOR-only, and the device is happy to serve both at once.
 
