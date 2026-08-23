@@ -22,6 +22,19 @@ socket_timeout_secs = 15
 # this, and never run them concurrently. See docs/06.
 connection_cooldown_ms = 1000
 
+[safety]
+# Pacing the model applies on the device's behalf. Every value here is measured
+# (docs/11): a SysEx request of any kind answers in under 50 ms even with the
+# whole 46-request connect burst in flight, and the CBOR state dump lands in
+# about 350 ms. The reconnect and reopen floors are the spacing MetersApp used
+# for a year without wedging a device; nothing faster has been tried.
+request_timeout_ms = 300          # a request unanswered this long is reported as timed out and never retried
+max_in_flight_requests = 16       # requests on the wire at once; the rest queue
+dump_settle_ms = 1000             # the dump phase ends this long after the trigger if the end marker never comes
+reconnect_delay_ms = 4000         # first retry after the stream is lost, when a client opts into reconnecting
+reconnect_max_delay_ms = 30000    # the retry delay doubles up to this
+control_reopen_min_gap_ms = 30000 # the control channel is never reopened closer than this to its last open
+
 [discovery]
 # UDP broadcast discovery. The client broadcasts a fixed 34-byte poll; Profilers
 # on the LAN reply on the same port with a DSCV TagStream of key/value fields.
@@ -96,6 +109,10 @@ filler_byte = 0xC0
 # device already carries) and applies to address 102528 = 1.
 state_dump_trigger_address = 102528
 state_dump_trigger_value = 1
+# The item that always ends a state dump: a consecutive run whose base is this
+# address. Measured over repeated dumps (docs/11); the model closes the dump
+# phase when it has folded that run, and falls back to `dump_settle_ms`.
+dump_end_address = 100800
 # Addresses whose string values are the device's stored WiFi credentials
 # (network name and passphrase). The state dump volunteers both in the clear; a
 # reader must never surface them. See docs/06.

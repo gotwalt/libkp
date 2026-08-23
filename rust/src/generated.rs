@@ -9,6 +9,12 @@ pub const PORT: u16 = 5727;
 pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 pub const SOCKET_TIMEOUT_SECS: u64 = 15;
 pub const CONNECTION_COOLDOWN_MS: u64 = 1000;
+pub const REQUEST_TIMEOUT_MS: u64 = 300;
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+pub const DUMP_SETTLE_MS: u64 = 1000;
+pub const RECONNECT_DELAY_MS: u64 = 4000;
+pub const RECONNECT_MAX_DELAY_MS: u64 = 30000;
+pub const CONTROL_REOPEN_MIN_GAP_MS: u64 = 30000;
 
 // Discovery
 pub const DISCOVERY_HEADER: &str = "DSCV";
@@ -38,6 +44,7 @@ pub const CBOR_SELECTOR_STRING: i64 = 4;
 pub const CBOR_FILLER_BYTE: u8 = 0xc0;
 pub const STATE_DUMP_TRIGGER_ADDRESS: u32 = 102528;
 pub const STATE_DUMP_TRIGGER_VALUE: i64 = 1;
+pub const DUMP_END_ADDRESS: u32 = 100800;
 pub const SENSITIVE_ADDRESSES: [u32; 2] = [200008, 200009];
 pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
