@@ -24,11 +24,20 @@ VECTORS = ROOT / "spec" / "vectors"
 with open(ROOT / "spec" / "protocol.toml", "rb") as fh:
     P = tomllib.load(fh)
 
+with open(ROOT / "spec" / "parameters.toml", "rb") as fh:
+    PARAMS = tomllib.load(fh)
+
 MFR = bytes(P["sysex"]["manufacturer_id"])
 DEVICE_OMNI = P["sysex"]["device_omni"]
 FULL_SCALE = P["sysex"]["full_scale"]
 FN = P["sysex"]["functions"]
 TAG_CONT = P["midi3"]["tag_continuation"]
+BANK_SLOTS = PARAMS["well_known"]["bank_slots"]
+MORPH_PAGE = PARAMS["well_known"]["page_morph"]
+MORPH_NUMBER = PARAMS["well_known"]["morph_number"]
+MORPH_BUTTON_NUMBER = PARAMS["well_known"]["morph_button_number"]
+CURRENT_BANK_ADDRESS = PARAMS["well_known"]["current_bank_address"]
+CURRENT_RIG_SLOT_ADDRESS = PARAMS["well_known"]["current_rig_slot_address"]
 
 
 def hx(b: bytes | list[int]) -> str:
@@ -71,6 +80,16 @@ def set_single(product, device, page, number, value) -> bytes:
 def request_rendered_string(product, device, page, number, value) -> bytes:
     msb, lsb = u14_split(value)
     return sysex(product, device, FN["request_rendered_string"], page, number, [msb, lsb])
+
+
+def request_extended_param(product, device, address) -> bytes:
+    return bytes([0xF0, *MFR, product, device, FN["request_ext_param"], 0x00,
+                  *ext_encode(address, 5), 0xF7])
+
+
+def ext_param(product, device, address, value) -> bytes:
+    return bytes([0xF0, *MFR, product, device, FN["ext_param"], 0x00,
+                  *ext_encode(address, 5), *ext_encode(value, 5), 0xF7])
 
 
 def beacon(init, tuner, lease_secs, param_set, product) -> bytes:
@@ -126,6 +145,13 @@ def parse_extended_string(msg: bytes):
     address = ext_decode(msg[8:13])
     text = bytes(msg[13:-1]).split(b"\x00", 1)[0].decode("ascii", "replace")
     return {"address": address, "text": text}
+
+
+def parse_extended_param(msg: bytes):
+    if (len(msg) < 19 or msg[0] != 0xF0 or bytes(msg[1:4]) != MFR
+            or msg[6] != FN["ext_param"] or msg[-1] != 0xF7):
+        return None
+    return {"address": ext_decode(msg[8:13]), "value": ext_decode(msg[13:18])}
 
 
 def parse_rendered_string(msg: bytes):
@@ -207,6 +233,18 @@ def _check():
     # extended string round-trip
     m = bytes([0xF0, *MFR, 0x02, 0x00, 0x07, 0x00]) + ext_encode(1, 5) + b"AC30\x00\xf7"
     assert parse_extended_string(m) == {"address": 1, "text": "AC30"}
+    # extended param: ground truth from a captured position reply — current bank
+    # (address 100701) reading 1.
+    assert list(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 1)) == [
+        0xF0, 0x00, 0x20, 0x33, 0x02, 0x00, 0x06, 0x00,
+        0x00, 0x00, 0x06, 0x12, 0x5D, 0x00, 0x00, 0x00, 0x00, 0x01, 0xF7]
+    assert list(request_extended_param(0x00, 0x7F, CURRENT_RIG_SLOT_ADDRESS)) == [
+        0xF0, 0x00, 0x20, 0x33, 0x00, 0x7F, 0x46, 0x00,
+        0x00, 0x00, 0x06, 0x12, 0x5E, 0xF7]
+    for addr, value in ((CURRENT_BANK_ADDRESS, 24), (102405, 0x123456789)):
+        assert parse_extended_param(ext_param(0x02, 0x00, addr, value)) == {
+            "address": addr, "value": value}
+    assert parse_extended_param(set_single(0x00, 0x7F, 0x00, 0x01, 1)) is None
     # rendered string reply
     rr = sysex(0x02, DEVICE_OMNI, FN["rendered_string_reply"], 0x3C, 53,
                [*u14_split(8192), ord("<"), ord("0"), ord("."), ord("0"), ord(">"), 0])
@@ -333,6 +371,16 @@ def build():
             {"bytes": hx(ext_encode(1, 5)), "value": 1},
             {"bytes": hx(ext_encode(1280, 5)), "value": 1280},
             {"bytes": hx(ext_encode(0x123456789, 5)), "value": 0x123456789},
+        ],
+        "request_extended_param": [
+            {"product": 0x00, "device": 0x7F, "address": CURRENT_BANK_ADDRESS, "hex": hx(request_extended_param(0x00, 0x7F, CURRENT_BANK_ADDRESS))},
+            {"product": 0x00, "device": 0x7F, "address": CURRENT_RIG_SLOT_ADDRESS, "hex": hx(request_extended_param(0x00, 0x7F, CURRENT_RIG_SLOT_ADDRESS))},
+        ],
+        "parse_extended_param": [
+            {"hex": hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 24)), "expected": {"address": CURRENT_BANK_ADDRESS, "value": 24}},
+            {"hex": hx(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, 3)), "expected": {"address": CURRENT_RIG_SLOT_ADDRESS, "value": 3}},
+            {"hex": hx(ext_param(0x02, 0x00, 102405, 0x123456789)), "expected": {"address": 102405, "value": 0x123456789}},
+            {"hex": hx(set_single(0x00, 0x7F, 0x00, 0x01, 1)), "expected": None},
         ],
         "parse_extended_string": [
             {"hex": hx(bytes([0xF0, *MFR, 0x02, 0x00, 0x07, 0x00]) + ext_encode(1, 5) + b"AC30\x00\xf7"), "expected": {"address": 1, "text": "AC30"}},
@@ -504,31 +552,53 @@ def _state_cases():
     cases.append({"name": "amp on + gain", "messages": [hx(ampon), hx(gain)],
                   "expect": {"amp_on": True, "amp_gain": 6925}})
     # 6. Morph + tuner note + main volume.
-    morph = set_single(0x00, 0x00, 0x00, 0x0B, 4096)
+    morph = set_single(0x00, 0x00, MORPH_PAGE, MORPH_NUMBER, 4096)
     note = set_single(0x00, 0x00, 0x7D, 0x54, 9)
     mainv = set_single(0x00, 0x00, 0x7F, 0x00, 12000)
     cases.append({"name": "morph + tuner note + main vol",
                   "messages": [hx(morph), hx(note), hx(mainv)],
                   "expect": {"morph": 4096, "tuner_note": 9, "main_volume": 12000}})
-    # 7. The device's position: Bank Select LSB (high 7 bits) then Program
-    #    Change (low 7), a flat 0-based rig index that divides by BANK_SLOTS.
-    #    Index 123 = bank 24, slot 3 — the last rig of a 25-bank device.
-    cases.append({"name": "rig index, single byte",
-                  "messages": [hx(bytes([0xB0, 32, 0])), hx(bytes([0xC0, 123]))],
+    # 6b. The morph button is momentary: it says a morph happened, and moves
+    #     nothing in the tree. Only the position (0x77) is stored.
+    cases.append({"name": "morph button leaves the position alone",
+                  "messages": [hx(set_single(0x00, 0x00, MORPH_PAGE, MORPH_BUTTON_NUMBER, 1))],
+                  "expect": {"morph": None}})
+    # 6c. Regression: 0x0B is *not* the morph. It is a real address that answers
+    #     a request with a constant 0 whether the rig is morphed or at base, and
+    #     is never pushed — so a value landing there must move nothing, or the
+    #     mistake it caused goes unnoticed again.
+    cases.append({"name": "0x0B is not the morph",
+                  "messages": [hx(set_single(0x00, 0x00, MORPH_PAGE, 0x0B, 16383))],
+                  "expect": {"morph": None}})
+    # 7. The device's position: a `$06` Extended Parameter per index, both
+    #    0-based. Bank 24 slot 3 is flat index 123 — the last rig of a 25-bank
+    #    device.
+    cases.append({"name": "position from extended params",
+                  "messages": [hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 24)),
+                               hx(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, 3))],
                   "expect": {"current_bank": 24, "current_rig_slot": 3,
                              "current_rig_index": 123}})
-    # 8. An index past 127 needs the Bank Select byte: 128 * 1 + 72 = 200.
-    cases.append({"name": "rig index, two bytes",
-                  "messages": [hx(bytes([0xB0, 32, 1])), hx(bytes([0xC0, 72]))],
+    # 8. The two arrive independently — the device pushes only the one that
+    #    changed — so a bank alone must land, leaving the slot unknown.
+    cases.append({"name": "position, bank alone",
+                  "messages": [hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 40))],
+                  "expect": {"current_bank": 40, "current_rig_slot": None,
+                             "current_rig_index": None}})
+    # 9. A later push of one half must not disturb the other: slot 0 of bank 40
+    #    is flat index 200.
+    cases.append({"name": "position, halves pushed apart",
+                  "messages": [hx(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, 2)),
+                               hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 40)),
+                               hx(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, 0))],
                   "expect": {"current_bank": 40, "current_rig_slot": 0,
                              "current_rig_index": 200}})
-    # 9. A Program Change with no Bank Select ahead of it is half an index, not
-    #    a position: the trailing lone PC must leave the last one standing.
-    cases.append({"name": "rig index ignores an unpaired program change",
-                  "messages": [hx(bytes([0xB0, 32, 0])), hx(bytes([0xC0, 123])),
-                               hx(bytes([0xC0, 5]))],
-                  "expect": {"current_bank": 24, "current_rig_slot": 3,
-                             "current_rig_index": 123}})
+    # 10. An extended address the state tree does not track changes nothing —
+    #     102405 is the free-running counter the device pushes every second.
+    cases.append({"name": "position ignores an untracked extended address",
+                  "messages": [hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 24)),
+                               hx(ext_param(0x02, 0x00, 102405, 31))],
+                  "expect": {"current_bank": 24, "current_rig_slot": None,
+                             "current_rig_index": None}})
     return cases
 
 

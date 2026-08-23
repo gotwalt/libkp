@@ -49,6 +49,10 @@ def test_extracts_position_from_a_multi_run():
     snap = cbor.extract_snapshot([run])
     assert snap.current_bank == 1
     assert snap.current_rig_slot == 2
+    # The morph has not landed, so the reader must keep going.
+    assert not snap.is_complete()
+    snap = cbor.extract_snapshot([run, cbor.param_write(119, 8192)])
+    assert snap.morph == 8192
     assert snap.is_complete()
 
 
@@ -72,3 +76,21 @@ def test_empty_snapshot_is_incomplete():
     assert snap.current_bank is None
     assert snap.current_rig_slot is None
     assert not snap.is_complete()
+
+
+def test_session_backlog_survives_a_late_subscriber():
+    """The state dump lands as soon as the session opens, which is before a
+    caller can subscribe. Those values must not be sent into a void -- the morph
+    among them appears nowhere else until something moves it."""
+    session = cbor.CborSession(session=None)
+    # Values arriving with nobody subscribed are held...
+    session._emit([cbor.param_write(gen.MORPH_ADDRESS, 8192)])
+    assert list(session._backlog) == [(gen.MORPH_ADDRESS, 8192)]
+    # ...and replayed to the first subscriber.
+    queue = session.updates()
+    assert queue.get_nowait() == (gen.MORPH_ADDRESS, 8192)
+    assert not session._backlog
+    # Once subscribed, values go straight out rather than accumulating.
+    session._emit([cbor.param_write(gen.MORPH_ADDRESS, 0)])
+    assert queue.get_nowait() == (gen.MORPH_ADDRESS, 0)
+    assert not session._backlog

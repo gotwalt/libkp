@@ -24,7 +24,11 @@
 //! non-mutating.
 
 use std::net::Ipv4Addr;
+use std::sync::Mutex;
 use std::time::Duration;
+
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 
 use crate::SessionError;
 use crate::generated;
@@ -469,9 +473,9 @@ pub fn is_sensitive(addr: u32) -> bool {
     generated::SENSITIVE_ADDRESSES.contains(&addr)
 }
 
-/// The device's current position and the names carried alongside it, read out of
-/// a state dump. Both indices are 0-based; either is `None` if the dump did not
-/// carry it.
+/// The device's current position and the values carried alongside it, read out
+/// of a state dump. Both indices are 0-based; any field is `None` if the dump
+/// did not carry it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StateSnapshot {
     /// Current bank, 0-based ([`generated::CURRENT_BANK_ADDRESS`]).
@@ -479,6 +483,14 @@ pub struct StateSnapshot {
     /// Current rig slot within the bank, 0-based
     /// ([`generated::CURRENT_RIG_SLOT_ADDRESS`]).
     pub current_rig_slot: Option<u16>,
+    /// The morph position (0 = base, 16383 = fully morphed), at
+    /// [`generated::MORPH_ADDRESS`].
+    ///
+    /// This dump is the only way a client that is not holding a CBOR session
+    /// open can learn it: the position is never sent on the MIDI3 stream, and
+    /// answers neither a `$41` nor a `$46` request. It is a live value, so it is
+    /// true as of the read and stale the moment anyone morphs.
+    pub morph: Option<u16>,
     /// String parameters the dump carried, by address, with any sensitive value
     /// redacted. In document order; useful for the current rig name (address 1)
     /// and the bank name.
@@ -486,9 +498,16 @@ pub struct StateSnapshot {
 }
 
 impl StateSnapshot {
-    /// True once both indices are known — the reader can stop early.
+    /// True once every value this snapshot reads is known — the point at which
+    /// the reader may stop before the dump has finished streaming.
+    ///
+    /// The morph counts: it arrives later in the dump than the two indices, so
+    /// stopping at those would truncate the read just short of it and leave
+    /// [`morph`](Self::morph) `None` on a device that reported it perfectly
+    /// well. Every dump observed carries all three, at base as readily as
+    /// morphed.
     pub fn is_complete(&self) -> bool {
-        self.current_bank.is_some() && self.current_rig_slot.is_some()
+        self.current_bank.is_some() && self.current_rig_slot.is_some() && self.morph.is_some()
     }
 
     /// The string parameter at `addr`, if the dump carried one.
@@ -507,6 +526,8 @@ fn note_index(snap: &mut StateSnapshot, addr: i128, value: i128) {
         snap.current_bank = v;
     } else if addr == generated::CURRENT_RIG_SLOT_ADDRESS as i128 {
         snap.current_rig_slot = v;
+    } else if addr == generated::MORPH_ADDRESS as i128 {
+        snap.morph = v;
     }
 }
 
@@ -520,6 +541,54 @@ fn note_index(snap: &mut StateSnapshot, addr: i128, value: i128) {
 /// skipped exactly as [`param_write`] never emits one.
 pub fn extract_snapshot(items: &[Value]) -> StateSnapshot {
     let mut snap = StateSnapshot::default();
+    walk(items, &mut |element| match element {
+        Element::Numeric(addr, value) => note_index(&mut snap, addr, value),
+        Element::Text(addr, text) => {
+            let a = addr as u32;
+            let text = if is_sensitive(a) {
+                generated::REDACTED_PLACEHOLDER.to_string()
+            } else {
+                text.to_string()
+            };
+            snap.strings.push((a, text));
+        }
+    });
+    snap
+}
+
+/// One element of a decoded dump or push, as [`walk`] hands it out.
+enum Element<'a> {
+    /// A numeric parameter: flat address, value.
+    Numeric(i128, i128),
+    /// A string parameter: flat address, text.
+    Text(i128, &'a str),
+}
+
+/// Every numeric address/value pair the items carry, in document order.
+///
+/// The dump and a session's live pushes are the same shapes, so this is what a
+/// [`CborSession`] folds into a state tree as values move.
+pub fn numeric_values(items: &[Value]) -> Vec<(u32, i64)> {
+    let mut out = Vec::new();
+    walk(items, &mut |element| {
+        if let Element::Numeric(addr, value) = element {
+            // A negative or oversized address is malformed, not an address to
+            // wrap into a plausible-looking one.
+            if let (Ok(a), Ok(v)) = (u32::try_from(addr), i64::try_from(value)) {
+                out.push((a, v));
+            }
+        }
+    });
+    out
+}
+
+/// Walk decoded items, handing each numeric and string element to a callback.
+///
+/// Scans the value-bearing shapes: a single `[1, addr, value]`, a consecutive-run
+/// `[2, base, v0, v1, …]` where the whole run is walked because the target
+/// address can fall anywhere inside it, and a string `[4, addr, text]`. A leading
+/// negative source-flag word, if present, is skipped.
+fn walk(items: &[Value], visit: &mut dyn FnMut(Element)) {
     for item in items {
         let Some(fields) = item.as_array() else {
             continue;
@@ -535,31 +604,24 @@ pub fn extract_snapshot(items: &[Value]) -> StateSnapshot {
         let addr = rest.get(1).and_then(Value::as_i128);
         if selector == generated::CBOR_SELECTOR_SINGLE as i128 {
             if let (Some(a), Some(v)) = (addr, rest.get(2).and_then(Value::as_i128)) {
-                note_index(&mut snap, a, v);
+                visit(Element::Numeric(a, v));
             }
         } else if selector == generated::CBOR_SELECTOR_MULTI as i128 {
             if let Some(base) = addr {
                 for (i, v) in rest[2..].iter().enumerate() {
                     if let Some(v) = v.as_i128() {
-                        note_index(&mut snap, base + i as i128, v);
+                        visit(Element::Numeric(base + i as i128, v));
                     }
                 }
             }
         } else if selector == generated::CBOR_SELECTOR_STRING as i128 {
             if let (Some(a), Some(Value::Text(t))) = (addr, rest.get(2)) {
                 if !t.is_empty() {
-                    let a = a as u32;
-                    let text = if is_sensitive(a) {
-                        generated::REDACTED_PLACEHOLDER.to_string()
-                    } else {
-                        t.clone()
-                    };
-                    snap.strings.push((a, text));
+                    visit(Element::Text(a, t));
                 }
             }
         }
     }
-    snap
 }
 
 impl StateSnapshot {
@@ -567,13 +629,14 @@ impl StateSnapshot {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 
     /// Open a fresh CBOR session to `ip`, trigger the state dump, and read back
-    /// the current bank and rig slot.
+    /// the current bank, rig slot and morph position.
     ///
     /// This opens its **own** short-lived connection, independent of any
     /// [`DeviceModel`](crate::model), and closes it (by drop) on return. The
-    /// device crashes under connection churn, so run this sequentially — before,
-    /// not concurrently with, a streaming session — and sparingly. Returns as
-    /// soon as both indices are known or the default timeout elapses.
+    /// device crashes under connection churn, so run this sparingly. For a *live*
+    /// view, and to run alongside a streaming session rather than before it, use
+    /// [`CborSession`]. Returns as soon as every value it reads is known (see
+    /// [`is_complete`](Self::is_complete)) or the default timeout elapses.
     pub async fn fetch(ip: Ipv4Addr) -> Result<StateSnapshot, SessionError> {
         Self::fetch_with(ip, Self::DEFAULT_TIMEOUT).await
     }
@@ -612,6 +675,115 @@ impl StateSnapshot {
             }
         }
         Ok(extract_snapshot(&items))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live session
+// ---------------------------------------------------------------------------
+
+/// One value the device pushed on the CBOR channel: a flat address and its
+/// value, as the channel encodes it (35-bit range, so wider than `$01`).
+pub type CborUpdate = (u32, i64);
+
+/// A **live** session on the native CBOR channel: it opens, asks for the state
+/// dump, and then streams every value the device pushes until it is dropped.
+///
+/// This is the counterpart to [`StateSnapshot::fetch`], which reads one dump and
+/// hangs up. Hold this open instead when you want to *watch* the values the
+/// MIDI3 stream never carries — the morph position above all, which is pushed
+/// here at about 40 Hz while a morph ramps and is unreachable by any request on
+/// the streaming session.
+///
+/// **It may run alongside a [`DeviceModel`](crate::model::DeviceModel).** The
+/// device's fragility is about connection *churn*, not concurrency: two
+/// read-only sessions coexist happily, and the pair is how a client gets both
+/// the meter lane and the morph. Space the two connections by
+/// [`generated::CONNECTION_COOLDOWN_MS`] when opening them, and do not reopen
+/// either in a tight loop.
+///
+/// Read-only. The one thing it writes is the state-dump trigger, which is a flag
+/// the device already carries — see `docs/06`.
+pub struct CborSession {
+    updates: broadcast::Sender<CborUpdate>,
+    /// The receiver opened before ingest started, handed to the first
+    /// [`subscribe`](Self::subscribe) so the state dump survives the gap between
+    /// connecting and subscribing.
+    initial: Mutex<Option<broadcast::Receiver<CborUpdate>>>,
+    task: JoinHandle<()>,
+}
+
+impl CborSession {
+    /// How long a read waits before looping. Short, so a drop takes effect
+    /// promptly.
+    const READ_IDLE: Duration = Duration::from_millis(250);
+
+    /// Connect to `ip:5727`, open the CBOR protocol, ask for the state dump, and
+    /// start streaming.
+    ///
+    /// Returns once the session is established; values arrive on
+    /// [`subscribe`](Self::subscribe). Subscribe *before* awaiting them, or the
+    /// dump's own burst is missed.
+    pub async fn connect(ip: Ipv4Addr) -> Result<Self, SessionError> {
+        let mut session = Session::connect(ip).await?;
+        let outcome = session
+            .handshake(&[PROTOCOL_CBOR_CONTROL], Duration::from_millis(30))
+            .await?;
+        session.write_session_preamble().await?;
+        let tail = outcome.response_tail().to_vec();
+
+        // Writing one item asks for the whole state; the reply is the burst the
+        // stream opens with.
+        session.write_all(&to_vec(&state_dump_request())).await?;
+
+        // Subscribe before spawning: `broadcast::Sender::send` discards when
+        // nothing is listening, and the opening burst — the only place several
+        // values, the morph among them, appear until something moves them —
+        // lands immediately. This receiver keeps it, and `subscribe` hands it to
+        // the first caller.
+        let (updates, initial) = broadcast::channel(4096);
+        let task = tokio::spawn(ingest(session, updates.clone(), tail));
+        Ok(CborSession {
+            updates,
+            initial: Mutex::new(Some(initial)),
+            task,
+        })
+    }
+
+    /// Subscribe to every value the device pushes, in arrival order.
+    ///
+    /// The first caller also receives whatever arrived before it subscribed, so
+    /// the state dump is not lost to the gap after [`connect`](Self::connect).
+    pub fn subscribe(&self) -> broadcast::Receiver<CborUpdate> {
+        if let Some(initial) = self.initial.lock().ok().and_then(|mut g| g.take()) {
+            return initial;
+        }
+        self.updates.subscribe()
+    }
+}
+
+impl Drop for CborSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Own the socket: read, decode, and fan out every numeric value.
+async fn ingest(mut session: Session, updates: broadcast::Sender<CborUpdate>, tail: Vec<u8>) {
+    let mut decoder = Decoder::new();
+    for pair in numeric_values(&decoder.push(&tail)) {
+        let _ = updates.send(pair);
+    }
+    loop {
+        match session.read_once(CborSession::READ_IDLE, 64 * 1024).await {
+            Ok(chunk) if chunk.is_empty() => {}
+            Ok(chunk) => {
+                for pair in numeric_values(&decoder.push(&chunk)) {
+                    let _ = updates.send(pair);
+                }
+            }
+            Err(_) => return,
+        }
     }
 }
 
@@ -680,9 +852,13 @@ mod tests {
                 Value::Uint(2),
             ])),
         );
-        let snap = extract_snapshot(&[run]);
+        let snap = extract_snapshot(std::slice::from_ref(&run));
         assert_eq!(snap.current_bank, Some(1));
         assert_eq!(snap.current_rig_slot, Some(2));
+        // The morph has not landed, so the reader must keep going.
+        assert!(!snap.is_complete());
+        let snap = extract_snapshot(&[run.clone(), param_write(119, 8192)]);
+        assert_eq!(snap.morph, Some(8192));
         assert!(snap.is_complete());
     }
 
@@ -718,5 +894,25 @@ mod tests {
             snap.string(generated::SENSITIVE_ADDRESSES[0]),
             Some(generated::REDACTED_PLACEHOLDER)
         );
+    }
+
+    /// A negative or oversized address is malformed; wrapping it into a
+    /// plausible-looking `u32` would invent a parameter that was never sent.
+    #[test]
+    fn numeric_values_skips_unrepresentable_addresses() {
+        let good = param_write(generated::MORPH_ADDRESS, 8192);
+        assert_eq!(
+            numeric_values(&[good]),
+            vec![(generated::MORPH_ADDRESS, 8192)]
+        );
+        let wide = Value::Tag(
+            1,
+            Box::new(Value::Array(vec![
+                Value::Uint(generated::CBOR_SELECTOR_SINGLE as u64),
+                Value::Uint(u64::from(u32::MAX) + 1),
+                Value::Uint(1),
+            ])),
+        );
+        assert!(numeric_values(&[wide]).is_empty());
     }
 }

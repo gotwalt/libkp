@@ -134,6 +134,7 @@ rendered_string_reply = 0x3C     # reply to a rendered-string request
 request_single = 0x41            # request a single numeric parameter (reply $01)
 request_multi = 0x42             # request all params of a unit (reply $02)
 request_string = 0x43            # request a string parameter (reply $03)
+request_ext_param = 0x46         # request an extended-address parameter (reply $06)
 request_ext_string = 0x47        # request an extended string
 request_rendered_string = 0x7C   # request a value rendered to display text (reply $3C)
 beacon = 0x7E                    # bidirectional beacon (PySwitch; undocumented in the PDF)

@@ -513,8 +513,11 @@ final class ParamsTests: XCTestCase {
         XCTAssertEqual(Params.paramName(page: 0x05, number: 6), "Fixed Noise Gate On/Off")
         XCTAssertEqual(Params.paramName(page: 0x7D, number: 84), "Tuner Note")
         XCTAssertEqual(Params.paramName(page: 0x7F, number: 126), "Tuner Mode State")
-        XCTAssertEqual(Params.page0NumericName(0x0B), "Morph State")
-        XCTAssertEqual(Params.describeNumeric(page: 0x00, number: 0x0B), "Page 0: Morph State")
+        XCTAssertEqual(Params.page0NumericName(0x77), "Morph Position")
+        XCTAssertEqual(Params.page0NumericName(0x50), "Morph Button")
+        XCTAssertEqual(Params.describeNumeric(page: 0x00, number: 0x77), "Page 0: Morph Position")
+        // 0x0B is a string tag, and is *not* the morph — see testMorphIsNotAt0x0B.
+        XCTAssertNil(Params.page0NumericName(0x0B))
         XCTAssertEqual(Params.describe(page: 0x00, number: 0x0B), "String Tags: Amp Author")
     }
 
@@ -921,6 +924,65 @@ final class StateTests: XCTestCase {
         XCTAssertEqual(state.morph, 8192)
     }
 
+    func testMorphButtonIsMomentary() {
+        var state = DeviceState()
+        let press = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageMorph,
+                number: Generated.morphButtonNumber, value: 1
+            ))
+        XCTAssertEqual(press.events, [.morphButton(on: true)])
+        XCTAssertFalse(press.slowChanged, "the button stores nothing")
+        let release = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageMorph,
+                number: Generated.morphButtonNumber, value: 0
+            ))
+        XCTAssertEqual(release.events, [.morphButton(on: false)])
+        // The button says a morph happened; it never says where the fader sits.
+        XCTAssertNil(state.morph)
+    }
+
+    /// `$0B` came from a third-party mapping and is wrong: the device answers a
+    /// request there with a constant 0 whether the rig is morphed or at base, and
+    /// never pushes it. Nothing may land in ``DeviceState/morph`` from it, or the
+    /// same silent mistake returns — a value that simply never moves.
+    func testMorphIsNotAt0x0B() {
+        var state = DeviceState()
+        let outcome = state.apply(
+            Nrpn.setSingle(
+                product: 0, device: 0, page: Generated.pageMorph, number: 0x0B, value: 16383
+            ))
+        XCTAssertNil(state.morph)
+        XCTAssertFalse(outcome.slowChanged)
+        XCTAssertEqual(outcome.events, [.paramChanged(page: 0x00, number: 0x0B, value: 16383)])
+    }
+
+    /// The two channels are one event universe: a value arriving over CBOR lands
+    /// in the same field, and raises the same event, as one arriving over MIDI3.
+    func testApplyCborRoutesTheSameAsTheStream() {
+        var state = DeviceState()
+        let morph = state.applyCbor(address: Generated.morphAddress, value: 8192)
+        XCTAssertEqual(morph.events, [.morphChanged(8192)])
+        XCTAssertTrue(morph.slowChanged)
+        XCTAssertEqual(state.morph, 8192)
+
+        let bank = state.applyCbor(address: Generated.currentBankAddress, value: 3)
+        XCTAssertEqual(bank.events, [.currentPosition(bank: 3, slot: nil)])
+        let slot = state.applyCbor(address: Generated.currentRigSlotAddress, value: 4)
+        XCTAssertEqual(slot.events, [.currentPosition(bank: 3, slot: 4)])
+        XCTAssertEqual(state.currentRigIndex, 19)
+
+        // An unchanged value is not a change, and an unknown address is ignored.
+        XCTAssertEqual(
+            state.applyCbor(address: Generated.morphAddress, value: 8192), ApplyOutcome())
+        XCTAssertEqual(state.applyCbor(address: 102_405, value: 31), ApplyOutcome())
+        // A value too wide for the field is dropped, not truncated.
+        XCTAssertEqual(
+            state.applyCbor(address: Generated.morphAddress, value: 70_000), ApplyOutcome())
+        XCTAssertEqual(state.morph, 8192)
+    }
+
     func testTunerDevianceIsFastAndNoteIsSlow() {
         var state = DeviceState()
         let deviance = state.apply(
@@ -1048,7 +1110,11 @@ final class CborTests: XCTestCase {
         let snap = Cbor.extractSnapshot([run])
         XCTAssertEqual(snap.currentBank, 1)
         XCTAssertEqual(snap.currentRigSlot, 2)
-        XCTAssertTrue(snap.isComplete)
+        // The morph has not landed, so the reader must keep going.
+        XCTAssertFalse(snap.isComplete)
+        let withMorph = Cbor.extractSnapshot([run, Cbor.paramWrite(addr: 119, value: 8192)])
+        XCTAssertEqual(withMorph.morph, 8192)
+        XCTAssertTrue(withMorph.isComplete)
     }
 
     func testExtractsPositionFromSingleItems() {

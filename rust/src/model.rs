@@ -79,8 +79,9 @@ use crate::error::SessionError;
 use crate::generated;
 use crate::midi3::{self, Unframer};
 use crate::nrpn::{
-    self, FUNCTION_EXT_STRING_PARAM, FUNCTION_MULTI_PARAM, FUNCTION_RENDERED_STRING_REPLY,
-    FUNCTION_SINGLE_PARAM, FUNCTION_STRING_PARAM, NrpnHeader, PAGE_STRINGS, multi_values,
+    self, FUNCTION_EXT_PARAM, FUNCTION_EXT_STRING_PARAM, FUNCTION_MULTI_PARAM,
+    FUNCTION_RENDERED_STRING_REPLY, FUNCTION_SINGLE_PARAM, FUNCTION_STRING_PARAM, NrpnHeader,
+    PAGE_STRINGS, multi_values, parse_extended_param, request_extended_param,
     request_extended_string, request_rendered_string, request_single, request_string, set_single,
     u14,
 };
@@ -121,10 +122,13 @@ const MONITOR_VOL_NUMBER: u8 = generated::MONITOR_VOLUME_NUMBER;
 const PAGE_BANK_PREVIEW: u8 = generated::PAGE_BANK_PREVIEW;
 /// The maximum 14-bit NRPN value (0–16383).
 const NRPN_MAX: u16 = generated::FULL_SCALE;
-/// Morph-state page: page 0 is dual-use, morph lives at number [`MORPH_NUMBER`].
+/// Morph page: page 0 is dual-use, morph lives at [`MORPH_NUMBER`] and
+/// [`MORPH_BUTTON_NUMBER`].
 const PAGE_MORPH: u8 = generated::PAGE_MORPH;
-/// Morph-state number on [`PAGE_MORPH`] (`$01`, 0–16383 morph position).
+/// Morph position on [`PAGE_MORPH`] (`$01`, 0 = base .. 16383 = fully morphed).
 const MORPH_NUMBER: u8 = generated::MORPH_NUMBER;
+/// Morph button on [`PAGE_MORPH`] (`$01`, 1 on press, 0 on release).
+const MORPH_BUTTON_NUMBER: u8 = generated::MORPH_BUTTON_NUMBER;
 /// Tuner-deviance number on [`PAGE_REALTIME`] (`$01`; 8192 = in tune).
 const TUNER_DEVIANCE_NUMBER: u8 = generated::TUNER_DEVIANCE_NUMBER;
 /// Tuner-note page (holds the detected note at [`TUNER_NOTE_NUMBER`]).
@@ -241,8 +245,18 @@ pub enum DeviceEvent {
     },
     /// The tempo changed, in whole beats per minute.
     TempoBpm(u16),
-    /// The morph position changed (`$01` page 0 / number 0x0B, 0–16383).
+    /// The morph position changed (`$01` page 0 / number 0x77): 0 = base,
+    /// 16383 = fully morphed.
+    ///
+    /// Only a CBOR session ever sees this: the position is never sent on the
+    /// MIDI3 stream, even while a morph is ramping. See [`Self::MorphButton`].
     MorphChanged(u16),
+    /// The morph button was pressed (`true`) or released (`false`) — momentary,
+    /// so nothing about it is stored in the snapshot.
+    ///
+    /// This is what a MIDI3 client sees of a morph: *that* one happened, and
+    /// what it did to the audio parameters, but never where the fader sits.
+    MorphButton(bool),
     /// The tuner pitch deviance changed (`$01` page 0x7C / number 0x0F; 8192 =
     /// in tune).
     TunerDeviance(u16),
@@ -338,18 +352,19 @@ impl DeviceState {
     ///   (each consecutive address routed like a single-param).
     /// - `$07` ext-string on the string page → the amp/cab/author tags the
     ///   rig-load dump sends as extended strings (see [`Self::apply_ext_string`]).
+    /// - `$06` extended param → the device's current bank / rig slot (see
+    ///   [`Self::apply_ext_param`]).
     /// - `$3C` rendered-string reply → a transient `RenderedString` event with a
     ///   value's exact display text (see [`Self::apply_rendered_string`]). FAST.
-    /// - `$06` extended and any other traffic → ignored.
+    /// - Anything else → ignored.
     pub fn apply(&mut self, msg: &[u8]) -> ApplyOutcome {
-        // Channel-voice messages ride the same stream as the SysEx: the device
-        // announces every rig change as a Bank Select / Program Change pair.
-        if let Some(outcome) = self.apply_rig_index(msg) {
-            return outcome;
-        }
-        // The extended-string ($07) address is 5×7-bit encoded and does not fit
-        // the fixed `NrpnHeader` layout, so route it off the raw message first.
+        // The extended ($06) and extended-string ($07) addresses are 5×7-bit
+        // encoded and do not fit the fixed `NrpnHeader` layout, so route both
+        // off the raw message first.
         if let Some((h, _)) = NrpnHeader::parse(msg) {
+            if h.function == FUNCTION_EXT_PARAM {
+                return self.apply_ext_param(msg);
+            }
             if h.function == FUNCTION_EXT_STRING_PARAM {
                 return self.apply_ext_string(msg);
             }
@@ -367,55 +382,80 @@ impl DeviceState {
             }
             FUNCTION_MULTI_PARAM => self.apply_multi(h.page, h.number, vals),
             FUNCTION_RENDERED_STRING_REPLY => self.apply_rendered_string(msg),
-            _ => ApplyOutcome::empty(), // $06 extended, and anything else, ignored.
+            _ => ApplyOutcome::empty(),
+        }
+    }
+
+    /// Fold a `$06` Extended Parameter into the tree.
+    ///
+    /// This is the device's position report. It carries a 5×7-bit address and a
+    /// 5×7-bit value; the two addresses that matter here are the current bank
+    /// and the current rig slot, both 0-based. The device pushes whichever of
+    /// the two changed on every rig change — including changes made at the front
+    /// panel — and answers [`DeviceModel::refresh_position`] with both.
+    ///
+    /// Any other extended address is ignored, and a value too large for the
+    /// 16-bit field is dropped rather than truncated into a bogus position.
+    fn apply_ext_param(&mut self, msg: &[u8]) -> ApplyOutcome {
+        let Some((address, value)) = parse_extended_param(msg) else {
+            return ApplyOutcome::empty();
+        };
+        let Ok(value) = u16::try_from(value) else {
+            return ApplyOutcome::empty();
+        };
+        self.apply_address(address, value)
+    }
+
+    /// Fold one **CBOR** address/value into the tree.
+    ///
+    /// The CBOR channel and the MIDI3 stream are two wire formats over one event
+    /// universe, so a value arriving either way lands in the same field and
+    /// raises the same event. This is the entry point for a
+    /// [`CborSession`](crate::cbor::CborSession)'s live pushes and for a state
+    /// dump's items.
+    ///
+    /// A value outside the 16-bit range is dropped rather than truncated into a
+    /// bogus reading.
+    pub fn apply_cbor(&mut self, address: u32, value: i64) -> ApplyOutcome {
+        let Ok(value) = u16::try_from(value) else {
+            return ApplyOutcome::empty();
+        };
+        self.apply_address(address, value)
+    }
+
+    /// Route one flat address to the field that tracks it, whichever transport
+    /// carried it. Unknown addresses change nothing.
+    fn apply_address(&mut self, address: u32, value: u16) -> ApplyOutcome {
+        if address == generated::CURRENT_BANK_ADDRESS {
+            if self.current_bank == Some(value) {
+                return ApplyOutcome::empty();
+            }
+            self.current_bank = Some(value);
+            ApplyOutcome::slow(vec![DeviceEvent::CurrentPosition {
+                bank: Some(value),
+                slot: self.current_rig_slot,
+            }])
+        } else if address == generated::CURRENT_RIG_SLOT_ADDRESS {
+            if self.current_rig_slot == Some(value) {
+                return ApplyOutcome::empty();
+            }
+            self.current_rig_slot = Some(value);
+            ApplyOutcome::slow(vec![DeviceEvent::CurrentPosition {
+                bank: self.current_bank,
+                slot: Some(value),
+            }])
+        } else if address == generated::MORPH_ADDRESS {
+            if self.morph == Some(value) {
+                return ApplyOutcome::empty();
+            }
+            self.morph = Some(value);
+            ApplyOutcome::slow(vec![DeviceEvent::MorphChanged(value)])
+        } else {
+            ApplyOutcome::empty()
         }
     }
 
     /// Route a `$03` page-0 string tag into the tree.
-    /// Fold the device's position report into the tree.
-    ///
-    /// The device says where it is with two channel-voice messages: CC32 (Bank
-    /// Select LSB) carrying the high 7 bits, then a Program Change carrying the
-    /// low 7. Together they are a flat, 0-based rig index — `128 * msb + program`
-    /// — which divides by [`generated::BANK_SLOTS`] into bank and slot. Unlike the CBOR
-    /// snapshot, a one-shot read at connect, this arrives on every change, from
-    /// the front panel as readily as from a controller.
-    ///
-    /// Returns `None` for anything that is not one of the two messages, so NRPN
-    /// parsing carries on. A Program Change with no Bank Select ahead of it is
-    /// ignored: half an index is not a position.
-    fn apply_rig_index(&mut self, msg: &[u8]) -> Option<ApplyOutcome> {
-        match msg.first()? & 0xF0 {
-            generated::CONTROL_CHANGE_STATUS => {
-                if msg.len() < 3 || msg[1] != generated::CC_BANK_SELECT_LSB {
-                    return None;
-                }
-                self.pending_rig_index_msb = Some(msg[2] & 0x7F);
-                Some(ApplyOutcome::empty())
-            }
-            generated::PROGRAM_CHANGE_STATUS => {
-                let msb = self.pending_rig_index_msb?;
-                if msg.len() < 2 {
-                    return None;
-                }
-                self.pending_rig_index_msb = None;
-                let index = u16::from(msb) * 128 + u16::from(msg[1] & 0x7F);
-                let bank = index / generated::BANK_SLOTS as u16;
-                let slot = index % generated::BANK_SLOTS as u16;
-                if self.current_bank == Some(bank) && self.current_rig_slot == Some(slot) {
-                    return Some(ApplyOutcome::empty());
-                }
-                self.current_bank = Some(bank);
-                self.current_rig_slot = Some(slot);
-                Some(ApplyOutcome::slow(vec![DeviceEvent::CurrentPosition {
-                    bank: Some(bank),
-                    slot: Some(slot),
-                }]))
-            }
-            _ => None,
-        }
-    }
-
     fn apply_string(&mut self, number: u8, vals: &[u8]) -> ApplyOutcome {
         let text: String = vals
             .iter()
@@ -551,7 +591,11 @@ impl DeviceState {
             self.output.monitor_volume = Some(value);
             return ApplyOutcome::slow(vec![generic(page, number, value)]);
         }
-        // Morph position (page 0 is dual-use with the string page) (SLOW).
+        // Morph (page 0 is dual-use with the string page). The position is SLOW;
+        // the button is momentary, so it is an event and nothing more.
+        if page == PAGE_MORPH && number == MORPH_BUTTON_NUMBER {
+            return ApplyOutcome::fast(DeviceEvent::MorphButton(value != 0));
+        }
         if page == PAGE_MORPH && number == MORPH_NUMBER {
             self.morph = Some(value);
             return ApplyOutcome::slow(vec![DeviceEvent::MorphChanged(value)]);
@@ -718,6 +762,7 @@ impl DeviceModel {
         // Read-only sync so the snapshot populates from the replies.
         let _ = model.refresh_rig().await;
         let _ = model.refresh_bank().await;
+        let _ = model.refresh_position().await;
         Ok(model)
     }
 
@@ -846,15 +891,53 @@ impl DeviceModel {
         Ok(())
     }
 
+    /// Ask the device where it is: the current bank and rig slot, as two `$46`
+    /// extended-parameter requests. The `$06` replies fold into
+    /// [`DeviceState::current_bank`] and [`DeviceState::current_rig_slot`].
+    /// Read-only.
+    ///
+    /// Only needed once, at connect: the device pushes an unsolicited `$06` for
+    /// whichever of the two changed on every subsequent rig change, whoever
+    /// caused it.
+    pub async fn refresh_position(&self) -> Result<(), CommandError> {
+        for address in [
+            generated::CURRENT_BANK_ADDRESS,
+            generated::CURRENT_RIG_SLOT_ADDRESS,
+        ] {
+            self.enqueue(request_extended_param(PRODUCT, DEVICE, address))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Fold one value from a [`CborSession`](crate::cbor::CborSession) into this
+    /// model's state tree, emitting whatever events it raises and republishing
+    /// the snapshot.
+    ///
+    /// The two channels are one event universe in two wire formats, so a client
+    /// holding both hands the CBOR side's pushes here and reads a single tree.
+    /// This is how the morph position reaches a model whose own session cannot
+    /// carry it.
+    pub fn apply_cbor(&self, address: u32, value: i64) {
+        let outcome = write_state(&self.state).apply_cbor(address, value);
+        for event in outcome.events {
+            let _ = self.events.send(event);
+        }
+        if outcome.slow_changed {
+            let _ = self.snapshots.send(read_state(&self.state).clone());
+        }
+    }
+
     /// Fold a [`StateSnapshot`](crate::cbor::StateSnapshot)'s current bank and
     /// rig slot into the state tree, emitting a
     /// [`DeviceEvent::CurrentPosition`] and broadcasting a fresh snapshot.
     ///
-    /// The MIDI3 stream never reports these indices; a controller learns them by
-    /// running [`StateSnapshot::fetch`](crate::cbor::StateSnapshot::fetch) over a
-    /// separate CBOR session — which the device wants done *before* this streaming
-    /// session opens, not concurrently — and applying the result here. Only the
-    /// `Some` fields overwrite; a `None` leaves the current value untouched.
+    /// For a client that already holds a `StateSnapshot` — read over the CBOR
+    /// channel *before* this streaming session opened — this seeds the tree
+    /// without waiting for a reply. A session that is already up should call
+    /// [`refresh_position`](Self::refresh_position) instead and let the device
+    /// answer. Only the `Some` fields overwrite; a `None` leaves the current
+    /// value untouched.
     pub fn set_current_position(&self, bank: Option<u16>, slot: Option<u16>) {
         {
             let mut st = write_state(&self.state);
@@ -941,8 +1024,8 @@ impl DeviceModel {
     /// [`generated::BANK_SLOTS`], so index 123 is bank 25, slot 4.
     ///
     /// Nothing here assumes how many banks a device has. Aim past the end and
-    /// the device simply stays where it is — and says so in the Bank Select /
-    /// Program Change report that follows, so
+    /// the device simply stays where it is — and says so in the `$06` position
+    /// push that follows, so
     /// [`DeviceState::current_rig_index`](crate::state::DeviceState::current_rig_index)
     /// always reflects where it actually landed, not where this aimed.
     pub async fn select_rig_index(&self, index: u16) -> Result<(), CommandError> {
@@ -1495,10 +1578,84 @@ mod tests {
     #[test]
     fn morph_sets_position() {
         let mut st = DeviceState::new();
-        // Page 0 / number 0x0B, half-morphed.
+        // Page 0 / number 0x77, half-morphed.
         let out = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, MORPH_NUMBER, 8192));
         assert_eq!(out.events, vec![DeviceEvent::MorphChanged(8192)]);
         assert!(out.slow_changed);
+        assert_eq!(st.morph, Some(8192));
+    }
+
+    #[test]
+    fn morph_button_is_momentary() {
+        let mut st = DeviceState::new();
+        let press = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, MORPH_BUTTON_NUMBER, 1));
+        assert_eq!(press.events, vec![DeviceEvent::MorphButton(true)]);
+        assert!(!press.slow_changed, "the button stores nothing");
+        let release = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, MORPH_BUTTON_NUMBER, 0));
+        assert_eq!(release.events, vec![DeviceEvent::MorphButton(false)]);
+        // The button says a morph happened; it never says where the fader sits.
+        assert_eq!(st.morph, None);
+    }
+
+    #[test]
+    fn morph_is_not_at_0x0b() {
+        // 0x0B came from a third-party mapping and is wrong: the device answers
+        // a request there with a constant 0 whether the rig is morphed or at
+        // base, and never pushes it. Nothing may land in `morph` from it, or the
+        // same silent mistake returns — a value that simply never moves.
+        let mut st = DeviceState::new();
+        let out = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, 0x0B, 16383));
+        assert_eq!(st.morph, None);
+        assert!(!out.slow_changed);
+        assert_eq!(
+            out.events,
+            vec![DeviceEvent::ParamChanged {
+                page: 0x00,
+                number: 0x0B,
+                value: 16383
+            }]
+        );
+    }
+
+    /// The two channels are one event universe: a value arriving over CBOR lands
+    /// in the same field, and raises the same event, as one arriving over MIDI3.
+    #[test]
+    fn apply_cbor_routes_the_same_as_the_stream() {
+        let mut st = DeviceState::new();
+        let morph = st.apply_cbor(generated::MORPH_ADDRESS, 8192);
+        assert_eq!(morph.events, vec![DeviceEvent::MorphChanged(8192)]);
+        assert!(morph.slow_changed);
+        assert_eq!(st.morph, Some(8192));
+
+        let bank = st.apply_cbor(generated::CURRENT_BANK_ADDRESS, 3);
+        assert_eq!(
+            bank.events,
+            vec![DeviceEvent::CurrentPosition {
+                bank: Some(3),
+                slot: None
+            }]
+        );
+        let slot = st.apply_cbor(generated::CURRENT_RIG_SLOT_ADDRESS, 4);
+        assert_eq!(
+            slot.events,
+            vec![DeviceEvent::CurrentPosition {
+                bank: Some(3),
+                slot: Some(4)
+            }]
+        );
+        assert_eq!(st.current_rig_index(), Some(19));
+
+        // An unchanged value is not a change, and an unknown address is ignored.
+        assert_eq!(
+            st.apply_cbor(generated::MORPH_ADDRESS, 8192),
+            ApplyOutcome::empty()
+        );
+        assert_eq!(st.apply_cbor(102_405, 31), ApplyOutcome::empty());
+        // A value too wide for the field is dropped, not truncated.
+        assert_eq!(
+            st.apply_cbor(generated::MORPH_ADDRESS, 70_000),
+            ApplyOutcome::empty()
+        );
         assert_eq!(st.morph, Some(8192));
     }
 

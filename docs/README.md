@@ -17,6 +17,7 @@ control.
 8. [Control model](08-control-model.md) — CC vs NRPN, and the device model
 9. [Parameter registry](09-parameter-registry.md) — typed parameter descriptors
 10. [Versioning & compatibility](10-versioning-and-compatibility.md) — how the three implementations stay in sync
+11. [Channels and data paths](11-channels-and-data-paths.md) — MIDI3 vs CBOR: what each carries, how `libkp` uses both, and what is unresolved
 
 ## Sources
 

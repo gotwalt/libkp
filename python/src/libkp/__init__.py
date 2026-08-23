@@ -36,9 +36,11 @@ from __future__ import annotations
 
 from ._generated import SPEC_VERSION
 from .cbor import (
+    CborSession,
     StateSnapshot,
     extract_snapshot,
     fetch_state_snapshot,
+    numeric_values,
     param_write,
     state_dump_request,
 )
@@ -123,6 +125,7 @@ from .state import (
     Disconnected,
     Effect,
     EffectChanged,
+    MorphButton,
     MorphChanged,
     Output,
     ParamChanged,
@@ -220,6 +223,7 @@ __all__ = [
     "Status",
     "BeatPulse",
     "TempoBpm",
+    "MorphButton",
     "MorphChanged",
     "TunerDeviance",
     "TunerNote",
@@ -229,8 +233,10 @@ __all__ = [
     "Disconnected",
     "DeviceModel",
     # cbor state-dump snapshot
+    "CborSession",
     "StateSnapshot",
     "extract_snapshot",
+    "numeric_values",
     "fetch_state_snapshot",
     "param_write",
     "state_dump_request",

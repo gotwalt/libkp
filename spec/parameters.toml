@@ -2,14 +2,14 @@
 #
 # Provenance: transcribed from the official Kemper MIDI Parameter Documentation
 # (page/number → name, effect types, string tags, SysEx functions), plus a few
-# addresses credited to PySwitch: the Fixed-FX page (0x05), the tuner / tempo /
-# meter addresses on pages 0x7C / 0x7D / 0x7F, and the numeric morph-state
-# parameter on page 0. Meter-field identities (page 0x7C, numbers 78–88) were
-# established by observed experimentation (see docs/07-realtime-status.md).
+# addresses credited to PySwitch: the Fixed-FX page (0x05), and the tuner /
+# tempo / meter addresses on pages 0x7C / 0x7D / 0x7F. Meter-field identities
+# (page 0x7C, numbers 78–88) and the morph addresses on page 0 were established
+# by observed experimentation (see docs/07-realtime-status.md and docs/05).
 #
 # Addressing: a parameter is (page, number). Effect modules A..REV share one
 # parameter map. Page 0 is dual-use: string tags via $03/$43, numeric params
-# (morph) via $01/$41.
+# (the morph button and position) via $01.
 
 # SysEx function code → short name (Kemper MIDI doc, Table 5).
 functions = [
@@ -349,7 +349,8 @@ string_tags = [
 
 # Page 0 is dual-use: numeric params (function $01 / $41) instead of string tags.
 page0_numeric = [
-  { number = 0x0B, name = "Morph State" },  # PySwitch
+  { number = 0x50, name = "Morph Button" },
+  { number = 0x77, name = "Morph Position" },
 ]
 
 # Common effect-slot parameter numbers (within any effect page).
@@ -384,8 +385,21 @@ monitor_volume_number = 0x02
 # under the default output routing. It has no soft-takeover, so a written value
 # is authoritative only until the pot next moves; treat master volume as a
 # read-only readout. Main Output (0x7F/0) is independent of the knob.
+# Morph lives on page 0 (dual-use with the string page). The button is a
+# momentary the device reports on press and release; the position is the fader
+# it drives, 0 = base .. 16383 = fully morphed.
+#
+# The position is **push-only and CBOR-only**: neither a $41 nor a $46 request
+# draws any reply, and it never appears on the MIDI3 stream even while a morph
+# is ramping. The CBOR state dump carries it, and a CBOR session sees it move.
+# So a MIDI3 client learns *that* a morph happened, and hears what it did to the
+# audio parameters, but never where the fader sits. See docs/05.
 page_morph = 0x00
-morph_number = 0x0B
+morph_number = 0x77
+morph_button_number = 0x50
+# The morph position as a single CBOR address (page_morph * 128 + morph_number),
+# which is how the state dump names it.
+morph_address = 119
 page_tuner_note = 0x7D
 tuner_note_number = 0x54
 tuner_in_tune_center = 8192
@@ -398,10 +412,11 @@ bank_slots = 5
 bank_rig_name_base = 0x00
 bank_amp_name_base = 0x05
 bank_cabinet_name_base = 0x0A
-# The device's current position, as single extended addresses that appear in the
-# CBOR state dump (docs/06). Both are 0-based: bank 0 slot 0 is the first rig of
-# the first bank. The MIDI3 stream never reports these — the read-only name-match
-# (loaded rig name vs. the bank preview) is the stream-only fallback for the slot,
-# and cannot recover the bank number at all.
+# The device's current position, as single extended addresses. Both are 0-based:
+# bank 0 slot 0 is the first rig of the first bank. They are readable on the
+# streaming session with a `$46` request (reply `$06`), and the device pushes an
+# unsolicited `$06` for whichever of the two changed on every rig change — from
+# the front panel as readily as from a controller. They also appear in the CBOR
+# state dump (docs/06), which is how a client learns them before a session opens.
 current_bank_address = 100701      # 0x1895D
 current_rig_slot_address = 100702  # 0x1895E

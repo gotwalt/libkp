@@ -22,7 +22,7 @@ the official documentation, including:
 
 - The Fixed-FX parameter page and several tuner / tempo / meter addresses.
 - The bidirectional beacon and "sense" keep-alive semantics.
-- The numeric morph-state parameter and the rig/bank selection scheme.
+- The rig/bank selection scheme.
 
 PySwitch is credited wherever those addresses appear in the spec.
 

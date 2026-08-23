@@ -168,6 +168,47 @@
       "value": 4886718345
     }
   ],
+  "request_extended_param": [
+    {
+      "product": 0,
+      "device": 127,
+      "address": 100701,
+      "hex": "f0002033007f4600000006125df7"
+    },
+    {
+      "product": 0,
+      "device": 127,
+      "address": 100702,
+      "hex": "f0002033007f4600000006125ef7"
+    }
+  ],
+  "parse_extended_param": [
+    {
+      "hex": "f000203302000600000006125d0000000018f7",
+      "expected": {
+        "address": 100701,
+        "value": 24
+      }
+    },
+    {
+      "hex": "f000203302000600000006125e0000000003f7",
+      "expected": {
+        "address": 100702,
+        "value": 3
+      }
+    },
+    {
+      "hex": "f0002033020006000000062005121a154f09f7",
+      "expected": {
+        "address": 102405,
+        "value": 4886718345
+      }
+    },
+    {
+      "hex": "f0002033007f010000010001f7",
+      "expected": null
+    }
+  ],
   "parse_extended_string": [
     {
       "hex": "f00020330200070000000000014143333000f7",

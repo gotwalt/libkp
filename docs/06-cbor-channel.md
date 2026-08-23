@@ -1,10 +1,12 @@
 # The CBOR channel
 
-> **Partially implemented.** `libkp` speaks this channel for exactly one purpose:
-> the **state-dump snapshot** that reads the device's current bank and rig
+> **Partially implemented.** `libkp` speaks this channel for two purposes: the
+> one-shot **state-dump snapshot** that reads the device's current bank, rig and
+> morph, and a **live session** (`CborSession`) that holds the channel open and
+> streams every value the device pushes
 > ([`cbor`](../rust/src/cbor.rs) / [`libkp.cbor`](../python/src/libkp/cbor.py) /
 > [`Cbor`](../swift/Sources/LibKP/Cbor.swift)). The codec (encode + streaming
-> decode) and that one exchange are exercised by the conformance vectors
+> decode) and the dump exchange are exercised by the conformance vectors
 > ([`../spec/vectors/cbor.json`](../spec/vectors/cbor.json)). The channel's wider
 > command grammar — preset and library management, backup, firmware transfer — is
 > still only characterized as a category and no `libkp` code path drives it.
@@ -119,11 +121,20 @@ changes then push the elements singly. The dump also carries the current rig
 name (string address 1) and the bank's five preview names, so the name and the
 index agree.
 
-This is the only route to these values. The MIDI3 stream never reports them: the
-read-only name-match ([Control model](08-control-model.md)) — comparing the
-loaded rig name against the [bank preview](09-parameter-registry.md) — can
-recover the *slot* but not the bank number, and fails when two slots share a
-name. The numeric indices resolve both.
+This is the route to these values *before* a streaming session exists. Once one
+is open the same two addresses are readable there, with a `$46` request, and the
+device pushes a `$06` whenever either changes — see
+[the position report](05-sysex-nrpn.md#the-position-report). What neither route
+needs is the name-match ([Control model](08-control-model.md)): comparing the
+loaded rig name against the [bank preview](09-parameter-registry.md) recovers
+the *slot* but not the bank number, and fails when two slots share a name.
+
+### The morph position
+
+The dump also carries the morph position at address 119, which `StateSnapshot`
+reads out alongside the indices. This channel is the **only** route to it: the
+position never appears on the MIDI3 stream and answers no request there. See
+[the morph](05-sysex-nrpn.md#the-morph).
 
 ### Credentials are redacted
 
@@ -156,10 +167,11 @@ let snap = try await StateSnapshot.fetch(ip)
 // snap.currentBank, snap.currentRigSlot        (both UInt16?, 0-based)
 ```
 
-**Run it before, not alongside, a streaming session.** It opens its own socket,
-independent of a [`DeviceModel`](07-realtime-status.md); the device is unhappy
-about concurrent connections and connection churn. It refuses to greet — or
-resets — a session opened too soon after a prior socket closed: a MIDI3 session
+**Space it from any other connection.** It opens its own socket, independent of
+a [`DeviceModel`](07-realtime-status.md). Concurrent sessions are fine — see
+[Channels and data paths](11-channels-and-data-paths.md) — but connection
+*churn* is not. It refuses to greet — or resets — a session opened too soon
+after a prior socket closed: a MIDI3 session
 opened immediately after the snapshot's socket closes times out waiting for the
 greeting, while spacing them by about a second connects cleanly. So a controller
 that also wants live meters should fetch the snapshot first, **wait at least the
@@ -170,11 +182,36 @@ then open the MIDI3 model — and feed the result in with
 `setCurrentPosition` (Swift), which folds the indices into `DeviceState`
 (`current_bank` / `current_rig_slot`) and emits a `CurrentPosition` event.
 
+A controller that opens a streaming session anyway does not need any of that:
+`refresh_position` reads the same two indices over the session it already has,
+and `connect` runs it as part of the initial sync.
+
 ## The relationship to MIDI3
 
-In an idle session, the change events this channel pushes are a re-encoding of
-events the device already broadcasts as MIDI3-framed SysEx. One event universe,
-two wire formats:
+The two channels overlap heavily, but **neither is a superset**. Each sends
+something the other never does, so a client that wants the whole device opens
+both — which the device tolerates: its fragility is about connection *churn*,
+not concurrency, and two read-only sessions coexist indefinitely.
+
+Measured with both channels open across the same gestures:
+
+| | MIDI3 | CBOR |
+|---|---|---|
+| Meter block (11 values, page `$7C`) | all eleven | **only the tuner strobe phase** — the other ten are never sent, not even at zero |
+| Morph position (119) | never | pushed, ~40 Hz while ramping |
+| Morph button (`$00`/`$50`) | pushed | never |
+| Amplifier page (`$0A`) | pushed | absent from the dump |
+| Session-open state dump | none | the whole parameter state |
+
+So a CBOR-only client can drive a tuner strobe but not a level meter, and a
+MIDI3-only client can show everything except where the morph fader sits. `libkp`
+exposes the live channel as `CborSession` (all three implementations) for exactly
+this: hold it alongside a `DeviceModel` and fold its values in with
+`apply_cbor` / `applyCbor`, and one state tree carries what both channels know.
+
+In an idle session, most of what this channel pushes is a re-encoding of events
+the device also broadcasts as MIDI3-framed SysEx. One event universe, two wire
+formats:
 
 | | `{369F50E7-…}` MIDI3 | `{774CDB9E-…}` CBOR |
 |---|---|---|

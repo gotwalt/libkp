@@ -13,6 +13,9 @@ import SwiftUI
 @main
 struct MetersApp: App {
     @StateObject private var store = DeviceStore()
+    /// The loopback command socket, when `KP_DEBUG_PORT` asks for one. Held for
+    /// the app's lifetime; `nil` — and nothing listening — otherwise.
+    @State private var debugControl: DebugControl?
 
     var body: some Scene {
         Window("KP Meters", id: "main") {
@@ -25,6 +28,9 @@ struct MetersApp: App {
                     NSApp.setActivationPolicy(.regular)
                     NSApp.activate(ignoringOtherApps: true)
                     store.start()
+                    if debugControl == nil {
+                        debugControl = DebugControl.fromEnvironment(store: store)
+                    }
                 }
         }
         .defaultSize(width: 760, height: 640)

@@ -51,6 +51,7 @@ __all__ = [
     "Status",
     "BeatPulse",
     "TempoBpm",
+    "MorphButton",
     "MorphChanged",
     "TunerDeviance",
     "TunerNote",
@@ -365,9 +366,27 @@ class TempoBpm(DeviceEvent):
 
 @dataclass(frozen=True, slots=True)
 class MorphChanged(DeviceEvent):
-    """The morph position changed (``$01`` page 0 / number 0x0B, 0–16383)."""
+    """The morph position changed (``$01`` page 0 / number 0x77): 0 = base,
+    16383 = fully morphed.
+
+    Only a CBOR session ever sees this: the position is never sent on the MIDI3
+    stream, even while a morph is ramping. See :class:`MorphButton`.
+    """
 
     value: int
+
+
+@dataclass(frozen=True, slots=True)
+class MorphButton(DeviceEvent):
+    """The morph button was pressed or released (``$01`` page 0 / number 0x50) --
+    momentary, so nothing about it is stored in the snapshot.
+
+    This is what a MIDI3 client sees of a morph: *that* one happened, and what it
+    did to the audio parameters, but never where the fader sits.
+    """
+
+    #: True on press, False on release.
+    on: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,15 +419,16 @@ class RenderedString(DeviceEvent):
 
 @dataclass(frozen=True, slots=True)
 class CurrentPosition(DeviceEvent):
-    """The device's current position was learned from the CBOR state-dump snapshot.
+    """The device's current position changed, or was learned for the first time.
 
     Read :attr:`DeviceState.current_bank` and :attr:`DeviceState.current_rig_slot`
-    for the new values (both 0-based).
+    for the new values (both 0-based); a ``None`` here is a half not yet known,
+    not a cleared one.
     """
 
-    #: Current bank, 0-based, if the dump carried it.
+    #: Current bank, 0-based, if known.
     bank: int | None
-    #: Current rig slot within the bank, 0-based, if the dump carried it.
+    #: Current rig slot within the bank, 0-based, if known.
     slot: int | None
 
 
@@ -496,17 +516,19 @@ class DeviceState:
     output: Output = field(default_factory=Output)
     #: The loaded bank's five-slot name preview (page ``0x96``).
     bank: Bank = field(default_factory=Bank)
-    #: Current bank, 0-based, once known. Seeded from the CBOR state-dump
-    #: snapshot (:func:`libkp.cbor.fetch_state_snapshot`) via
-    #: :meth:`libkp.model.DeviceModel.set_current_position`, then kept live by
-    #: the Bank Select / Program Change pair the device sends on every rig change.
+    #: Current bank, 0-based, once known. Kept live by the ``$06`` Extended
+    #: Parameter the device sends at :data:`libkp._generated.CURRENT_BANK_ADDRESS`
+    #: whenever the bank changes -- from the front panel as readily as from a
+    #: controller -- and by the reply to
+    #: :meth:`libkp.model.DeviceModel.refresh_position`. Can also be seeded
+    #: before a session opens, from the CBOR state-dump snapshot
+    #: (:func:`libkp.cbor.fetch_state_snapshot`) via
+    #: :meth:`libkp.model.DeviceModel.set_current_position`.
     current_bank: int | None = None
     #: Current rig slot within the bank, 0-based, once known. Same source as
-    #: :attr:`current_bank`; slot 0 is rig slot 1.
+    #: :attr:`current_bank`, at
+    #: :data:`libkp._generated.CURRENT_RIG_SLOT_ADDRESS`; slot 0 is rig slot 1.
     current_rig_slot: int | None = None
-    #: The high 7 bits of a rig index, held between the Bank Select that carries
-    #: them and the Program Change that completes the pair.
-    _pending_rig_index_msb: int | None = None
 
     @property
     def current_rig_index(self) -> int | None:
@@ -520,7 +542,10 @@ class DeviceState:
             return None
         return self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
 
-    #: Latest morph position (0–16383), once seen (NRPN ``0x00/0x0B``).
+    #: Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
+    #: ``0x00/0x77``). Filled only from a CBOR source -- the state dump
+    #: (:attr:`libkp.cbor.StateSnapshot.morph`) or a CBOR session's live pushes.
+    #: A MIDI3-only client never learns it, so this stays ``None`` there.
     morph: int | None = None
     #: The most recent realtime status / meter frame (the FAST lane).
     status: RealtimeStatus = field(default_factory=RealtimeStatus)
@@ -556,22 +581,20 @@ class DeviceState:
           rig-load dump (each consecutive address routed like a single-param).
         - ``$07`` ext-string on the string page → the amp/cab/author tags the
           rig-load dump sends as extended strings.
+        - ``$06`` extended param → the device's current bank / rig slot.
         - ``$3C`` rendered-string reply → a transient ``RenderedString``. FAST.
-        - ``$06`` extended and any other traffic → ignored.
+        - Anything else → ignored.
         """
-        # Channel-voice messages ride the same stream as the SysEx: the device
-        # announces every rig change as a Bank Select / Program Change pair.
-        outcome = self._apply_rig_index(msg)
-        if outcome is not None:
-            return outcome
-
         parsed = NrpnHeader.parse(msg)
         if parsed is None:
             return ApplyOutcome.empty()
         header, vals = parsed
 
-        # The extended-string ($07) address is 5x7-bit encoded and does not fit
-        # the fixed header layout, so route it off the raw message.
+        # The extended ($06) and extended-string ($07) addresses are 5x7-bit
+        # encoded and do not fit the fixed header layout, so route both off the
+        # raw message.
+        if header.function == nrpn.FUNCTION_EXT_PARAM:
+            return self._apply_ext_param(msg)
         if header.function == nrpn.FUNCTION_EXT_STRING_PARAM:
             return self._apply_ext_string(msg)
 
@@ -589,41 +612,61 @@ class DeviceState:
 
     # -- decode helpers ----------------------------------------------------
 
-    def _apply_rig_index(self, msg: bytes) -> ApplyOutcome | None:
-        """Fold the device's position report into the tree.
+    def _apply_ext_param(self, msg: bytes) -> ApplyOutcome:
+        """Fold a ``$06`` Extended Parameter into the tree.
 
-        The device says where it is with two channel-voice messages: CC32 (Bank
-        Select LSB) carrying the high 7 bits, then a Program Change carrying the
-        low 7. Together they are a flat, 0-based rig index -- ``128 * msb +
-        program`` -- which divides by ``BANK_SLOTS`` into bank and slot.
-        Unlike the CBOR snapshot, a one-shot read at connect, this arrives on
-        every change, from the front panel as readily as from a controller.
+        This is the device's position report. It carries a 5x7-bit address and a
+        5x7-bit value; the two addresses that matter here are the current bank
+        and the current rig slot, both 0-based. The device pushes whichever of
+        the two changed on every rig change -- including changes made at the
+        front panel -- and answers
+        :meth:`libkp.model.DeviceModel.refresh_position` with both.
 
-        Returns ``None`` for anything that is not one of the two messages, so
-        NRPN parsing carries on. A Program Change with no Bank Select ahead of it
-        is ignored: half an index is not a position.
+        Any other extended address is ignored, and a value too large for the
+        16-bit field is dropped rather than truncated into a bogus position.
         """
-        if not msg:
-            return None
-        status = msg[0] & 0xF0
-        if status == gen.CONTROL_CHANGE_STATUS:
-            if len(msg) < 3 or msg[1] != gen.CC_BANK_SELECT_LSB:
-                return None
-            self._pending_rig_index_msb = msg[2] & 0x7F
+        parsed = nrpn.parse_extended_param(msg)
+        if parsed is None:
             return ApplyOutcome.empty()
-        if status == gen.PROGRAM_CHANGE_STATUS:
-            msb = self._pending_rig_index_msb
-            if len(msg) < 2 or msb is None:
-                return None
-            self._pending_rig_index_msb = None
-            index = msb * 128 + (msg[1] & 0x7F)
-            bank, slot = divmod(index, gen.BANK_SLOTS)
-            if self.current_bank == bank and self.current_rig_slot == slot:
+        address, value = parsed
+        if value > 0xFFFF:
+            return ApplyOutcome.empty()
+        return self._apply_address(address, value)
+
+    def apply_cbor(self, address: int, value: int) -> ApplyOutcome:
+        """Fold one **CBOR** address/value into the tree.
+
+        The CBOR channel and the MIDI3 stream are two wire formats over one event
+        universe, so a value arriving either way lands in the same field and
+        raises the same event. This is the entry point for a
+        :class:`libkp.cbor.CborSession`'s live pushes and for a state dump's items.
+
+        A value outside the 16-bit range is dropped rather than truncated into a
+        bogus reading.
+        """
+        if not 0 <= value <= 0xFFFF:
+            return ApplyOutcome.empty()
+        return self._apply_address(address, value)
+
+    def _apply_address(self, address: int, value: int) -> ApplyOutcome:
+        """Route one flat address to the field that tracks it, whichever
+        transport carried it. Unknown addresses change nothing."""
+        if address == gen.CURRENT_BANK_ADDRESS:
+            if self.current_bank == value:
                 return ApplyOutcome.empty()
-            self.current_bank = bank
-            self.current_rig_slot = slot
-            return ApplyOutcome.slow([CurrentPosition(bank=bank, slot=slot)])
-        return None
+            self.current_bank = value
+            return ApplyOutcome.slow([CurrentPosition(bank=value, slot=self.current_rig_slot)])
+        if address == gen.CURRENT_RIG_SLOT_ADDRESS:
+            if self.current_rig_slot == value:
+                return ApplyOutcome.empty()
+            self.current_rig_slot = value
+            return ApplyOutcome.slow([CurrentPosition(bank=self.current_bank, slot=value)])
+        if address == gen.MORPH_ADDRESS:
+            if self.morph == value:
+                return ApplyOutcome.empty()
+            self.morph = value
+            return ApplyOutcome.slow([MorphChanged(value=value)])
+        return ApplyOutcome.empty()
 
     def _apply_string(self, number: int, vals: bytes) -> ApplyOutcome:
         """Route a ``$03`` page-0 string tag into the tree."""
@@ -725,10 +768,13 @@ class DeviceState:
         if page == gen.SYSTEM_PAGE and number == gen.MONITOR_VOLUME_NUMBER:
             self.output.monitor_volume = value
             return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        # Morph position (page 0 is dual-use with the string page) (SLOW).
+        # Morph (page 0 is dual-use with the string page). The position is SLOW;
+        # the button is momentary, so it is an event and nothing more.
         if page == gen.PAGE_MORPH and number == gen.MORPH_NUMBER:
             self.morph = value
             return ApplyOutcome.slow([MorphChanged(value=value)])
+        if page == gen.PAGE_MORPH and number == gen.MORPH_BUTTON_NUMBER:
+            return ApplyOutcome.fast(MorphButton(on=value != 0))
         # Tuner detected note (SLOW).
         if page == gen.PAGE_TUNER_NOTE and number == gen.TUNER_NOTE_NUMBER:
             note = value & 0x7F

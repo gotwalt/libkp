@@ -52,6 +52,7 @@ need five bytes.
 | `$41` | Request Single Parameter | client → device | `<page> <num>` — reply `$01` |
 | `$42` | Request Multi Parameters | client → device | `<page> <num>` — reply `$02` |
 | `$43` | Request String Parameter | client → device | `<page> <num>` — reply `$03` |
+| `$46` | Request Extended Parameter | client → device | `<5-byte address>` — reply `$06` (or `$01` if the address fits in 14 bits) |
 | `$47` | Request Extended String | client → device | `<5-byte address>` — reply `$07` (or `$03` if the address fits in 14 bits) |
 | `$7C` | Request Rendered String | client → device | `<page> <num> <MSB> <LSB>` — reply `$3C` |
 | `$7E` | Beacon / sense | both | see [below](#beacon-and-sense) |
@@ -129,7 +130,7 @@ Page `$00` is dual-use: the same page number addresses ASCII string tags when
 reached through `$03`/`$43` and numeric parameters when reached through
 `$01`/`$41`. The function code disambiguates, so a decoder must key on it — for
 example page 0 / number 1 is the **Rig Name** string, while page 0 / number
-`$0B` is the numeric **Morph State**.
+`$77` is the numeric **Morph Position**.
 
 ## Worked example — request a rig name
 
@@ -376,9 +377,81 @@ Constants: `[beacon]` in [`../spec/protocol.toml`](../spec/protocol.toml).
 ## Program Change feedback does not exist here
 
 Program Change, Note On and Note Off are inert in the device's network MIDI
-encoder — no Program Change is emitted when the rig changes. To display the
-current rig, request its name (`$43`, page 0, number 1) after a switch rather
-than waiting for feedback. See [Control model](08-control-model.md).
+encoder — no Program Change is emitted when the rig changes, and nothing but
+SysEx ever comes back on the stream. To display the current rig, request its
+name (`$43`, page 0, number 1) after a switch rather than waiting for feedback.
+
+Where the device *is* it says a different way: as `$06` Extended Parameters at
+the two position addresses. See [the position report](#the-position-report).
+
+## The position report
+
+The device's current bank and rig slot live at two extended addresses, both
+0-based:
+
+| address | meaning |
+|---|---|
+| **100701** (`0x1895D`) | current bank |
+| **100702** (`0x1895E`) | current rig slot within the bank |
+
+Together they are a flat rig index, `bank × 5 + slot`, which is the only address
+that names a rig outside the current bank.
+
+Read them with `$46` and the device answers with `$06` in about 20 ms:
+
+```
+-> f0 00 20 33 00 7f 46 00  00 00 06 12 5d  f7          request address 100701
+<- f0 00 20 33 02 00 06 00  00 00 06 12 5d  00 00 00 00 01  f7   = 1
+```
+
+Better, the device **pushes** an unsolicited `$06` for whichever of the two
+changed on every rig change — from the front panel as readily as from a
+controller — so a client reads them once at connect and then just listens.
+Neither address is pushed when its value does not move: stepping a bank at the
+same slot pushes 100701 alone.
+
+Both fields use the 5×7-bit extended encoding, so a `$06` value spans 35 bits
+rather than the 14 a `$01` carries. Other extended addresses share the stream —
+102405 is a free-running counter the device emits every second — so match on the
+address rather than assuming any `$06` is a position.
+
+Established by observed experimentation; the function code `$46` is not in the
+Kemper MIDI Parameter Documentation.
+
+## The morph
+
+Morph lives on page `$00`, at two numbers:
+
+| page / number | address | meaning |
+|---|---|---|
+| `$00` / `$50` | 80 | **Morph Button** — 1 on press, 0 on release |
+| `$00` / `$77` | 119 | **Morph Position** — 0 = base … 16383 = fully morphed |
+
+A press ramps the position across the full 14-bit range in about two seconds at
+roughly 40 Hz, the direction alternating per press, starting on the press rather
+than the release. A state dump taken while morphed reports the position, so it
+is part of persistent state and not merely a live event.
+
+**The position is CBOR-only, and push-only.** Neither a `$41` nor a `$46`
+request draws any reply, and it never appears on the MIDI3 stream — unframing a
+45-second capture across nine morph cycles yields no message carrying address
+119 at all. The [CBOR channel](06-cbor-channel.md) is the only route: its state
+dump carries the position (`StateSnapshot`), and a live `CborSession` watches it
+move, at about 40 Hz while a morph ramps. Holding that session alongside a
+`DeviceModel` is what a client does to show both the meters and the morph.
+
+So a MIDI3 client learns *that* a morph happened, from the button at `$50`, and
+hears what it did to the audio parameters — but never where the fader sits. The
+bidirectional beacon does not change this.
+
+**`$0B` is not the morph.** It is a real address that answers a request with a
+constant 0 whether the rig is morphed or at base, and is never pushed. Because
+nothing errors and the value simply never moves, a client keyed on it looks like
+a rig that is never morphed. Implementations carry a regression test against it.
+
+Established by observed experimentation, measured with the front-panel MORPH
+button across nine press/release cycles with a CBOR and a MIDI3 session open
+side by side.
 
 ## Sources
 

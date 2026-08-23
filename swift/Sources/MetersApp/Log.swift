@@ -78,6 +78,8 @@ enum Log {
             return "tempoBpm \(bpm)"
         case let .morphChanged(value):
             return "morph \(value)"
+        case let .morphButton(on):
+            return "morphButton \(on ? "press" : "release")"
         case let .currentPosition(bank, slot):
             return "currentPosition bank \(opt(bank)) slot \(opt(slot))"
         case .connected:

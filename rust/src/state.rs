@@ -191,19 +191,26 @@ pub struct DeviceState {
     pub output: Output,
     /// The loaded bank's five-slot name preview (page `0x96`).
     pub bank: Bank,
-    /// Current bank, 0-based, once known. Seeded from the CBOR state-dump
+    /// Current bank, 0-based, once known. Kept live by the `$06` Extended
+    /// Parameter the device sends at [`generated::CURRENT_BANK_ADDRESS`]
+    /// whenever the bank changes — from the front panel as readily as from a
+    /// controller — and by the reply to
+    /// [`DeviceModel::refresh_position`](crate::model::DeviceModel::refresh_position).
+    /// Can also be seeded before a session opens, from the CBOR state-dump
     /// snapshot ([`crate::cbor::StateSnapshot::fetch`]) via
-    /// [`DeviceModel::set_current_position`](crate::model::DeviceModel::set_current_position),
-    /// then kept live by the Bank Select / Program Change pair the device sends
-    /// on every rig change.
+    /// [`DeviceModel::set_current_position`](crate::model::DeviceModel::set_current_position).
     pub current_bank: Option<u16>,
     /// Current rig slot within the bank, 0-based, once known. Same source as
-    /// [`current_bank`](Self::current_bank); slot 0 is rig slot 1.
+    /// [`current_bank`](Self::current_bank), at
+    /// [`generated::CURRENT_RIG_SLOT_ADDRESS`]; slot 0 is rig slot 1.
     pub current_rig_slot: Option<u16>,
-    /// The high 7 bits of a rig index, held between the Bank Select that carries
-    /// them and the Program Change that completes the pair.
-    pub(crate) pending_rig_index_msb: Option<u8>,
-    /// Latest morph position (0–16383), once seen (NRPN `0x00/0x0B`).
+    /// Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
+    /// `0x00/0x77`).
+    ///
+    /// Filled only from a CBOR source — the state dump
+    /// ([`StateSnapshot::morph`](crate::cbor::StateSnapshot::morph)) or a CBOR
+    /// session's live pushes. A MIDI3-only client never learns it, so this stays
+    /// `None` there.
     pub morph: Option<u16>,
     /// The most recent realtime status / meter frame (the FAST lane).
     pub status: RealtimeStatus,
@@ -243,7 +250,6 @@ impl DeviceState {
             bank: Bank::default(),
             current_bank: None,
             current_rig_slot: None,
-            pending_rig_index_msb: None,
             morph: None,
             status: RealtimeStatus::default(),
         }

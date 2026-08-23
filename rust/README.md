@@ -57,7 +57,7 @@ let replies = port.poll(&libkp::Options::default()).await?;
 | `discovery` | Async UDP broadcast discovery (`DiscoveryPort`, `discover`, `find_first`). |
 | `session` | TCP connect, the protocol-list handshake, and the stream preamble. |
 | `midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
-| `cbor` | The native CBOR channel: codec plus `StateSnapshot::fetch`, the state-dump read of the current bank/rig. |
+| `cbor` | The native CBOR channel: codec, `StateSnapshot::fetch` (a one-shot read of the current bank/rig/morph) and `CborSession` (a live session streaming what MIDI3 omits). |
 | `nrpn` | Kemper SysEx/NRPN builders and parsers (14-bit values, string tags, extended strings, the beacon). |
 | `control` | The 7-bit CC / Program Change / Bank Select vocabulary (`Control`). |
 | `params` | Offline `page/number → name` lookups over the generated tables. |

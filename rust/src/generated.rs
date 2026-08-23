@@ -2,7 +2,7 @@
 #![allow(clippy::all)]
 #![cfg_attr(rustfmt, rustfmt::skip)]
 
-pub const SPEC_VERSION: &str = "0.5.0";
+pub const SPEC_VERSION: &str = "0.6.0";
 
 // Transport
 pub const PORT: u16 = 5727;
@@ -66,6 +66,7 @@ pub const FN_RENDERED_STRING_REPLY: u8 = 0x3c;
 pub const FN_REQUEST_SINGLE: u8 = 0x41;
 pub const FN_REQUEST_MULTI: u8 = 0x42;
 pub const FN_REQUEST_STRING: u8 = 0x43;
+pub const FN_REQUEST_EXT_PARAM: u8 = 0x46;
 pub const FN_REQUEST_EXT_STRING: u8 = 0x47;
 pub const FN_REQUEST_RENDERED_STRING: u8 = 0x7c;
 pub const FN_BEACON: u8 = 0x7e;
@@ -108,7 +109,9 @@ pub const BANK_RIG_NAME_BASE: u8 = 0x00;
 pub const BANK_AMP_NAME_BASE: u8 = 0x05;
 pub const BANK_CABINET_NAME_BASE: u8 = 0x0a;
 pub const PAGE_MORPH: u8 = 0x00;
-pub const MORPH_NUMBER: u8 = 0x0b;
+pub const MORPH_NUMBER: u8 = 0x77;
+pub const MORPH_BUTTON_NUMBER: u8 = 0x50;
+pub const MORPH_ADDRESS: u32 = 119;
 pub const PAGE_TUNER_NOTE: u8 = 0x7d;
 pub const TUNER_NOTE_NUMBER: u8 = 0x54;
 pub const TUNER_IN_TUNE_CENTER: u16 = 8192;
@@ -474,7 +477,8 @@ pub static STRING_TAGS: &[(u8, &str)] = &[
 
 #[rustfmt::skip]
 pub static PAGE0_NUMERIC: &[(u8, &str)] = &[
-    (0x0b, "Morph State"),
+    (0x50, "Morph Button"),
+    (0x77, "Morph Position"),
 ];
 
 #[rustfmt::skip]

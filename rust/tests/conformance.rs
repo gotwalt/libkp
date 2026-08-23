@@ -95,7 +95,7 @@ fn opt_str(v: &Value) -> Option<&str> {
 
 #[test]
 fn spec_version_matches() {
-    assert_eq!(generated::SPEC_VERSION, "0.5.0");
+    assert_eq!(generated::SPEC_VERSION, "0.6.0");
     assert_eq!(libkp::SPEC_VERSION, generated::SPEC_VERSION);
     assert_eq!(PORT, 5727);
 }
@@ -286,6 +286,28 @@ fn nrpn_parser_vectors() {
     for c in cases(&doc, "ext_decode") {
         let got = nrpn::ext_decode(&unhex(&str_of(c, "bytes")));
         assert_eq!(got, c["value"].as_u64().unwrap(), "ext_decode");
+    }
+
+    for c in cases(&doc, "request_extended_param") {
+        let built = nrpn::request_extended_param(
+            c["product"].as_u64().unwrap() as u8,
+            c["device"].as_u64().unwrap() as u8,
+            c["address"].as_u64().unwrap() as u32,
+        );
+        assert_eq!(hex(&built), str_of(c, "hex"), "request_extended_param");
+    }
+
+    for c in cases(&doc, "parse_extended_param") {
+        let got = nrpn::parse_extended_param(&unhex(&str_of(c, "hex")));
+        match c["expected"].as_object() {
+            None => assert_eq!(got, None, "parse_extended_param should reject"),
+            Some(_) => {
+                let e = &c["expected"];
+                let (addr, value) = got.expect("parse_extended_param should accept");
+                assert_eq!(u64::from(addr), e["address"].as_u64().unwrap());
+                assert_eq!(value, e["value"].as_u64().unwrap());
+            }
+        }
     }
 
     for c in cases(&doc, "parse_extended_string") {
@@ -508,12 +530,10 @@ fn state_apply_vectors() {
                 "[{name}] amp_gain"
             );
         }
+        // A JSON null asserts the morph is still unset — the MIDI3 stream never
+        // carries the position, so most messages must leave it alone.
         if let Some(v) = expect.get("morph") {
-            assert_eq!(
-                state.morph,
-                Some(v.as_u64().unwrap() as u16),
-                "[{name}] morph"
-            );
+            assert_eq!(state.morph, v.as_u64().map(|v| v as u16), "[{name}] morph");
         }
         if let Some(v) = expect.get("tuner_note") {
             assert_eq!(
@@ -522,24 +542,30 @@ fn state_apply_vectors() {
                 "[{name}] tuner_note"
             );
         }
+        // A JSON null here asserts the half is still unknown — the device
+        // pushes only the index that changed.
         if let Some(v) = expect.get("current_bank") {
             assert_eq!(
                 state.current_bank,
-                Some(v.as_u64().unwrap() as u16),
+                v.as_u64().map(|v| v as u16),
                 "[{name}] current_bank"
             );
         }
+        // A JSON null here asserts the half is still unknown — the device
+        // pushes only the index that changed.
         if let Some(v) = expect.get("current_rig_slot") {
             assert_eq!(
                 state.current_rig_slot,
-                Some(v.as_u64().unwrap() as u16),
+                v.as_u64().map(|v| v as u16),
                 "[{name}] current_rig_slot"
             );
         }
+        // A JSON null here asserts the half is still unknown — the device
+        // pushes only the index that changed.
         if let Some(v) = expect.get("current_rig_index") {
             assert_eq!(
                 state.current_rig_index(),
-                Some(v.as_u64().unwrap() as u16),
+                v.as_u64().map(|v| v as u16),
                 "[{name}] current_rig_index"
             );
         }
@@ -641,6 +667,8 @@ fn cbor_extract_snapshot_vectors() {
             snap.current_rig_slot, want_slot,
             "[{name}] current_rig_slot"
         );
+        let want_morph = expect["morph"].as_u64().map(|v| v as u16);
+        assert_eq!(snap.morph, want_morph, "[{name}] morph");
 
         if let Some(strings) = expect.get("strings").and_then(|v| v.as_array()) {
             let got: Vec<(u32, String)> = snap.strings.clone();
