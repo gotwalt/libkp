@@ -22,7 +22,7 @@ Requires Swift 6.0 or newer and macOS 13+.
 | `Sources/LibKP/Generated.swift` | **Generated** constants and lookup tables — do not edit; see [`../codegen`](../codegen) |
 | `Sources/LibKP/Protocol.swift` | The discovery TagStream encoding and the poll packet |
 | `Sources/LibKP/Discovery.swift` | UDP discovery over an exclusively-bound BSD socket |
-| `Sources/LibKP/Session.swift` | TCP session, protocol handshake, stream preamble |
+| `Sources/LibKP/Session.swift` | TCP session, protocol handshake, stream preamble, and the per-peer connection ledger that spaces opens by the cooldown |
 | `Sources/LibKP/Inbox.swift` | The timed read buffer behind the session's async reads |
 | `Sources/LibKP/Midi3.swift` | Stream framing/unframing |
 | `Sources/LibKP/Nrpn.swift` | SysEx/NRPN builders and parsers |
