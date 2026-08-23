@@ -8,8 +8,13 @@ held to the shared conformance vectors.
 ```sh
 python3 codegen/generate.py          # regenerate the three modules
 python3 codegen/generate.py --check  # exit 1 if any committed module is stale (CI)
-python3 codegen/gen_vectors.py       # regenerate spec/vectors/*.json
+python3 codegen/gen_vectors.py       # regenerate spec/vectors/*.json (every file, cbor.json included)
 ```
+
+`gen_vectors.py` owns every file under `spec/vectors/`, including `cbor.json`,
+for which it carries a minimal CBOR encoder. CI regenerates the vectors and
+fails if the committed files differ, so a hand edit to a vector does not
+survive — change the script.
 
 Requires Python 3.11+ (stdlib `tomllib`).
 
@@ -39,6 +44,15 @@ Swift). Highlights:
   `NON_EFFECT_PARAMS`, `STRING_TAGS`, `PAGE0_NUMERIC`, `EFFECT_TYPES`,
   `EFFECT_CATEGORIES`, `SLOT_ENABLE_CC`, `METER_FIELDS`, and the `CC_*` control
   constants.
+- **The state routing table** from `spec/state.toml`: `STATE_ROUTES`, a flat
+  list of `Route` records sorted by address, and the closed enums it is typed
+  with — `Field` (one variant per route name: the tree field the address
+  writes), `Kind` (how the value decodes), `Lane` (fast / slow) and `Wire`
+  (stream / control / both). Each `Route` carries `address`, `field`, `slot`
+  (the per-slot index for rows expanded over the effect slots, the bank
+  preview, or a spanned block; absent otherwise), `kind`, `lane`, `wire`,
+  `dedupe` and `request`. Per-slot and spanned rows are expanded by the
+  generator, so the table is already flat.
 
 Tables are emitted as the most natural literal per language: Rust `static`
 slices of tuples, Python `dict`/`list`, Swift `Dictionary`/`Array` (with small
@@ -46,6 +60,17 @@ slices of tuples, Python `dict`/`list`, Swift `Dictionary`/`Array` (with small
 Implementations wrap these with
 thin lookup helpers (`param_name`, `effect_type_name`, …); the `params.json`
 vectors verify those helpers agree across languages.
+
+The routing table follows the same rule. It is emitted as data — Rust
+`generated::{Field, Kind, Lane, Wire, Route, STATE_ROUTES}`, Python
+`libkp._generated.{Field, Kind, Lane, Wire, Route, STATE_ROUTES}` (`Enum`s and
+a `NamedTuple`), Swift `Route` with nested `Route.Field` / `Route.Kind` /
+`Route.Lane` / `Route.Wire` and `Generated.stateRoutes` — and nothing more:
+no lookup by address, and no code that writes a field. The fold that turns a
+`Route` into a store write is hand-written in each language, where the
+compiler's exhaustiveness check over `Field` (or a coverage test, in Python)
+keeps it complete. The table is small enough that generating the fold would
+buy little and would change the data-only contract.
 
 **Do not edit the generated files by hand.** Change `spec/*.toml` and rerun the
 generator.

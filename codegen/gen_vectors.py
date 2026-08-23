@@ -38,6 +38,8 @@ MORPH_NUMBER = PARAMS["well_known"]["morph_number"]
 MORPH_BUTTON_NUMBER = PARAMS["well_known"]["morph_button_number"]
 CURRENT_BANK_ADDRESS = PARAMS["well_known"]["current_bank_address"]
 CURRENT_RIG_SLOT_ADDRESS = PARAMS["well_known"]["current_rig_slot_address"]
+MORPH_ADDRESS = PARAMS["well_known"]["morph_address"]
+CBOR = P["cbor"]
 
 
 def hx(b: bytes | list[int]) -> str:
@@ -210,6 +212,56 @@ def unframe(stream: bytes):
 
 
 # --------------------------------------------------------------------------
+# CBOR (RFC 8949): just enough of an encoder for the control channel's items —
+# unsigned integers, text strings, arrays and tags, each with the shortest head
+# that holds its argument, which is the only encoding the device accepts.
+# --------------------------------------------------------------------------
+
+def cbor_head(major: int, arg: int) -> bytes:
+    if arg < 24:
+        return bytes([major << 5 | arg])
+    for info, width in ((24, 1), (25, 2), (26, 4), (27, 8)):
+        if arg < 1 << (8 * width):
+            return bytes([major << 5 | info]) + arg.to_bytes(width, "big")
+    raise ValueError(f"CBOR argument out of range: {arg}")
+
+
+def cbor(v) -> bytes:
+    """Encode an int, str, list, or ``("tag", n, value)`` tuple."""
+    if isinstance(v, int):
+        return cbor_head(0, v) if v >= 0 else cbor_head(1, -1 - v)
+    if isinstance(v, str):
+        raw = v.encode("utf-8")
+        return cbor_head(3, len(raw)) + raw
+    if isinstance(v, list):
+        return cbor_head(4, len(v)) + b"".join(cbor(x) for x in v)
+    if isinstance(v, tuple) and v[0] == "tag":
+        return cbor_head(6, v[1]) + cbor(v[2])
+    raise TypeError(f"cannot encode {v!r}")
+
+
+def cbor_item(*payload) -> bytes:
+    """One control-channel item: ``tag(item_tag)([selector, ...])``."""
+    return cbor(("tag", CBOR["item_tag"], list(payload)))
+
+
+def cbor_param_write(addr: int, value: int) -> bytes:
+    return cbor_item(CBOR["selector_single"], addr, value)
+
+
+def cbor_multi(base: int, *values: int) -> bytes:
+    return cbor_item(CBOR["selector_multi"], base, *values)
+
+
+def cbor_string(addr: int, text: str) -> bytes:
+    return cbor_item(CBOR["selector_string"], addr, text)
+
+
+def cbor_filler(n: int) -> bytes:
+    return bytes([CBOR["filler_byte"]]) * n
+
+
+# --------------------------------------------------------------------------
 # Inline cross-checks against known-good reference values
 # --------------------------------------------------------------------------
 
@@ -260,6 +312,14 @@ def _check():
     for m in (bytes([0xF0, *MFR, 0xF7]), bytes([0xF0, *MFR, 0x01, 0xF7])):
         rt, pend = unframe(frame(m))
         assert rt == [hx(m)] and pend == 0
+    # CBOR heads at each width boundary, and the state-dump trigger as captured
+    # on the wire: tag(1) [1, 102528, 1] with a 4-byte address argument.
+    assert hx(cbor(23)) == "17" and hx(cbor(24)) == "1818" and hx(cbor(255)) == "18ff"
+    assert hx(cbor(256)) == "190100" and hx(cbor(65536)) == "1a00010000"
+    assert hx(cbor(-1)) == "20" and hx(cbor("AC30")) == "6441433330"
+    assert hx(cbor_param_write(CBOR["state_dump_trigger_address"],
+                               CBOR["state_dump_trigger_value"])) == "c183011a0001908001"
+    assert hx(cbor_param_write(15953, 0)) == "c18301193e5100"
 
 _check()
 
@@ -514,6 +574,24 @@ def build():
         "cases": _state_cases(),
     })
 
+    # cbor: the one write this library sends, and reading a dump's position,
+    # strings and morph back out of a decoded item stream.
+    w("cbor.json", {
+        "description": "The native CBOR control channel: the state-dump write, and reading the "
+                       "current bank/rig position and morph out of a decoded dump.",
+        "param_write": [
+            {"addr": addr, "value": value, "hex": hx(cbor_param_write(addr, value))}
+            for addr, value in ((15953, 0), (102405, 19),
+                                (CBOR["state_dump_trigger_address"],
+                                 CBOR["state_dump_trigger_value"]))
+        ],
+        "state_dump_request": {
+            "hex": hx(cbor_param_write(CBOR["state_dump_trigger_address"],
+                                       CBOR["state_dump_trigger_value"])),
+        },
+        "extract_snapshot": _cbor_snapshot_cases(),
+    })
+
 
 def _hdr(msg: bytes):
     h = parse_header(msg)
@@ -600,6 +678,32 @@ def _state_cases():
                   "expect": {"current_bank": 24, "current_rig_slot": None,
                              "current_rig_index": None}})
     return cases
+
+
+def _cbor_snapshot_cases():
+    def case(name, stream, bank, slot, morph, strings):
+        return {"name": name, "stream_hex": hx(stream),
+                "expect": {"current_bank": bank, "current_rig_slot": slot, "morph": morph,
+                           "strings": [{"addr": a, "text": t} for a, t in strings]}}
+    secret = CBOR["sensitive_addresses"][0]
+    return [
+        # A multi-run is consecutive addresses from its base, so the position
+        # can sit inside one; the filler bytes before it must be skipped.
+        case("position inside one consecutive multi-run, after inter-item filler",
+             cbor_filler(2) + cbor_multi(CURRENT_BANK_ADDRESS - 1, 0, 1, 2),
+             1, 2, None, []),
+        # Singles land too, strings are kept, and a sensitive address is
+        # replaced by the placeholder rather than surfaced.
+        case("position from single items, plus a rig name and a redacted secret",
+             cbor_param_write(CURRENT_BANK_ADDRESS, 3) + cbor_param_write(CURRENT_RIG_SLOT_ADDRESS, 4)
+             + cbor_string(1, "Maz 18 Pushed") + cbor_string(secret, "secret"),
+             3, 4, None, [(1, "Maz 18 Pushed"), (secret, CBOR["redacted_placeholder"])]),
+        case("an empty stream yields no position", b"", None, None, None, []),
+        case("the dump carries the morph position alongside the indices",
+             cbor_param_write(CURRENT_BANK_ADDRESS, 1) + cbor_param_write(CURRENT_RIG_SLOT_ADDRESS, 2)
+             + cbor_param_write(MORPH_ADDRESS, 16383),
+             1, 2, 16383, []),
+    ]
 
 
 if __name__ == "__main__":

@@ -27,8 +27,8 @@
       "expect": {
         "current_bank": 1,
         "current_rig_slot": 2,
-        "strings": [],
-        "morph": null
+        "morph": null,
+        "strings": []
       }
     },
     {
@@ -37,6 +37,7 @@
       "expect": {
         "current_bank": 3,
         "current_rig_slot": 4,
+        "morph": null,
         "strings": [
           {
             "addr": 1,
@@ -46,8 +47,7 @@
             "addr": 200008,
             "text": "[redacted]"
           }
-        ],
-        "morph": null
+        ]
       }
     },
     {
@@ -56,8 +56,8 @@
       "expect": {
         "current_bank": null,
         "current_rig_slot": null,
-        "strings": [],
-        "morph": null
+        "morph": null,
+        "strings": []
       }
     },
     {

@@ -19,7 +19,7 @@ from libkp.state import DeviceState
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.6.0"
+    assert gen.SPEC_VERSION == "0.7.0"
 
 
 def test_every_vector_file_is_covered():

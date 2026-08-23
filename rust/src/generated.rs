@@ -2,7 +2,7 @@
 #![allow(clippy::all)]
 #![cfg_attr(rustfmt, rustfmt::skip)]
 
-pub const SPEC_VERSION: &str = "0.6.0";
+pub const SPEC_VERSION: &str = "0.7.0";
 
 // Transport
 pub const PORT: u16 = 5727;
@@ -119,6 +119,13 @@ pub const TUNER_IN_TUNE_WINDOW: u16 = 350;
 pub const METER_COUNT: usize = 11;
 pub const CURRENT_BANK_ADDRESS: u32 = 100701;
 pub const CURRENT_RIG_SLOT_ADDRESS: u32 = 100702;
+pub const STRING_RIG_AUTHOR: u8 = 0x02;
+pub const STRING_RIG_DATE: u8 = 0x03;
+pub const STRING_RIG_COMMENT: u8 = 0x04;
+pub const STRING_AMP_NAME: u8 = 0x0a;
+pub const STRING_CABINET_NAME: u8 = 0x20;
+pub const CABINET_PAGE: u8 = 0x0c;
+pub const CABINET_ON_NUMBER: u8 = 0x02;
 
 // Meter block
 pub const METER_PAGE: u8 = 0x7c;
@@ -669,5 +676,156 @@ pub static METER_FIELDS: &[(usize, u8, &str, &str, &str)] = &[
     (8, 86, "unused_v8", "(unused)", "extra"),
     (9, 87, "loudness", "Loudness (slow RMS)", "bar"),
     (10, 88, "unused_v10", "(unused)", "extra"),
+];
+
+/// A field of the device-state tree that a routed address writes (spec/state.toml).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Field {
+    RigName,
+    RigAuthor,
+    RigDate,
+    RigComment,
+    AmpName,
+    CabinetName,
+    MorphButton,
+    MorphPosition,
+    TempoBpm,
+    RigVolume,
+    AmpOn,
+    AmpGain,
+    CabinetOn,
+    EffectType,
+    EffectOn,
+    EffectMix,
+    BeatPulse,
+    TunerDeviance,
+    Status,
+    TunerNote,
+    MainVolume,
+    HeadphoneVolume,
+    MonitorVolume,
+    BankRigName,
+    BankAmpName,
+    BankCabinetName,
+    CurrentBank,
+    CurrentRigSlot,
+}
+
+/// How a routed value decodes before it is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Kind {
+    U14,
+    U16,
+    U7,
+    Bool,
+    Text,
+    Bpm,
+    Multi,
+}
+
+/// Which update lane a route feeds: FAST (event only) or SLOW (snapshot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    Fast,
+    Slow,
+}
+
+/// Which channel may write a route: the MIDI3 stream, the CBOR control channel, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Wire {
+    Stream,
+    Control,
+    Both,
+}
+
+/// One row of the state routing table: a flat address and how the tree folds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub address: u32,
+    pub field: Field,
+    /// The per-slot index for expanded rows: effect slot, bank-preview slot, or
+    /// element index within a spanned block.
+    pub slot: Option<u8>,
+    pub kind: Kind,
+    pub lane: Lane,
+    pub wire: Wire,
+    pub dedupe: bool,
+    pub request: bool,
+}
+
+/// The state routing table, sorted by address (spec/state.toml).
+#[rustfmt::skip]
+pub static STATE_ROUTES: &[Route] = &[
+    Route { address: 1, field: Field::RigName, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 2, field: Field::RigAuthor, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 3, field: Field::RigDate, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 4, field: Field::RigComment, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 10, field: Field::AmpName, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 32, field: Field::CabinetName, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 80, field: Field::MorphButton, slot: None, kind: Kind::Bool, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 119, field: Field::MorphPosition, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Control, dedupe: true, request: false },
+    Route { address: 512, field: Field::TempoBpm, slot: None, kind: Kind::Bpm, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 513, field: Field::RigVolume, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 1282, field: Field::AmpOn, slot: None, kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 1284, field: Field::AmpGain, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 1538, field: Field::CabinetOn, slot: None, kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 6400, field: Field::EffectType, slot: Some(0), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6403, field: Field::EffectOn, slot: Some(0), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6404, field: Field::EffectMix, slot: Some(0), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 6528, field: Field::EffectType, slot: Some(1), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6531, field: Field::EffectOn, slot: Some(1), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6532, field: Field::EffectMix, slot: Some(1), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 6656, field: Field::EffectType, slot: Some(2), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6659, field: Field::EffectOn, slot: Some(2), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6660, field: Field::EffectMix, slot: Some(2), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 6784, field: Field::EffectType, slot: Some(3), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6787, field: Field::EffectOn, slot: Some(3), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 6788, field: Field::EffectMix, slot: Some(3), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 7168, field: Field::EffectType, slot: Some(4), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7171, field: Field::EffectOn, slot: Some(4), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7172, field: Field::EffectMix, slot: Some(4), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 7424, field: Field::EffectType, slot: Some(5), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7427, field: Field::EffectOn, slot: Some(5), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7428, field: Field::EffectMix, slot: Some(5), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 7680, field: Field::EffectType, slot: Some(6), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7683, field: Field::EffectOn, slot: Some(6), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7684, field: Field::EffectMix, slot: Some(6), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 7808, field: Field::EffectType, slot: Some(7), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7811, field: Field::EffectOn, slot: Some(7), kind: Kind::Bool, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 7812, field: Field::EffectMix, slot: Some(7), kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: false },
+    Route { address: 15872, field: Field::BeatPulse, slot: None, kind: Kind::Bool, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15887, field: Field::TunerDeviance, slot: None, kind: Kind::U14, lane: Lane::Fast, wire: Wire::Stream, dedupe: true, request: false },
+    Route { address: 15950, field: Field::Status, slot: Some(0), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15951, field: Field::Status, slot: Some(1), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15952, field: Field::Status, slot: Some(2), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15953, field: Field::Status, slot: Some(3), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15954, field: Field::Status, slot: Some(4), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15955, field: Field::Status, slot: Some(5), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15956, field: Field::Status, slot: Some(6), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15957, field: Field::Status, slot: Some(7), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15958, field: Field::Status, slot: Some(8), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15959, field: Field::Status, slot: Some(9), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 15960, field: Field::Status, slot: Some(10), kind: Kind::Multi, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
+    Route { address: 16084, field: Field::TunerNote, slot: None, kind: Kind::U7, lane: Lane::Slow, wire: Wire::Stream, dedupe: true, request: false },
+    Route { address: 16256, field: Field::MainVolume, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 16257, field: Field::HeadphoneVolume, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 16258, field: Field::MonitorVolume, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19200, field: Field::BankRigName, slot: Some(0), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19201, field: Field::BankRigName, slot: Some(1), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19202, field: Field::BankRigName, slot: Some(2), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19203, field: Field::BankRigName, slot: Some(3), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19204, field: Field::BankRigName, slot: Some(4), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19205, field: Field::BankAmpName, slot: Some(0), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19206, field: Field::BankAmpName, slot: Some(1), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19207, field: Field::BankAmpName, slot: Some(2), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19208, field: Field::BankAmpName, slot: Some(3), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19209, field: Field::BankAmpName, slot: Some(4), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19210, field: Field::BankCabinetName, slot: Some(0), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19211, field: Field::BankCabinetName, slot: Some(1), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19212, field: Field::BankCabinetName, slot: Some(2), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19213, field: Field::BankCabinetName, slot: Some(3), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 19214, field: Field::BankCabinetName, slot: Some(4), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 100701, field: Field::CurrentBank, slot: None, kind: Kind::U16, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 100702, field: Field::CurrentRigSlot, slot: None, kind: Kind::U16, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
 ];
 

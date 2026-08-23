@@ -1,6 +1,9 @@
 """GENERATED FILE — DO NOT EDIT. Edit spec/*.toml and run codegen/generate.py."""
 
-SPEC_VERSION = "0.6.0"
+from enum import Enum
+from typing import NamedTuple
+
+SPEC_VERSION = "0.7.0"
 
 PORT = 5727
 CONNECT_TIMEOUT_SECS = 5
@@ -106,6 +109,13 @@ TUNER_IN_TUNE_WINDOW = 350
 METER_COUNT = 11
 CURRENT_BANK_ADDRESS = 100701
 CURRENT_RIG_SLOT_ADDRESS = 100702
+STRING_RIG_AUTHOR = 0x02
+STRING_RIG_DATE = 0x03
+STRING_RIG_COMMENT = 0x04
+STRING_AMP_NAME = 0x0a
+STRING_CABINET_NAME = 0x20
+CABINET_PAGE = 0x0c
+CABINET_ON_NUMBER = 0x02
 
 METER_PAGE = 0x7c
 METER_FIRST_NUMBER = 0x4e
@@ -452,4 +462,155 @@ METER_FIELDS = [
     (9, 87, "loudness", "Loudness (slow RMS)", "bar"),
     (10, 88, "unused_v10", "(unused)", "extra"),
 ]
+
+
+class Field(Enum):
+    """A field of the device-state tree that a routed address writes (spec/state.toml)."""
+
+    RIG_NAME = "rig_name"
+    RIG_AUTHOR = "rig_author"
+    RIG_DATE = "rig_date"
+    RIG_COMMENT = "rig_comment"
+    AMP_NAME = "amp_name"
+    CABINET_NAME = "cabinet_name"
+    MORPH_BUTTON = "morph_button"
+    MORPH_POSITION = "morph_position"
+    TEMPO_BPM = "tempo_bpm"
+    RIG_VOLUME = "rig_volume"
+    AMP_ON = "amp_on"
+    AMP_GAIN = "amp_gain"
+    CABINET_ON = "cabinet_on"
+    EFFECT_TYPE = "effect_type"
+    EFFECT_ON = "effect_on"
+    EFFECT_MIX = "effect_mix"
+    BEAT_PULSE = "beat_pulse"
+    TUNER_DEVIANCE = "tuner_deviance"
+    STATUS = "status"
+    TUNER_NOTE = "tuner_note"
+    MAIN_VOLUME = "main_volume"
+    HEADPHONE_VOLUME = "headphone_volume"
+    MONITOR_VOLUME = "monitor_volume"
+    BANK_RIG_NAME = "bank_rig_name"
+    BANK_AMP_NAME = "bank_amp_name"
+    BANK_CABINET_NAME = "bank_cabinet_name"
+    CURRENT_BANK = "current_bank"
+    CURRENT_RIG_SLOT = "current_rig_slot"
+
+
+class Kind(Enum):
+    """How a routed value decodes before it is stored."""
+
+    U14 = "u14"
+    U16 = "u16"
+    U7 = "u7"
+    BOOL = "bool"
+    TEXT = "text"
+    BPM = "bpm"
+    MULTI = "multi"
+
+
+class Lane(Enum):
+    """Which update lane a route feeds: FAST (event only) or SLOW (snapshot)."""
+
+    FAST = "fast"
+    SLOW = "slow"
+
+
+class Wire(Enum):
+    """Which channel may write a route: the MIDI3 stream, the CBOR control channel, or both."""
+
+    STREAM = "stream"
+    CONTROL = "control"
+    BOTH = "both"
+
+
+class Route(NamedTuple):
+    """One row of the state routing table: a flat address and how the tree folds it."""
+
+    address: int
+    field: Field
+    #: The per-slot index for expanded rows: effect slot, bank-preview slot, or
+    #: element index within a spanned block.
+    slot: int | None
+    kind: Kind
+    lane: Lane
+    wire: Wire
+    dedupe: bool
+    request: bool
+
+
+#: The state routing table, sorted by address (spec/state.toml).
+STATE_ROUTES: tuple[Route, ...] = (
+    Route(1, Field.RIG_NAME, None, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(2, Field.RIG_AUTHOR, None, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(3, Field.RIG_DATE, None, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(4, Field.RIG_COMMENT, None, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(10, Field.AMP_NAME, None, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(32, Field.CABINET_NAME, None, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(80, Field.MORPH_BUTTON, None, Kind.BOOL, Lane.FAST, Wire.STREAM, False, False),
+    Route(119, Field.MORPH_POSITION, None, Kind.U14, Lane.SLOW, Wire.CONTROL, True, False),
+    Route(512, Field.TEMPO_BPM, None, Kind.BPM, Lane.SLOW, Wire.BOTH, True, True),
+    Route(513, Field.RIG_VOLUME, None, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(1282, Field.AMP_ON, None, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(1284, Field.AMP_GAIN, None, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(1538, Field.CABINET_ON, None, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, False),
+    Route(6400, Field.EFFECT_TYPE, 0, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6403, Field.EFFECT_ON, 0, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6404, Field.EFFECT_MIX, 0, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(6528, Field.EFFECT_TYPE, 1, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6531, Field.EFFECT_ON, 1, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6532, Field.EFFECT_MIX, 1, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(6656, Field.EFFECT_TYPE, 2, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6659, Field.EFFECT_ON, 2, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6660, Field.EFFECT_MIX, 2, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(6784, Field.EFFECT_TYPE, 3, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6787, Field.EFFECT_ON, 3, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(6788, Field.EFFECT_MIX, 3, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(7168, Field.EFFECT_TYPE, 4, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7171, Field.EFFECT_ON, 4, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7172, Field.EFFECT_MIX, 4, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(7424, Field.EFFECT_TYPE, 5, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7427, Field.EFFECT_ON, 5, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7428, Field.EFFECT_MIX, 5, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(7680, Field.EFFECT_TYPE, 6, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7683, Field.EFFECT_ON, 6, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7684, Field.EFFECT_MIX, 6, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(7808, Field.EFFECT_TYPE, 7, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7811, Field.EFFECT_ON, 7, Kind.BOOL, Lane.SLOW, Wire.BOTH, True, True),
+    Route(7812, Field.EFFECT_MIX, 7, Kind.U14, Lane.SLOW, Wire.BOTH, True, False),
+    Route(15872, Field.BEAT_PULSE, None, Kind.BOOL, Lane.FAST, Wire.STREAM, False, False),
+    Route(15887, Field.TUNER_DEVIANCE, None, Kind.U14, Lane.FAST, Wire.STREAM, True, False),
+    Route(15950, Field.STATUS, 0, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15951, Field.STATUS, 1, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15952, Field.STATUS, 2, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15953, Field.STATUS, 3, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15954, Field.STATUS, 4, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15955, Field.STATUS, 5, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15956, Field.STATUS, 6, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15957, Field.STATUS, 7, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15958, Field.STATUS, 8, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15959, Field.STATUS, 9, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(15960, Field.STATUS, 10, Kind.MULTI, Lane.FAST, Wire.STREAM, False, False),
+    Route(16084, Field.TUNER_NOTE, None, Kind.U7, Lane.SLOW, Wire.STREAM, True, False),
+    Route(16256, Field.MAIN_VOLUME, None, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(16257, Field.HEADPHONE_VOLUME, None, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(16258, Field.MONITOR_VOLUME, None, Kind.U14, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19200, Field.BANK_RIG_NAME, 0, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19201, Field.BANK_RIG_NAME, 1, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19202, Field.BANK_RIG_NAME, 2, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19203, Field.BANK_RIG_NAME, 3, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19204, Field.BANK_RIG_NAME, 4, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19205, Field.BANK_AMP_NAME, 0, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19206, Field.BANK_AMP_NAME, 1, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19207, Field.BANK_AMP_NAME, 2, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19208, Field.BANK_AMP_NAME, 3, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19209, Field.BANK_AMP_NAME, 4, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19210, Field.BANK_CABINET_NAME, 0, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19211, Field.BANK_CABINET_NAME, 1, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19212, Field.BANK_CABINET_NAME, 2, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19213, Field.BANK_CABINET_NAME, 3, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(19214, Field.BANK_CABINET_NAME, 4, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True),
+    Route(100701, Field.CURRENT_BANK, None, Kind.U16, Lane.SLOW, Wire.BOTH, True, True),
+    Route(100702, Field.CURRENT_RIG_SLOT, None, Kind.U16, Lane.SLOW, Wire.BOTH, True, True),
+)
 

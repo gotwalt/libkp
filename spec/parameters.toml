@@ -364,7 +364,14 @@ volume = 6   # Volume
 # name the constants each implementation's state layer keys on.
 [well_known]
 page_strings = 0x00
+# The page-0 string tags the state tree stores (function $03 / $43, and the same
+# numbers again as $07 extended strings on the rig-load dump).
 string_rig_name = 0x01
+string_rig_author = 0x02
+string_rig_date = 0x03
+string_rig_comment = 0x04
+string_amp_name = 0x0A
+string_cabinet_name = 0x20
 page_realtime = 0x7C
 meter_block_number = 0x4E     # first NRPN number of the 11-value status block
 beat_pulse_number = 0x00
@@ -376,6 +383,8 @@ rig_volume_number = 0x01
 amp_page = 0x0A
 amp_on_number = 0x02
 gain_number = 0x04
+cabinet_page = 0x0C
+cabinet_on_number = 0x02
 system_page = 0x7F
 main_volume_number = 0x00
 headphone_volume_number = 0x01

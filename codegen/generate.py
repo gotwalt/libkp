@@ -10,7 +10,10 @@ them into native, data-only modules for each implementation:
 
 Those modules contain only constants and lookup tables — no protocol logic. Each
 implementation hand-writes the logic (framing, SysEx builders, decode, model)
-and is kept honest by the shared conformance vectors in ``spec/vectors/``.
+and is kept honest by the shared conformance vectors in ``spec/vectors/``. That
+includes the state routing table from ``spec/state.toml``: it is emitted as data
+(``STATE_ROUTES`` plus the ``Field`` / ``Kind`` / ``Lane`` / ``Wire`` enums), and
+the fold that consumes it stays hand-written.
 
 Usage:
     generate.py            # write the generated modules
@@ -33,7 +36,8 @@ BANNER = "GENERATED FILE — DO NOT EDIT. Edit spec/*.toml and run codegen/gener
 
 def load() -> dict:
     data = {}
-    for name in ("version", "protocol", "parameters", "effect-types", "controls", "meters"):
+    for name in ("version", "protocol", "parameters", "effect-types", "controls", "meters",
+                 "state"):
         with open(SPEC / f"{name}.toml", "rb") as fh:
             data[name] = tomllib.load(fh)
     return data
@@ -53,6 +57,117 @@ def non_effect_params(params: dict) -> list[tuple[int, int, str]]:
 
 def cc_const_name(name: str) -> str:
     return "CC_" + name.upper()
+
+
+# --------------------------------------------------------------------------
+# State routing table (spec/state.toml)
+# --------------------------------------------------------------------------
+
+ROUTE_KINDS = ("u14", "u16", "u7", "bool", "text", "bpm", "multi")
+ROUTE_LANES = ("fast", "slow")
+ROUTE_WIRES = ("stream", "control", "both")
+ROUTE_EVENTS = (
+    "rig_changed", "string_tag", "bank_preview", "effect_changed", "param_changed", "status",
+    "beat_pulse", "tempo_bpm", "morph_changed", "morph_button", "tuner_deviance", "tuner_note",
+    "current_position",
+)
+ROUTE_ADDRESS_FORMS = ("address", "page", "effect_param", "bank_preview")
+
+
+def state_routes(d: dict) -> list[dict]:
+    """Expand spec/state.toml into the flat, address-sorted table each language emits.
+
+    Every row comes out as ``{address, name, slot, kind, lane, wire, dedupe,
+    request, event}`` with ``slot`` ``None`` unless the row was expanded per
+    slot. Addresses are resolved through ``[well_known]`` (and
+    ``[effect_param_numbers]`` / ``effect_slots``) so parameters.toml stays the
+    single home for them; a malformed row is a hard error rather than a silent
+    hole in the table.
+    """
+    pa = d["parameters"]
+    wk = pa["well_known"]
+    epn = pa["effect_param_numbers"]
+
+    def resolve(row: dict, key: str) -> int:
+        v = row[key]
+        if isinstance(v, bool) or not isinstance(v, (int, str)):
+            raise SystemExit(f"state.toml: route {row['name']!r}: {key} must be an int or a key")
+        if isinstance(v, str):
+            if v not in wk:
+                raise SystemExit(f"state.toml: route {row['name']!r}: no [well_known] key {v!r}")
+            return wk[v]
+        return v
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in d["state"]["route"]:
+        name = row["name"]
+        if name in seen:
+            raise SystemExit(f"state.toml: duplicate route name {name!r}")
+        seen.add(name)
+        for col, allowed in (("kind", ROUTE_KINDS), ("lane", ROUTE_LANES),
+                             ("wire", ROUTE_WIRES), ("event", ROUTE_EVENTS)):
+            if row.get(col) not in allowed:
+                raise SystemExit(f"state.toml: route {name!r}: {col} must be one of {allowed}")
+        for col in ("dedupe", "request"):
+            if not isinstance(row.get(col), bool):
+                raise SystemExit(f"state.toml: route {name!r}: {col} must be true or false")
+        forms = [f for f in ROUTE_ADDRESS_FORMS if f in row]
+        if len(forms) != 1:
+            raise SystemExit(f"state.toml: route {name!r}: exactly one of {ROUTE_ADDRESS_FORMS}")
+        common = {k: row[k] for k in ("name", "kind", "lane", "wire", "dedupe", "request", "event")}
+        form = forms[0]
+        if form == "address":
+            if "span" in row or "number" in row:
+                raise SystemExit(f"state.toml: route {name!r}: address rows take no span/number")
+            out.append({"address": resolve(row, "address"), "slot": None, **common})
+        elif form == "page":
+            base = resolve(row, "page") * 128 + resolve(row, "number")
+            span = resolve(row, "span") if "span" in row else None
+            if span is None:
+                out.append({"address": base, "slot": None, **common})
+            else:
+                for i in range(span):
+                    out.append({"address": base + i, "slot": i, **common})
+        elif form == "effect_param":
+            key = row["effect_param"]
+            if key not in epn:
+                raise SystemExit(f"state.toml: route {name!r}: no [effect_param_numbers] key {key!r}")
+            for i, s in enumerate(pa["effect_slots"]):
+                out.append({"address": s["page"] * 128 + epn[key], "slot": i, **common})
+        else:  # bank_preview
+            base = wk["page_bank_preview"] * 128 + resolve(row, "bank_preview")
+            for i in range(wk["bank_slots"]):
+                out.append({"address": base + i, "slot": i, **common})
+    # The morph position is written two ways in the spec — as page/number on the
+    # stream side and as the flat `morph_address` the CBOR dump names — and the
+    # table keys on the flat form, so the two must agree.
+    if wk["morph_address"] != wk["page_morph"] * 128 + wk["morph_number"]:
+        raise SystemExit("parameters.toml: morph_address != page_morph * 128 + morph_number")
+    out.sort(key=lambda r: r["address"])
+    for a, b in zip(out, out[1:]):
+        if a["address"] == b["address"]:
+            raise SystemExit(f"state.toml: routes {a['name']!r} and {b['name']!r} share address "
+                             f"{a['address']}")
+    return out
+
+
+def route_fields(routes: list[dict]) -> list[str]:
+    """The distinct route names in first-appearance (address) order — the `Field` variants."""
+    names: list[str] = []
+    for r in routes:
+        if r["name"] not in names:
+            names.append(r["name"])
+    return names
+
+
+def pascal(name: str) -> str:
+    return "".join(part.capitalize() for part in name.split("_"))
+
+
+def camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part.capitalize() for part in rest)
 
 
 # --------------------------------------------------------------------------
@@ -206,6 +321,13 @@ def emit_rust(d: dict) -> str:
         "tuner_in_tune_window": ("TUNER_IN_TUNE_WINDOW", "u16"), "meter_count": ("METER_COUNT", "usize"),
         "current_bank_address": ("CURRENT_BANK_ADDRESS", "u32"),
         "current_rig_slot_address": ("CURRENT_RIG_SLOT_ADDRESS", "u32"),
+        "string_rig_author": ("STRING_RIG_AUTHOR", "u8"),
+        "string_rig_date": ("STRING_RIG_DATE", "u8"),
+        "string_rig_comment": ("STRING_RIG_COMMENT", "u8"),
+        "string_amp_name": ("STRING_AMP_NAME", "u8"),
+        "string_cabinet_name": ("STRING_CABINET_NAME", "u8"),
+        "cabinet_page": ("CABINET_PAGE", "u8"),
+        "cabinet_on_number": ("CABINET_ON_NUMBER", "u8"),
     }
     for k, (const, ty) in wk_rust.items():
         val = wk[k]
@@ -281,6 +403,61 @@ def emit_rust(d: dict) -> str:
         for f in mb["fields"])
     w(f"pub static METER_FIELDS: &[(usize, u8, &str, &str, &str)] = &[\n{rows},\n];")
     w("")
+    # State routing table
+    routes = state_routes(d)
+    w("/// A field of the device-state tree that a routed address writes (spec/state.toml).")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]")
+    w("pub enum Field {")
+    for name in route_fields(routes):
+        w(f"    {pascal(name)},")
+    w("}")
+    w("")
+    w("/// How a routed value decodes before it is stored.")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]")
+    w("pub enum Kind {")
+    for k in ROUTE_KINDS:
+        w(f"    {pascal(k)},")
+    w("}")
+    w("")
+    w("/// Which update lane a route feeds: FAST (event only) or SLOW (snapshot).")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]")
+    w("pub enum Lane {")
+    for k in ROUTE_LANES:
+        w(f"    {pascal(k)},")
+    w("}")
+    w("")
+    w("/// Which channel may write a route: the MIDI3 stream, the CBOR control channel, or both.")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]")
+    w("pub enum Wire {")
+    for k in ROUTE_WIRES:
+        w(f"    {pascal(k)},")
+    w("}")
+    w("")
+    w("/// One row of the state routing table: a flat address and how the tree folds it.")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+    w("pub struct Route {")
+    w("    pub address: u32,")
+    w("    pub field: Field,")
+    w("    /// The per-slot index for expanded rows: effect slot, bank-preview slot, or")
+    w("    /// element index within a spanned block.")
+    w("    pub slot: Option<u8>,")
+    w("    pub kind: Kind,")
+    w("    pub lane: Lane,")
+    w("    pub wire: Wire,")
+    w("    pub dedupe: bool,")
+    w("    pub request: bool,")
+    w("}")
+    w("")
+    rows = ",\n".join(
+        f"    Route {{ address: {r['address']}, field: Field::{pascal(r['name'])}, "
+        f"slot: {'None' if r['slot'] is None else f'Some({r['slot']})'}, "
+        f"kind: Kind::{pascal(r['kind'])}, lane: Lane::{pascal(r['lane'])}, "
+        f"wire: Wire::{pascal(r['wire'])}, dedupe: {str(r['dedupe']).lower()}, "
+        f"request: {str(r['request']).lower()} }}"
+        for r in routes)
+    w("/// The state routing table, sorted by address (spec/state.toml).")
+    w(f"pub static STATE_ROUTES: &[Route] = &[\n{rows},\n];")
+    w("")
     # Guard the multi-line table literals from `cargo fmt`: rustfmt recurses
     # through `mod` declarations and would otherwise reformat this generated file,
     # making it diverge from the generator output and tripping the drift check.
@@ -308,6 +485,9 @@ def emit_python(d: dict) -> str:
     out: list[str] = []
     w = out.append
     w(f'"""{BANNER}"""')
+    w("")
+    w("from enum import Enum")
+    w("from typing import NamedTuple")
     w("")
     w(f'SPEC_VERSION = {q(d["version"]["spec_version"])}')
     w("")
@@ -403,6 +583,10 @@ def emit_python(d: dict) -> str:
         "tuner_in_tune_window": "TUNER_IN_TUNE_WINDOW", "meter_count": "METER_COUNT",
         "current_bank_address": "CURRENT_BANK_ADDRESS",
         "current_rig_slot_address": "CURRENT_RIG_SLOT_ADDRESS",
+        "string_rig_author": "STRING_RIG_AUTHOR", "string_rig_date": "STRING_RIG_DATE",
+        "string_rig_comment": "STRING_RIG_COMMENT", "string_amp_name": "STRING_AMP_NAME",
+        "string_cabinet_name": "STRING_CABINET_NAME", "cabinet_page": "CABINET_PAGE",
+        "cabinet_on_number": "CABINET_ON_NUMBER",
     }
     for k, const in wk_names.items():
         val = wk[k]
@@ -462,6 +646,59 @@ def emit_python(d: dict) -> str:
         f"({f['index']}, {f['number']}, {q(f['id'])}, {q(f['name'])}, {q(f['render'])})"
         for f in mb["fields"])
     w(f"# (index, number, id, name, render)\nMETER_FIELDS = [\n    {rows},\n]")
+    w("")
+    # State routing table
+    routes = state_routes(d)
+    w("")
+    w("class Field(Enum):")
+    w('    """A field of the device-state tree that a routed address writes (spec/state.toml)."""')
+    w("")
+    for name in route_fields(routes):
+        w(f"    {name.upper()} = {q(name)}")
+    w("")
+    w("")
+    w("class Kind(Enum):")
+    w('    """How a routed value decodes before it is stored."""')
+    w("")
+    for k in ROUTE_KINDS:
+        w(f"    {k.upper()} = {q(k)}")
+    w("")
+    w("")
+    w("class Lane(Enum):")
+    w('    """Which update lane a route feeds: FAST (event only) or SLOW (snapshot)."""')
+    w("")
+    for k in ROUTE_LANES:
+        w(f"    {k.upper()} = {q(k)}")
+    w("")
+    w("")
+    w("class Wire(Enum):")
+    w('    """Which channel may write a route: the MIDI3 stream, the CBOR control channel, or both."""')
+    w("")
+    for k in ROUTE_WIRES:
+        w(f"    {k.upper()} = {q(k)}")
+    w("")
+    w("")
+    w("class Route(NamedTuple):")
+    w('    """One row of the state routing table: a flat address and how the tree folds it."""')
+    w("")
+    w("    address: int")
+    w("    field: Field")
+    w("    #: The per-slot index for expanded rows: effect slot, bank-preview slot, or")
+    w("    #: element index within a spanned block.")
+    w("    slot: int | None")
+    w("    kind: Kind")
+    w("    lane: Lane")
+    w("    wire: Wire")
+    w("    dedupe: bool")
+    w("    request: bool")
+    w("")
+    w("")
+    rows = ",\n    ".join(
+        f"Route({r['address']}, Field.{r['name'].upper()}, {r['slot']}, Kind.{r['kind'].upper()}, "
+        f"Lane.{r['lane'].upper()}, Wire.{r['wire'].upper()}, {r['dedupe']}, {r['request']})"
+        for r in routes)
+    w(f"#: The state routing table, sorted by address (spec/state.toml).\n"
+      f"STATE_ROUTES: tuple[Route, ...] = (\n    {rows},\n)")
     w("")
     return "\n".join(out) + "\n"
 
@@ -580,6 +817,13 @@ def emit_swift(d: dict) -> str:
         "tuner_in_tune_window": ("tunerInTuneWindow", "UInt16"), "meter_count": ("meterCount", "Int"),
         "current_bank_address": ("currentBankAddress", "UInt32"),
         "current_rig_slot_address": ("currentRigSlotAddress", "UInt32"),
+        "string_rig_author": ("stringRigAuthor", "UInt8"),
+        "string_rig_date": ("stringRigDate", "UInt8"),
+        "string_rig_comment": ("stringRigComment", "UInt8"),
+        "string_amp_name": ("stringAmpName", "UInt8"),
+        "string_cabinet_name": ("stringCabinetName", "UInt8"),
+        "cabinet_page": ("cabinetPage", "UInt8"),
+        "cabinet_on_number": ("cabinetOnNumber", "UInt8"),
     }
     for k, (const, ty) in wk_sw.items():
         val = wk[k]
@@ -633,6 +877,15 @@ def emit_swift(d: dict) -> str:
         f"MeterField(index: {f['index']}, number: {f['number']}, id: {q(f['id'])}, "
         f"name: {q(f['name'])}, render: {q(f['render'])})" for f in mb["fields"])
     w(f"    public static let meterFields: [MeterField] = [\n        {rows},\n    ]")
+    routes = state_routes(d)
+    rows = ",\n        ".join(
+        f"Route(address: {r['address']}, field: .{camel(r['name'])}, "
+        f"slot: {'nil' if r['slot'] is None else r['slot']}, kind: .{r['kind']}, "
+        f"lane: .{r['lane']}, wire: .{r['wire']}, dedupe: {str(r['dedupe']).lower()}, "
+        f"request: {str(r['request']).lower()})"
+        for r in routes)
+    w("    /// The state routing table, sorted by address (spec/state.toml).")
+    w(f"    public static let stateRoutes: [Route] = [\n        {rows},\n    ]")
     w("}")
     w("")
     # Support types for Swift keys.
@@ -654,6 +907,51 @@ def emit_swift(d: dict) -> str:
     w("    public let min: UInt16")
     w("    public let max: UInt16")
     w("    public let name: String")
+    w("}")
+    w("")
+    w("/// One row of the state routing table: a flat address and how the tree folds it.")
+    w("public struct Route: Hashable, Sendable {")
+    w("    /// A field of the device-state tree that a routed address writes (spec/state.toml).")
+    w("    public enum Field: String, CaseIterable, Hashable, Sendable {")
+    for name in route_fields(routes):
+        w(f"        case {camel(name)} = {q(name)}")
+    w("    }")
+    w("")
+    w("    /// How a routed value decodes before it is stored.")
+    w("    public enum Kind: String, CaseIterable, Hashable, Sendable {")
+    for k in ROUTE_KINDS:
+        w(f"        case {k} = {q(k)}")
+    w("    }")
+    w("")
+    w("    /// Which update lane a route feeds: FAST (event only) or SLOW (snapshot).")
+    w("    public enum Lane: String, CaseIterable, Hashable, Sendable {")
+    for k in ROUTE_LANES:
+        w(f"        case {k} = {q(k)}")
+    w("    }")
+    w("")
+    w("    /// Which channel may write a route: the MIDI3 stream, the CBOR control channel, or both.")
+    w("    public enum Wire: String, CaseIterable, Hashable, Sendable {")
+    for k in ROUTE_WIRES:
+        w(f"        case {k} = {q(k)}")
+    w("    }")
+    w("")
+    w("    public let address: UInt32")
+    w("    public let field: Field")
+    w("    /// The per-slot index for expanded rows: effect slot, bank-preview slot, or")
+    w("    /// element index within a spanned block.")
+    w("    public let slot: UInt8?")
+    w("    public let kind: Kind")
+    w("    public let lane: Lane")
+    w("    public let wire: Wire")
+    w("    public let dedupe: Bool")
+    w("    public let request: Bool")
+    w("    public init(")
+    w("        address: UInt32, field: Field, slot: UInt8?, kind: Kind, lane: Lane, wire: Wire,")
+    w("        dedupe: Bool, request: Bool")
+    w("    ) {")
+    w("        self.address = address; self.field = field; self.slot = slot; self.kind = kind")
+    w("        self.lane = lane; self.wire = wire; self.dedupe = dedupe; self.request = request")
+    w("    }")
     w("}")
     w("")
     return "\n".join(out) + "\n"
