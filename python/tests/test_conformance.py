@@ -6,12 +6,23 @@ outputs every implementation of the protocol is held to.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from conftest import VECTORS_DIR, vector
 
 from libkp import _generated as gen
 from libkp import cbor, control, midi3, nrpn, params, protocol
-from libkp.state import DeviceState
+from libkp.state import (
+    ApplyOutcome,
+    Channel,
+    DeviceEvent,
+    DeviceState,
+    Num,
+    Phase,
+    Text,
+    Update,
+)
 
 # ---------------------------------------------------------------------------
 # The vector set itself
@@ -349,12 +360,57 @@ def _assert_state_expectations(state: DeviceState, expect: dict) -> None:
             assert effect.type_name == want["type_name"]
 
 
+def _event_name(event: DeviceEvent) -> str:
+    """The vectors name events in snake_case (``current_position``); the classes
+    are CamelCase (``CurrentPosition``)."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type(event).__name__).lower()
+
+
+def _run_step(state: DeviceState, step: dict) -> ApplyOutcome:
+    """Drive one ``steps`` entry through the entry point it names.
+
+    ``midi3`` / ``cbor`` / ``cbor_text`` are the decoders a live session uses;
+    ``cbor_dump*`` build a :class:`Update` tagged :attr:`Phase.DUMP` directly,
+    because the harness, not a timer, decides what counts as the dump.
+    """
+    ((kind, arg),) = step.items()
+    if kind == "midi3":
+        return state.apply(bytes.fromhex(arg))
+    if kind == "cbor":
+        return state.apply_cbor(arg[0], arg[1])
+    if kind == "cbor_text":
+        return state.apply_cbor_text(arg[0], arg[1])
+    if kind == "cbor_dump":
+        return state.apply_update(Update(Channel.CONTROL, Phase.DUMP, arg[0], Num(arg[1])))
+    if kind == "cbor_dump_text":
+        return state.apply_update(Update(Channel.CONTROL, Phase.DUMP, arg[0], Text(arg[1])))
+    if kind == "dump_begin":
+        state.begin_dump()
+        return ApplyOutcome.empty()
+    if kind == "dump_end":
+        state.end_dump()
+        return ApplyOutcome.empty()
+    raise AssertionError(f"unknown step kind {kind!r}")
+
+
 @pytest.mark.parametrize("case", vector("state")["cases"], ids=lambda c: c["name"])
 def test_state_apply(case):
+    """A case is either ``messages`` (unframed MIDI3 hex, each through ``apply``)
+    or ``steps`` (each naming the entry point it drives). Both fold into one
+    fresh tree; a ``steps`` case also pins the ordered event names and how many
+    steps flagged the snapshot."""
+    if "messages" in case:
+        steps = [{"midi3": hex_message} for hex_message in case["messages"]]
+    else:
+        steps = case["steps"]
     state = DeviceState()
-    for hex_message in case["messages"]:
-        state.apply(bytes.fromhex(hex_message))
-    _assert_state_expectations(state, case["expect"])
+    outcomes = [_run_step(state, step) for step in steps]
+    expect = case["expect"]
+    _assert_state_expectations(state, expect)
+    if "events" in expect:
+        assert [_event_name(e) for o in outcomes for e in o.events] == expect["events"]
+    if "slow_steps" in expect:
+        assert sum(o.slow_changed for o in outcomes) == expect["slow_steps"]
 
 
 # ---------------------------------------------------------------------------

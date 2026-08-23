@@ -29,25 +29,37 @@ Requires Swift 6.0 or newer and macOS 13+.
 | `Sources/LibKP/Control.swift` | The typed 7-bit CC / PC / Bank Select vocabulary |
 | `Sources/LibKP/Params.swift` | Offline name lookups over the generated tables |
 | `Sources/LibKP/Registry.swift` | Typed parameter descriptors and value formatting |
-| `Sources/LibKP/State.swift` | The state tree and its decode routing |
+| `Sources/LibKP/State.swift` | The state tree and the decoders in front of its fold |
+| `Sources/LibKP/Routes.swift` | The fold: one routing table, one funnel, whichever wire carried the value |
 | `Sources/LibKP/DeviceModel.swift` | The `actor` that owns the session and publishes state |
 | `Sources/meters/main.swift` | A live full-screen terminal view |
 | `Sources/MetersApp/` | The same dashboard as a native SwiftUI macOS app |
 
 Everything the conformance vectors exercise — framing, builders, parsers, name
-lookups, and `DeviceState.apply` — is pure and imports no networking, so it is
-unit-testable with no device attached.
+lookups, and `DeviceState.apply` / `applyUpdate` — is pure and imports no
+networking, so it is unit-testable with no device attached.
 
 ## Two layers
 
 `DeviceState` is the **pure core**: a value-type tree (rig, amp, cabinet, the
-eight effect slots, tuner, output, morph, and the latest `RealtimeStatus` meter
-frame). It decodes one already-unframed MIDI message at a time:
+eight effect slots, tuner, output, morph, bank preview, position, and the latest
+`RealtimeStatus` meter frame). It folds one value at a time, whichever wire
+carried it: an already-unframed MIDI3 message, or one CBOR item.
 
 ```swift
 var state = DeviceState()
-let outcome = state.apply(message)   // -> ApplyOutcome(events:slowChanged:)
+let outcome = state.apply(message)                    // -> ApplyOutcome(events:slowChanged:)
+state.applyCbor(address: 119, value: 8192)            // a CBOR numeric: the morph position
+state.applyCborText(address: 1, text: "AC30")         // a CBOR string: the rig name
 ```
+
+Every entry point is a thin decoder in front of `applyUpdate`, and what the tree
+does with an address is decided by one spec-declared table (`spec/state.toml`,
+generated as `Generated.stateRoutes`): which field it writes, how the value
+decodes, which wire may write it, whether a repeat is a no-op, and whether it
+is FAST or SLOW. An address with no row is untracked. Between `beginDump()` and
+`endDump()` — the CBOR state dump — a live push outranks the dump's stale copy
+of the same address.
 
 `DeviceModel` is the **async handle**: an actor that owns an `NWConnection`,
 runs an ingest loop, and publishes both a coalesced snapshot stream and a

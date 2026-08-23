@@ -62,8 +62,9 @@ let replies = port.poll(&libkp::Options::default()).await?;
 | `control` | The 7-bit CC / Program Change / Bank Select vocabulary (`Control`). |
 | `params` | Offline `page/number → name` lookups over the generated tables. |
 | `registry` | Typed descriptors (`ParamKind`, `format_value`) layered over `params`. |
-| `state` | The immutable `DeviceState` tree — rig, amp, cabinet, eight effect slots, tuner, output, morph, meters. |
-| `model` | `DeviceModel`, the async observable store, plus `DeviceState::apply` (the pure decode routing). |
+| `state` | The immutable `DeviceState` tree — rig, amp, cabinet, eight effect slots, tuner, output, morph, meters — and its decoders: `apply` (one MIDI3 message), `apply_cbor` / `apply_cbor_text` (one CBOR item), each a thin front on the fold. |
+| `routes` | The state routing fold: `DeviceState::apply_update`, the one funnel every value passes through whichever wire carried it, driven by the generated `STATE_ROUTES` table (`spec/state.toml`) — which addresses are tracked, which channel may write them, how they decode, whether a repeat is a no-op. |
+| `model` | `DeviceModel`, the async observable store. |
 | `error` | `DiscoverError`, `SessionError`, `ParseError`. |
 | `fmt` | Small hex/ASCII formatting helpers. |
 

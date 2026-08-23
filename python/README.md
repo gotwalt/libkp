@@ -217,6 +217,19 @@ async with await CborSession.connect(ip) as cbor:
 change nothing; `apply_cbor` on the model writes the live tree and broadcasts the
 snapshot.
 
+Both wires feed one fold. `DeviceState.apply` (a MIDI3 message) and
+`DeviceState.apply_cbor` / `apply_cbor_text` (a CBOR numeric or string) are thin
+decoders that build an `Update` — the wire it came from, whether it was pushed
+live or is an item of the CBOR state dump, the flat address, and the decoded
+value — and hand it to `DeviceState.apply_update`, which routes it by the table
+generated from `spec/state.toml`. The table decides everything: which field an
+address writes, how the value decodes and is range-checked, which wire may write
+the row (the control channel's copies of the meter block, beat pulse and tuner
+are dropped; the morph position is the control channel's), whether a repeated
+value is a no-op, and whether the row is FAST (event only) or SLOW (event plus
+snapshot). `begin_dump()` / `end_dump()` bracket a state dump so a value pushed
+live while the dump streams is not overwritten by the dump's stale copy of it.
+
 Opening the second session needs no pacing on the caller's part. `Session.connect`
 keeps a per-peer ledger of the last open and close to each `(ip, port)` and waits
 out `CONNECTION_COOLDOWN` from the later of the two before dialing, so neither
@@ -229,7 +242,8 @@ morph position is CBOR-only, and the device is happy to serve both at once.
 
 ## Decoding without a device
 
-`DeviceState.apply` is pure — no sockets, no clock:
+`DeviceState.apply` is pure — no sockets, no clock — and so are `apply_cbor`,
+`apply_cbor_text` and the `apply_update` they feed:
 
 ```python
 from libkp import Unframer

@@ -15,7 +15,9 @@
 //! - [`nrpn`] — Kemper SysEx/NRPN builders and parsers.
 //! - [`control`] — the 7-bit CC / PC / Bank Select control vocabulary.
 //! - [`params`] / [`registry`] — offline name and descriptor lookups.
-//! - [`state`] / [`model`] — the immutable state tree and the observable store.
+//! - [`state`] / [`routes`] / [`model`] — the immutable state tree and its
+//!   decoders, the routing fold both wires pass through, and the observable
+//!   store.
 //! - [`error`] — error types.
 //!
 //! Discovery and the TCP session share one port, [`PORT`] (5727).
@@ -51,6 +53,7 @@ pub mod nrpn;
 pub mod params;
 pub mod protocol;
 pub mod registry;
+pub mod routes;
 pub mod session;
 pub mod state;
 
@@ -76,8 +79,12 @@ pub use nrpn::{
 };
 pub use protocol::{DISCOVERY_PORT, DSCV_HEADER, TagStream, build_poll_request};
 pub use registry::{ParamDescriptor, ParamKind, descriptor, format_value};
+pub use routes::route;
 pub use session::{
     CONNECTION_COOLDOWN, HandshakeOutcome, PROTOCOL_CBOR_CONTROL, PROTOCOL_MIDI3_STREAM,
     PROTOCOL_REQUEST_RESPONSE, Session,
 };
-pub use state::{Amp, Cabinet, Connection, DeviceState, Effect, Output, Rig, Tuner};
+pub use state::{
+    Amp, Cabinet, Channel, Connection, Decoded, DeviceState, Effect, Output, Phase, Rig, Tuner,
+    Update,
+};

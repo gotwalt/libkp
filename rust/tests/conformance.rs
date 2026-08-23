@@ -17,11 +17,11 @@ use serde_json::Value;
 use libkp::cbor::{self, Decoder};
 use libkp::control::{Control, ModuleSlot};
 use libkp::midi3::{Unframer, frame};
-use libkp::model::RealtimeStatus;
+use libkp::model::{ApplyOutcome, DeviceEvent, RealtimeStatus};
 use libkp::nrpn::{self, NrpnHeader};
 use libkp::params;
 use libkp::protocol::{TagStream, build_poll_request};
-use libkp::state::DeviceState;
+use libkp::state::{Channel, Decoded, DeviceState, Phase, Update};
 use libkp::{PORT, generated};
 
 // ---------------------------------------------------------------------------
@@ -468,16 +468,136 @@ fn param_lookup_vectors() {
 // state.json
 // ---------------------------------------------------------------------------
 
+/// The vector's name for a [`DeviceEvent`], as `expect.events` spells it.
+fn event_name(event: &DeviceEvent) -> &'static str {
+    match event {
+        DeviceEvent::RigChanged => "rig_changed",
+        DeviceEvent::StringTag { .. } => "string_tag",
+        DeviceEvent::BankPreview { .. } => "bank_preview",
+        DeviceEvent::EffectChanged { .. } => "effect_changed",
+        DeviceEvent::ParamChanged { .. } => "param_changed",
+        DeviceEvent::Status(_) => "status",
+        DeviceEvent::BeatPulse { .. } => "beat_pulse",
+        DeviceEvent::TempoBpm(_) => "tempo_bpm",
+        DeviceEvent::MorphChanged(_) => "morph_changed",
+        DeviceEvent::MorphButton(_) => "morph_button",
+        DeviceEvent::TunerDeviance(_) => "tuner_deviance",
+        DeviceEvent::TunerNote(_) => "tuner_note",
+        DeviceEvent::RenderedString { .. } => "rendered_string",
+        DeviceEvent::CurrentPosition { .. } => "current_position",
+        DeviceEvent::Connected => "connected",
+        DeviceEvent::Disconnected => "disconnected",
+        other => panic!("no vector name for {other:?}"),
+    }
+}
+
+/// The `[address, value]` pair a `cbor` / `cbor_dump` step carries.
+fn addr_num(step: &Value) -> (u32, i64) {
+    let pair = step.as_array().expect("[address, value]");
+    (
+        pair[0].as_u64().expect("address") as u32,
+        pair[1].as_i64().expect("value"),
+    )
+}
+
+/// The `[address, "text"]` pair a `cbor_text` / `cbor_dump_text` step carries.
+fn addr_text(step: &Value) -> (u32, &str) {
+    let pair = step.as_array().expect("[address, text]");
+    (
+        pair[0].as_u64().expect("address") as u32,
+        pair[1].as_str().expect("text"),
+    )
+}
+
+/// A dump item driven straight into the funnel, tagged as the dump's.
+fn dump_update(address: u32, decoded: Decoded) -> Update {
+    Update {
+        source: Channel::Control,
+        phase: Phase::Dump,
+        address,
+        decoded,
+    }
+}
+
+/// Run one step of a `steps` case against `state`, returning its outcome. The
+/// step is an object with exactly one key naming the entry point it drives.
+fn run_step(state: &mut DeviceState, step: &Value) -> ApplyOutcome {
+    let obj = step.as_object().expect("a step is an object");
+    assert_eq!(obj.len(), 1, "a step names exactly one entry point: {step}");
+    let (kind, arg) = obj.iter().next().unwrap();
+    match kind.as_str() {
+        "midi3" => state.apply(&unhex(arg.as_str().expect("hex"))),
+        "cbor" => {
+            let (address, value) = addr_num(arg);
+            state.apply_cbor(address, value)
+        }
+        "cbor_text" => {
+            let (address, text) = addr_text(arg);
+            state.apply_cbor_text(address, text)
+        }
+        "cbor_dump" => {
+            let (address, value) = addr_num(arg);
+            let value = u64::try_from(value).expect("a dump item is non-negative");
+            state.apply_update(&dump_update(address, Decoded::Num(value)))
+        }
+        "cbor_dump_text" => {
+            let (address, text) = addr_text(arg);
+            state.apply_update(&dump_update(address, Decoded::Text(text.to_string())))
+        }
+        "dump_begin" => {
+            state.begin_dump();
+            ApplyOutcome::default()
+        }
+        "dump_end" => {
+            state.end_dump();
+            ApplyOutcome::default()
+        }
+        other => panic!("unknown step kind {other:?}"),
+    }
+}
+
 #[test]
 fn state_apply_vectors() {
     let doc = vector("state.json");
     for c in cases(&doc, "cases") {
         let name = str_of(c, "name");
         let mut state = DeviceState::new();
-        for m in cases(c, "messages") {
-            state.apply(&unhex(m.as_str().unwrap()));
-        }
+        // A case is either the old form — unframed MIDI3 messages, each through
+        // `apply` — or the new one, steps that name the entry point they drive.
+        // Both run against one fresh state; only the new form pins the events
+        // and the snapshot flags, but collecting them costs nothing either way.
+        let outcomes: Vec<ApplyOutcome> = if let Some(messages) = c.get("messages") {
+            messages
+                .as_array()
+                .expect("messages is a list")
+                .iter()
+                .map(|m| state.apply(&unhex(m.as_str().unwrap())))
+                .collect()
+        } else {
+            cases(c, "steps")
+                .iter()
+                .map(|step| run_step(&mut state, step))
+                .collect()
+        };
         let expect = &c["expect"];
+
+        if let Some(v) = expect.get("events") {
+            let got: Vec<&str> = outcomes
+                .iter()
+                .flat_map(|o| o.events.iter().map(event_name))
+                .collect();
+            let want: Vec<&str> = v
+                .as_array()
+                .expect("events is a list")
+                .iter()
+                .map(|e| e.as_str().expect("event name"))
+                .collect();
+            assert_eq!(got, want, "[{name}] events");
+        }
+        if let Some(v) = expect.get("slow_steps") {
+            let got = outcomes.iter().filter(|o| o.slow_changed).count();
+            assert_eq!(got, v.as_u64().unwrap() as usize, "[{name}] slow_steps");
+        }
 
         if let Some(v) = expect.get("rig_name") {
             assert_eq!(state.rig.name.as_deref(), v.as_str(), "[{name}] rig_name");
