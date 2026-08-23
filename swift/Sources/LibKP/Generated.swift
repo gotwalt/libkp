@@ -8,6 +8,12 @@ public enum Generated {
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15
     public static let connectionCooldownMs: UInt64 = 1000
+    public static let requestTimeoutMs: UInt64 = 300
+    public static let maxInFlightRequests: Int = 16
+    public static let dumpSettleMs: UInt64 = 1000
+    public static let reconnectDelayMs: UInt64 = 4000
+    public static let reconnectMaxDelayMs: UInt64 = 30000
+    public static let controlReopenMinGapMs: UInt64 = 30000
     public static let discoveryHeader: String = "DSCV"
     public static let pollIntervalMs: UInt64 = 500
     public static let pollMacPrefix: String = "MAC#"
@@ -29,6 +35,7 @@ public enum Generated {
     public static let cborFillerByte: UInt8 = 0xc0
     public static let stateDumpTriggerAddress: UInt32 = 102528
     public static let stateDumpTriggerValue: Int64 = 1
+    public static let dumpEndAddress: UInt32 = 100800
     public static let sensitiveAddresses: [UInt32] = [200008, 200009]
     public static let redactedPlaceholder: String = "[redacted]"
     public static let midi3TagContinuation: UInt8 = 0x14
