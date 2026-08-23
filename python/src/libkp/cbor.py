@@ -38,6 +38,7 @@ from ._broadcast import Broadcast
 from .errors import ConnectionClosedError, SessionError
 from .protocol import PORT
 from .session import PROTOCOL_CBOR_CONTROL, Session
+from .state import DeviceState
 
 __all__ = [
     "Tag",
@@ -536,29 +537,32 @@ class StateSnapshot:
         return None
 
 
-def _note_index(snap: StateSnapshot, addr: int, value: int) -> None:
-    """Record the value at one address into the snapshot's indices."""
-    v = value if 0 <= value <= gen.FULL_SCALE else None
-    if addr == gen.CURRENT_BANK_ADDRESS:
-        snap.current_bank = v
-    elif addr == gen.CURRENT_RIG_SLOT_ADDRESS:
-        snap.current_rig_slot = v
-    elif addr == gen.MORPH_ADDRESS:
-        snap.morph = v
-
-
 def extract_snapshot(items: list) -> StateSnapshot:
     """Read the current bank, rig slot, morph and string parameters out of decoded
-    dump items."""
+    dump items.
+
+    The items fold into a scratch :class:`~libkp.state.DeviceState` through the
+    same entry points a live session uses, so the dump is read by exactly the
+    routing the tree is held to: the position rows' range checks, the morph's,
+    and nothing hand-written here. The strings are the one thing the tree cannot
+    answer -- the dump names addresses the tree has no field for, the bank name
+    among them -- so they are kept as the walk found them, in document order,
+    with any secret redacted before it can be seen.
+    """
+    scratch = DeviceState()
     snap = StateSnapshot()
 
     def numeric(addr: int, value: int) -> None:
-        _note_index(snap, addr, value)
+        scratch.apply_cbor(addr, value)
 
     def text(addr: int, value: str) -> None:
+        scratch.apply_cbor_text(addr, value)
         snap.strings.append((addr, gen.REDACTED_PLACEHOLDER if is_sensitive(addr) else value))
 
     _walk(items, numeric, text)
+    snap.current_bank = scratch.current_bank
+    snap.current_rig_slot = scratch.current_rig_slot
+    snap.morph = scratch.morph
     return snap
 
 
@@ -566,11 +570,27 @@ def numeric_values(items: list) -> list[tuple[int, int]]:
     """Every numeric ``(address, value)`` pair the items carry, in document order.
 
     The dump and a session's live pushes are the same shapes, so this is what a
-    :class:`CborSession` folds into a state tree as values move.
+    :class:`CborSession` folds into a state tree as values move. An address that
+    does not fit 32 bits, or a value that does not fit a signed 64-bit word, is
+    malformed rather than a pair to wrap into a plausible-looking one, and is
+    skipped -- the same bound every implementation applies.
     """
     out: list[tuple[int, int]] = []
-    _walk(items, lambda addr, value: out.append((addr, value)), lambda addr, value: None)
+
+    def numeric(addr: int, value: int) -> None:
+        if 0 <= addr <= _U32_MAX and _I64_MIN <= value <= _I64_MAX:
+            out.append((addr, value))
+
+    _walk(items, numeric, lambda addr, value: None)
     return out
+
+
+#: The widest address and value a numeric pair may carry: CBOR integers are
+#: unbounded in Python, but the channel's addresses are 32-bit and its values
+#: signed 64-bit, and the other implementations reject anything wider.
+_U32_MAX = 0xFFFF_FFFF
+_I64_MIN = -(1 << 63)
+_I64_MAX = (1 << 63) - 1
 
 
 def _walk(items: list, numeric, text) -> None:

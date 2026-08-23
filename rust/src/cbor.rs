@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 use crate::SessionError;
 use crate::generated;
 use crate::session::{PROTOCOL_CBOR_CONTROL, Session};
+use crate::state::DeviceState;
 
 /// A decoded CBOR data item.
 #[derive(Debug, Clone, PartialEq)]
@@ -519,41 +520,52 @@ impl StateSnapshot {
     }
 }
 
-/// Record the value at one address into the snapshot's indices.
-fn note_index(snap: &mut StateSnapshot, addr: i128, value: i128) {
-    let v = u16::try_from(value).ok();
-    if addr == generated::CURRENT_BANK_ADDRESS as i128 {
-        snap.current_bank = v;
-    } else if addr == generated::CURRENT_RIG_SLOT_ADDRESS as i128 {
-        snap.current_rig_slot = v;
-    } else if addr == generated::MORPH_ADDRESS as i128 {
-        snap.morph = v;
-    }
-}
-
-/// Read the current bank, rig slot and string parameters out of decoded dump
-/// items.
+/// Read the current bank, rig slot, morph and string parameters out of decoded
+/// dump items.
 ///
-/// Scans the two index-bearing shapes: a single `[1, addr, value]`, and a
-/// consecutive-run `[2, base, v0, v1, …]` where the whole run is walked because
-/// the target address can fall anywhere inside it (at session open the position
+/// The items are folded into a scratch [`DeviceState`] through the same
+/// [`apply_cbor`](DeviceState::apply_cbor) / [`apply_cbor_text`](DeviceState::apply_cbor_text)
+/// a live session uses, and the snapshot's fields are read off it — so the dump
+/// and a live push cannot disagree about what an address means, and a value
+/// too wide for its row is dropped rather than read as a bogus position. The
+/// whole of a consecutive-run `[2, base, v0, v1, …]` is walked because the
+/// target address can fall anywhere inside it (at session open the position
 /// arrives inside one run). A leading negative source-flag word, if present, is
 /// skipped exactly as [`param_write`] never emits one.
+///
+/// The strings are kept by address as they came, redacted where
+/// [`is_sensitive`] says so, whether or not the tree tracks them: the snapshot
+/// is a reader's view of the dump, not of the tree.
 pub fn extract_snapshot(items: &[Value]) -> StateSnapshot {
-    let mut snap = StateSnapshot::default();
+    let mut scratch = DeviceState::new();
+    let mut strings = Vec::new();
     walk(items, &mut |element| match element {
-        Element::Numeric(addr, value) => note_index(&mut snap, addr, value),
+        Element::Numeric(addr, value) => {
+            // A negative or oversized address is malformed, not an address to
+            // wrap into a plausible-looking one.
+            if let (Ok(a), Ok(v)) = (u32::try_from(addr), i64::try_from(value)) {
+                scratch.apply_cbor(a, v);
+            }
+        }
         Element::Text(addr, text) => {
-            let a = addr as u32;
+            let Ok(a) = u32::try_from(addr) else {
+                return;
+            };
+            scratch.apply_cbor_text(a, text);
             let text = if is_sensitive(a) {
                 generated::REDACTED_PLACEHOLDER.to_string()
             } else {
                 text.to_string()
             };
-            snap.strings.push((a, text));
+            strings.push((a, text));
         }
     });
-    snap
+    StateSnapshot {
+        current_bank: scratch.current_bank,
+        current_rig_slot: scratch.current_rig_slot,
+        morph: scratch.morph,
+        strings,
+    }
 }
 
 /// One element of a decoded dump or push, as [`walk`] hands it out.

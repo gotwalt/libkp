@@ -707,14 +707,14 @@ final class StateTests: XCTestCase {
         XCTAssertEqual(state.amp.name, "JCM")
         XCTAssertEqual(state.cabinet.name, "412")
 
-        // An untracked string tag leaves the snapshot unchanged.
+        // An untracked string tag is silent: only the stream's numerics have a
+        // generic event to fall through to.
         let untracked = state.apply(
             Nrpn.sysex(
                 product: 0x00, device: 0x7F, function: Generated.fnStringParam,
                 page: Generated.pageStrings, number: 99, values: Array("x".utf8)
             ))
-        XCTAssertFalse(untracked.slowChanged)
-        XCTAssertEqual(untracked.events, [.stringTag(number: 99)])
+        XCTAssertEqual(untracked, ApplyOutcome())
     }
 
     func testEffectTypeStateAndMixFoldIntoSlot() {
@@ -977,10 +977,62 @@ final class StateTests: XCTestCase {
         XCTAssertEqual(
             state.applyCbor(address: Generated.morphAddress, value: 8192), ApplyOutcome())
         XCTAssertEqual(state.applyCbor(address: 102_405, value: 31), ApplyOutcome())
-        // A value too wide for the field is dropped, not truncated.
+        // A value too wide for the field is dropped, not truncated — and so is
+        // a negative one, which nothing in the tree could hold.
         XCTAssertEqual(
             state.applyCbor(address: Generated.morphAddress, value: 70_000), ApplyOutcome())
+        XCTAssertEqual(state.applyCbor(address: Generated.morphAddress, value: -1), ApplyOutcome())
         XCTAssertEqual(state.morph, 8192)
+    }
+
+    /// The control channel carries the page-0 tags as strings too; one lands in
+    /// the same field, and raises the same events, as a `$03` on the stream.
+    func testApplyCborTextRoutesTheSameAsTheStream() {
+        var state = DeviceState()
+        let outcome = state.applyCborText(address: UInt32(Generated.stringRigName), text: "AC30")
+        XCTAssertEqual(outcome.events, [.stringTag(number: 1), .rigChanged])
+        XCTAssertTrue(outcome.slowChanged)
+        XCTAssertEqual(state.rig.name, "AC30")
+        // The same name again is not a change; a numeric at the tag is not the
+        // tag's value at all.
+        XCTAssertEqual(
+            state.applyCborText(address: UInt32(Generated.stringRigName), text: "AC30"),
+            ApplyOutcome())
+        XCTAssertEqual(
+            state.applyCbor(address: UInt32(Generated.stringRigName), value: 5), ApplyOutcome())
+        XCTAssertEqual(state.rig.name, "AC30")
+    }
+
+    /// The control channel's copies of the stream-only rows are a different,
+    /// unwanted feed: a CBOR value at the meter block never writes `status`.
+    func testApplyCborDropsStreamOnlyRows() {
+        var state = DeviceState()
+        let base = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.meterBlockNumber)
+        XCTAssertEqual(state.applyCbor(address: base + 3, value: 1234), ApplyOutcome())
+        XCTAssertEqual(state.status, RealtimeStatus())
+        let pulse = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.beatPulseNumber)
+        XCTAssertEqual(state.applyCbor(address: pulse, value: 1), ApplyOutcome())
+    }
+
+    /// While the state dump streams, a live push outranks the dump's copy of
+    /// the same address; once it ends, the bookkeeping is gone and the two
+    /// trees compare equal regardless of it.
+    func testDumpItemsYieldToLivePushes() {
+        var state = DeviceState()
+        state.beginDump()
+        let live = state.applyCbor(address: Generated.currentBankAddress, value: 3)
+        XCTAssertEqual(live.events, [.currentPosition(bank: 3, slot: nil)])
+        let stale = state.applyUpdate(
+            Update(
+                source: .control, phase: .dump, address: Generated.currentBankAddress,
+                decoded: .num(2)))
+        XCTAssertEqual(stale, ApplyOutcome())
+        XCTAssertEqual(state.currentBank, 3)
+        state.endDump()
+
+        var other = DeviceState()
+        other.applyCbor(address: Generated.currentBankAddress, value: 3)
+        XCTAssertEqual(state, other, "dump bookkeeping is not part of the snapshot")
     }
 
     func testTunerDevianceIsFastAndNoteIsSlow() {

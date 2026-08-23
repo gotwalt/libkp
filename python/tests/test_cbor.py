@@ -71,6 +71,36 @@ def test_collects_strings_and_redacts_secrets():
     assert snap.string(gen.SENSITIVE_ADDRESSES[0]) == gen.REDACTED_PLACEHOLDER
 
 
+def test_snapshot_reads_the_position_by_the_tree_rows():
+    """The dump folds through the same routing a live session uses, so a bank
+    index wider than the row's 16 bits is dropped rather than wrapped, and one
+    past 14 bits is kept: the position rows are ``u16``, the morph is ``u14``."""
+    snap = cbor.extract_snapshot(
+        [
+            cbor.param_write(gen.CURRENT_BANK_ADDRESS, 40_000),
+            cbor.param_write(gen.CURRENT_RIG_SLOT_ADDRESS, 70_000),
+            cbor.param_write(gen.MORPH_ADDRESS, 16_384),
+        ]
+    )
+    assert snap.current_bank == 40_000
+    assert snap.current_rig_slot is None
+    assert snap.morph is None
+
+
+def test_numeric_values_skips_unrepresentable_pairs():
+    """A pair every implementation would have to widen or wrap is malformed."""
+    good = cbor.param_write(gen.MORPH_ADDRESS, 8192)
+    assert cbor.numeric_values([good]) == [(gen.MORPH_ADDRESS, 8192)]
+    wide_address = cbor.param_write(0xFFFF_FFFF + 1, 1)
+    wide_value = cbor.param_write(gen.MORPH_ADDRESS, 1 << 63)
+    negative_address = cbor.param_write(-1, 1)
+    assert cbor.numeric_values([wide_address, wide_value, negative_address]) == []
+    # The bounds themselves are representable.
+    assert cbor.numeric_values([cbor.param_write(0xFFFF_FFFF, -(1 << 63))]) == [
+        (0xFFFF_FFFF, -(1 << 63))
+    ]
+
+
 def test_empty_snapshot_is_incomplete():
     snap = cbor.extract_snapshot([])
     assert snap.current_bank is None

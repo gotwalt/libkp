@@ -342,6 +342,11 @@ final class ConformanceTests: XCTestCase {
 
     // MARK: - state.json
 
+    /// A case carries either `"messages"` (unframed MIDI3 hex, each through
+    /// `apply`) or `"steps"` (each naming the entry point it drives). The steps
+    /// form also pins the ordered event names every step raised and how many
+    /// steps flagged the snapshot, so the fold's reporting is held to the
+    /// vectors and not only its tree.
     func testStateVectors() throws {
         let vector = try Fixtures.vector("state")
         let cases = vector.cases("cases")
@@ -349,14 +354,107 @@ final class ConformanceTests: XCTestCase {
         for entry in cases {
             let name = entry.string("name")
             var state = DeviceState()
+            var outcomes: [ApplyOutcome] = []
             for messageHex in (entry["messages"] as? [String]) ?? [] {
-                state.apply(try hex(messageHex))
+                outcomes.append(state.apply(try hex(messageHex)))
+            }
+            for step in (entry["steps"] as? [[String: Any]]) ?? [] {
+                outcomes.append(try run(step, on: &state, caseName: name))
             }
             guard let expect = entry["expect"] as? [String: Any] else {
                 XCTFail("case \"\(name)\" has no expect block")
                 continue
             }
             assertState(state, matches: expect, caseName: name)
+            if let events = expect["events"] as? [String] {
+                XCTAssertEqual(
+                    outcomes.flatMap(\.events).map(eventName), events, "\(name): events")
+            }
+            if let slowSteps = expect["slow_steps"] as? NSNumber {
+                XCTAssertEqual(
+                    outcomes.filter(\.slowChanged).count, slowSteps.intValue,
+                    "\(name): slow_steps")
+            }
+        }
+    }
+
+    /// Drive one `"steps"` entry — exactly one key naming the entry point —
+    /// against `state`, returning what it reported.
+    private func run(
+        _ step: [String: Any], on state: inout DeviceState, caseName: String
+    ) throws -> ApplyOutcome {
+        guard step.count == 1, let (kind, payload) = step.first else {
+            throw Fixtures.Failure("\(caseName): a step must have exactly one key")
+        }
+        func pair() throws -> (UInt32, Any) {
+            guard let list = payload as? [Any], list.count == 2, let addr = list[0] as? NSNumber
+            else { throw Fixtures.Failure("\(caseName): bad \(kind) step") }
+            return (addr.uint32Value, list[1])
+        }
+        func number(_ value: Any) throws -> UInt64 {
+            guard let n = value as? NSNumber, let u = UInt64(exactly: n.int64Value) else {
+                throw Fixtures.Failure("\(caseName): \(kind) value is not a whole number")
+            }
+            return u
+        }
+        func text(_ value: Any) throws -> String {
+            guard let t = value as? String else {
+                throw Fixtures.Failure("\(caseName): \(kind) value is not a string")
+            }
+            return t
+        }
+        switch kind {
+        case "midi3":
+            return state.apply(try hex(try text(payload)))
+        case "cbor":
+            let (address, value) = try pair()
+            return state.applyCbor(address: address, value: Int64(try number(value)))
+        case "cbor_text":
+            let (address, value) = try pair()
+            return state.applyCborText(address: address, text: try text(value))
+        case "cbor_dump":
+            let (address, value) = try pair()
+            return state.applyUpdate(
+                Update(
+                    source: .control, phase: .dump, address: address,
+                    decoded: .num(try number(value))))
+        case "cbor_dump_text":
+            let (address, value) = try pair()
+            return state.applyUpdate(
+                Update(
+                    source: .control, phase: .dump, address: address,
+                    decoded: .text(try text(value))))
+        case "dump_begin":
+            state.beginDump()
+            return ApplyOutcome()
+        case "dump_end":
+            state.endDump()
+            return ApplyOutcome()
+        default:
+            throw Fixtures.Failure("\(caseName): unknown step kind \"\(kind)\"")
+        }
+    }
+
+    /// The vectors' snake_case name for an event, as `spec/state.toml` spells
+    /// the `event` column.
+    private func eventName(_ event: DeviceEvent) -> String {
+        switch event {
+        case .rigChanged: return "rig_changed"
+        case .stringTag: return "string_tag"
+        case .bankPreview: return "bank_preview"
+        case .effectChanged: return "effect_changed"
+        case .paramChanged: return "param_changed"
+        case .status: return "status"
+        case .beatPulse: return "beat_pulse"
+        case .tempoBpm: return "tempo_bpm"
+        case .morphChanged: return "morph_changed"
+        case .morphButton: return "morph_button"
+        case .tunerDeviance: return "tuner_deviance"
+        case .tunerNote: return "tuner_note"
+        case .renderedString: return "rendered_string"
+        case .currentPosition: return "current_position"
+        case .connected: return "connected"
+        case .disconnected: return "disconnected"
         }
     }
 

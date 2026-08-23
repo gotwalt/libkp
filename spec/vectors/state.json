@@ -1,5 +1,5 @@
 {
-  "description": "Apply a sequence of decoded MIDI messages to a fresh DeviceState; assert fields.",
+  "description": "Apply a sequence of updates to a fresh DeviceState; assert fields. A case carries either \"messages\" (unframed MIDI3 hex, each through apply) or \"steps\" (midi3 / cbor / cbor_text / cbor_dump / cbor_dump_text / dump_begin / dump_end, each naming the entry point it drives); a \"steps\" case also pins expect.events, the ordered event names raised across all steps, and expect.slow_steps, how many steps returned an outcome with the snapshot flag set.",
   "cases": [
     {
       "name": "rig name",
@@ -145,6 +145,972 @@
         "current_bank": 24,
         "current_rig_slot": null,
         "current_rig_index": null
+      }
+    },
+    {
+      "name": "rule 7: the same position on both wires raises one current_position",
+      "steps": [
+        {
+          "midi3": "f000203302000600000006125d0000000002f7"
+        },
+        {
+          "cbor": [
+            100701,
+            2
+          ]
+        }
+      ],
+      "expect": {
+        "current_bank": 2,
+        "current_rig_slot": null,
+        "events": [
+          "current_position"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 3: a stream morph position is accepted, and rule 7 drops the equal CBOR copy",
+      "steps": [
+        {
+          "midi3": "f00020330000010000773e40f7"
+        },
+        {
+          "cbor": [
+            119,
+            8000
+          ]
+        }
+      ],
+      "expect": {
+        "morph": 8000,
+        "events": [
+          "morph_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 7: the same rig name on both wires raises one string_tag and one rig_changed",
+      "steps": [
+        {
+          "midi3": "f000203300000300000141433330f7"
+        },
+        {
+          "cbor_text": [
+            1,
+            "AC30"
+          ]
+        }
+      ],
+      "expect": {
+        "rig_name": "AC30",
+        "events": [
+          "string_tag",
+          "rig_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 7: a repeated control numeric is a no-op",
+      "steps": [
+        {
+          "cbor": [
+            513,
+            100
+          ]
+        },
+        {
+          "cbor": [
+            513,
+            100
+          ]
+        }
+      ],
+      "expect": {
+        "rig_volume": 100,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 7: dedupe compares the decoded value, not the wire value",
+      "steps": [
+        {
+          "cbor": [
+            1282,
+            1
+          ]
+        },
+        {
+          "cbor": [
+            1282,
+            5
+          ]
+        }
+      ],
+      "expect": {
+        "amp_on": true,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 7: the momentary morph button is never deduped",
+      "steps": [
+        {
+          "midi3": "f00020330000010000500001f7"
+        },
+        {
+          "midi3": "f00020330000010000500001f7"
+        }
+      ],
+      "expect": {
+        "morph": null,
+        "events": [
+          "morph_button",
+          "morph_button"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 7: the beat pulse is never deduped",
+      "steps": [
+        {
+          "midi3": "f0002033000001007c000001f7"
+        },
+        {
+          "midi3": "f0002033000001007c000001f7"
+        }
+      ],
+      "expect": {
+        "events": [
+          "beat_pulse",
+          "beat_pulse"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 7: the meter frame is never deduped",
+      "steps": [
+        {
+          "midi3": "f0002033000002007c4e00640148022c3e405d60270846281f2000002e700000f7"
+        },
+        {
+          "midi3": "f0002033000002007c4e00640148022c3e405d60270846281f2000002e700000f7"
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          100,
+          200,
+          300,
+          8000,
+          12000,
+          5000,
+          9000,
+          4000,
+          0,
+          6000,
+          0
+        ],
+        "events": [
+          "status",
+          "status"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 7: the tuner deviance is deduped on the fast lane",
+      "steps": [
+        {
+          "midi3": "f0002033000001007c0f4000f7"
+        },
+        {
+          "midi3": "f0002033000001007c0f4000f7"
+        }
+      ],
+      "expect": {
+        "events": [
+          "tuner_deviance"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 8: CBOR numerics land in tempo and rig volume with the rows' events",
+      "steps": [
+        {
+          "cbor": [
+            512,
+            5376
+          ]
+        },
+        {
+          "cbor": [
+            513,
+            8106
+          ]
+        }
+      ],
+      "expect": {
+        "tempo_bpm": 84,
+        "rig_volume": 8106,
+        "events": [
+          "tempo_bpm",
+          "param_changed"
+        ],
+        "slow_steps": 2
+      }
+    },
+    {
+      "name": "rule 8: CBOR text lands in rig_name and raises string_tag then rig_changed",
+      "steps": [
+        {
+          "cbor_text": [
+            1,
+            "AC30"
+          ]
+        }
+      ],
+      "expect": {
+        "rig_name": "AC30",
+        "events": [
+          "string_tag",
+          "rig_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 8: effect rows land from the control wire",
+      "steps": [
+        {
+          "cbor": [
+            7808,
+            179
+          ]
+        },
+        {
+          "cbor": [
+            7811,
+            1
+          ]
+        }
+      ],
+      "expect": {
+        "effect": {
+          "slot": "REV",
+          "kind": 179,
+          "on": true,
+          "type_name": "Easy Reverb"
+        },
+        "events": [
+          "effect_changed",
+          "effect_changed"
+        ],
+        "slow_steps": 2
+      }
+    },
+    {
+      "name": "rule 8: the control wire reaches the output volumes",
+      "steps": [
+        {
+          "cbor": [
+            16257,
+            1000
+          ]
+        }
+      ],
+      "expect": {
+        "headphone_volume": 1000,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 8: dump text fills the bank preview one slot at a time",
+      "steps": [
+        {
+          "cbor_dump_text": [
+            19200,
+            "Slot A"
+          ]
+        },
+        {
+          "cbor_dump_text": [
+            19201,
+            "Slot B"
+          ]
+        },
+        {
+          "cbor_dump_text": [
+            19202,
+            "Slot C"
+          ]
+        },
+        {
+          "cbor_dump_text": [
+            19203,
+            "Slot D"
+          ]
+        },
+        {
+          "cbor_dump_text": [
+            19204,
+            "Slot E"
+          ]
+        }
+      ],
+      "expect": {
+        "bank": [
+          {
+            "slot": 0,
+            "rig_name": "Slot A"
+          },
+          {
+            "slot": 1,
+            "rig_name": "Slot B"
+          },
+          {
+            "slot": 2,
+            "rig_name": "Slot C"
+          },
+          {
+            "slot": 3,
+            "rig_name": "Slot D"
+          },
+          {
+            "slot": 4,
+            "rig_name": "Slot E"
+          }
+        ],
+        "events": [
+          "bank_preview",
+          "bank_preview",
+          "bank_preview",
+          "bank_preview",
+          "bank_preview"
+        ],
+        "slow_steps": 5
+      }
+    },
+    {
+      "name": "rule 8: the stream reaches the bank preview too",
+      "steps": [
+        {
+          "midi3": "f00020330000030096055477696ef7"
+        }
+      ],
+      "expect": {
+        "bank": [
+          {
+            "slot": 0,
+            "amp_name": "Twin"
+          }
+        ],
+        "events": [
+          "bank_preview"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 2: an untracked control address is silent",
+      "steps": [
+        {
+          "cbor": [
+            200008,
+            1
+          ]
+        }
+      ],
+      "expect": {
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 2: an untracked stream numeric still raises a fast param_changed",
+      "steps": [
+        {
+          "midi3": "f00020330000010004100005f7"
+        }
+      ],
+      "expect": {
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 2: an untracked stream text is silent",
+      "steps": [
+        {
+          "midi3": "f000203300000300000578f7"
+        }
+      ],
+      "expect": {
+        "rig_name": null,
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 2: an untracked extended address on the stream is silent",
+      "steps": [
+        {
+          "midi3": "f0002033020006000000062005000000001ff7"
+        }
+      ],
+      "expect": {
+        "current_bank": null,
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 3: the control copy of the meter block is dropped",
+      "steps": [
+        {
+          "cbor": [
+            15953,
+            1234
+          ]
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 3: the control copy of the beat pulse is dropped",
+      "steps": [
+        {
+          "cbor": [
+            15872,
+            16383
+          ]
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 3: the control copy of the tuner note is dropped",
+      "steps": [
+        {
+          "cbor": [
+            16084,
+            9
+          ]
+        }
+      ],
+      "expect": {
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 3: the control copy of the morph button is dropped",
+      "steps": [
+        {
+          "cbor": [
+            80,
+            1
+          ]
+        }
+      ],
+      "expect": {
+        "morph": null,
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 4: text at a numeric row is untracked",
+      "steps": [
+        {
+          "cbor": [
+            513,
+            100
+          ]
+        },
+        {
+          "cbor_text": [
+            513,
+            "x"
+          ]
+        }
+      ],
+      "expect": {
+        "rig_volume": 100,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 4: a control numeric at a text row is untracked",
+      "steps": [
+        {
+          "cbor_text": [
+            1,
+            "AC30"
+          ]
+        },
+        {
+          "cbor": [
+            1,
+            5
+          ]
+        }
+      ],
+      "expect": {
+        "rig_name": "AC30",
+        "events": [
+          "string_tag",
+          "rig_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 4: a stream numeric at a text row falls through to param_changed",
+      "steps": [
+        {
+          "midi3": "f00020330000010000010005f7"
+        }
+      ],
+      "expect": {
+        "rig_name": null,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 5: a u14 row drops a value past 16383",
+      "steps": [
+        {
+          "cbor": [
+            513,
+            100
+          ]
+        },
+        {
+          "cbor": [
+            513,
+            70000
+          ]
+        }
+      ],
+      "expect": {
+        "rig_volume": 100,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 5: a u16 row drops a value past 65535",
+      "steps": [
+        {
+          "cbor": [
+            100701,
+            70000
+          ]
+        }
+      ],
+      "expect": {
+        "current_bank": null,
+        "current_rig_index": null,
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 5: a u16 row keeps a value past 14 bits",
+      "steps": [
+        {
+          "cbor": [
+            100701,
+            40000
+          ]
+        }
+      ],
+      "expect": {
+        "current_bank": 40000,
+        "events": [
+          "current_position"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 5: the stream's extended value is range-checked by the same row",
+      "steps": [
+        {
+          "midi3": "f000203302000600000006125d0000042270f7"
+        }
+      ],
+      "expect": {
+        "current_bank": null,
+        "events": [],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 5: a u7 row keeps the low seven bits",
+      "steps": [
+        {
+          "midi3": "f0002033000001007d540109f7"
+        }
+      ],
+      "expect": {
+        "tuner_note": 9,
+        "events": [
+          "tuner_note"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 6: a live position during the dump beats the dump's stale copy",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        },
+        {
+          "cbor_dump": [
+            100701,
+            2
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "current_bank": 3,
+        "events": [
+          "current_position"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 6: after the dump ends a live position lands over the dump's",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "cbor_dump": [
+            100701,
+            2
+          ]
+        },
+        {
+          "dump_end": true
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        }
+      ],
+      "expect": {
+        "current_bank": 3,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2
+      }
+    },
+    {
+      "name": "rule 6: a live string during the dump beats the dump's stale text",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "midi3": "f000203300000300000141433330f7"
+        },
+        {
+          "cbor_dump_text": [
+            1,
+            "Old"
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "rig_name": "AC30",
+        "events": [
+          "string_tag",
+          "rig_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 6: a live update marks its address even when deduped",
+      "steps": [
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        },
+        {
+          "dump_begin": true
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        },
+        {
+          "cbor_dump": [
+            100701,
+            2
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "current_bank": 3,
+        "events": [
+          "current_position"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 6: a live update dropped by range does not mark its address",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "cbor": [
+            100701,
+            70000
+          ]
+        },
+        {
+          "cbor_dump": [
+            100701,
+            2
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "current_bank": 2,
+        "events": [
+          "current_position"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 6: the dump guard is per address",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        },
+        {
+          "cbor_dump": [
+            100702,
+            1
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "current_bank": 3,
+        "current_rig_slot": 1,
+        "current_rig_index": 16,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2
+      }
+    },
+    {
+      "name": "rule 6: end_dump clears the touched set",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        },
+        {
+          "dump_end": true
+        },
+        {
+          "dump_begin": true
+        },
+        {
+          "cbor_dump": [
+            100701,
+            2
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "current_bank": 2,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2
+      }
+    },
+    {
+      "name": "rule 6: a dump item outside a dump folds like a live one",
+      "steps": [
+        {
+          "cbor_dump": [
+            513,
+            100
+          ]
+        }
+      ],
+      "expect": {
+        "rig_volume": 100,
+        "events": [
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 1: a stream block at the meter base is one status frame",
+      "steps": [
+        {
+          "midi3": "f0002033000002007c4e00640148022c3e405d60270846281f2000002e700000f7"
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          100,
+          200,
+          300,
+          8000,
+          12000,
+          5000,
+          9000,
+          4000,
+          0,
+          6000,
+          0
+        ],
+        "events": [
+          "status"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 1: a stream block off a Multi base folds element by element",
+      "steps": [
+        {
+          "midi3": "f00020330000020004002a004628f7"
+        }
+      ],
+      "expect": {
+        "tempo_bpm": 84,
+        "rig_volume": 9000,
+        "events": [
+          "tempo_bpm",
+          "param_changed"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "outside the table: a rendered-string reply is a fast event with no state",
+      "steps": [
+        {
+          "midi3": "f0002033027f3c003c3540003c302e303e00f7"
+        }
+      ],
+      "expect": {
+        "events": [
+          "rendered_string"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "outside the table: a non-Kemper message is ignored",
+      "steps": [
+        {
+          "midi3": "b03201"
+        }
+      ],
+      "expect": {
+        "events": [],
+        "slow_steps": 0
       }
     }
   ]

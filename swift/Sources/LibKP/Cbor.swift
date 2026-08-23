@@ -438,24 +438,29 @@ public enum Cbor {
         Generated.sensitiveAddresses.contains(addr)
     }
 
-    /// Read the current bank, rig slot and string parameters out of decoded dump
-    /// items.
+    /// Read the current bank, rig slot, morph and string parameters out of
+    /// decoded dump items.
     ///
-    /// Scans the two index-bearing shapes: a single `[1, addr, value]`, and a
-    /// consecutive-run `[2, base, v0, v1, …]` where the whole run is walked because
-    /// the target address can fall anywhere inside it. A leading negative
-    /// source-flag word, if present, is skipped.
+    /// The items are folded into a scratch ``DeviceState`` — the same routing
+    /// table a live session uses, so the dump cannot disagree with the tree
+    /// about what an address means — and the snapshot's fields are read off it.
+    /// The strings are collected alongside, in document order, because the
+    /// snapshot lists every string the dump carried rather than only the ones
+    /// the tree tracks; a sensitive one is redacted before it is kept.
     public static func extractSnapshot(_ items: [CBORValue]) -> StateSnapshot {
-        var snap = StateSnapshot()
+        var state = DeviceState()
+        var strings: [SnapshotString] = []
         walk(
             items,
-            numeric: { note(&snap, address: $0, value: $1) },
+            numeric: { state.applyCbor(address: $0, value: $1) },
             text: { address, text in
-                let ua = UInt32(truncatingIfNeeded: address)
-                let value = isSensitive(ua) ? Generated.redactedPlaceholder : text
-                snap.strings.append(SnapshotString(address: ua, text: value))
+                state.applyCborText(address: address, text: text)
+                let value = isSensitive(address) ? Generated.redactedPlaceholder : text
+                strings.append(SnapshotString(address: address, text: value))
             })
-        return snap
+        return StateSnapshot(
+            currentBank: state.currentBank, currentRigSlot: state.currentRigSlot,
+            morph: state.morph, strings: strings)
     }
 
     /// Every numeric address/value pair the items carry, in document order.
@@ -464,10 +469,7 @@ public enum Cbor {
     /// a ``CborSession`` folds into a state tree as values move.
     public static func numericValues(_ items: [CBORValue]) -> [(address: UInt32, value: Int64)] {
         var out: [(address: UInt32, value: Int64)] = []
-        walk(
-            items,
-            numeric: { out.append((UInt32(truncatingIfNeeded: $0), $1)) },
-            text: { _, _ in })
+        walk(items, numeric: { out.append(($0, $1)) }, text: { _, _ in })
         return out
     }
 
@@ -477,12 +479,15 @@ public enum Cbor {
     /// consecutive-run `[2, base, v0, v1, …]` where the whole run is walked
     /// because the target address can fall anywhere inside it, and a string
     /// `[4, addr, text]`. A leading negative source-flag word, if present, is
-    /// skipped.
+    /// skipped. An address outside the 32-bit space — negative, or past what
+    /// any page or extended address can name — is dropped rather than wrapped
+    /// onto some other parameter.
     private static func walk(
         _ items: [CBORValue],
-        numeric: (Int64, Int64) -> Void,
-        text: (Int64, String) -> Void
+        numeric: (UInt32, Int64) -> Void,
+        text: (UInt32, String) -> Void
     ) {
+        let address = { (n: Int64) -> UInt32? in UInt32(exactly: n) }
         for item in items {
             guard let fields = item.asArray else { continue }
             // Skip a leading negative source-flags word.
@@ -496,30 +501,22 @@ public enum Cbor {
             let addr = rest.count > 1 ? rest[1].asInt : nil
 
             if selector == Generated.cborSelectorSingle {
-                if let a = addr, rest.count > 2, let v = rest[2].asInt { numeric(a, v) }
+                if let a = addr.flatMap(address), rest.count > 2, let v = rest[2].asInt {
+                    numeric(a, v)
+                }
             } else if selector == Generated.cborSelectorMulti {
                 if let base = addr {
                     for (i, element) in rest.dropFirst(2).enumerated() {
-                        if let v = element.asInt { numeric(base + Int64(i), v) }
+                        if let a = address(base + Int64(i)), let v = element.asInt { numeric(a, v) }
                     }
                 }
             } else if selector == Generated.cborSelectorString {
-                if let a = addr, rest.count > 2, case .text(let t) = rest[2], !t.isEmpty {
+                if let a = addr.flatMap(address), rest.count > 2, case .text(let t) = rest[2],
+                    !t.isEmpty
+                {
                     text(a, t)
                 }
             }
-        }
-    }
-
-    /// Record the value at one address into the snapshot's indices.
-    private static func note(_ snap: inout StateSnapshot, address: Int64, value: Int64) {
-        let v = UInt16(exactly: value)
-        if address == Int64(Generated.currentBankAddress) {
-            snap.currentBank = v
-        } else if address == Int64(Generated.currentRigSlotAddress) {
-            snap.currentRigSlot = v
-        } else if address == Int64(Generated.morphAddress) {
-            snap.morph = v
         }
     }
 }

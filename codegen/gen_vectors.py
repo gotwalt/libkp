@@ -568,10 +568,18 @@ def build():
         ],
     })
 
-    # state.apply sequences
+    # state.apply sequences: the older cases feed unframed MIDI3 messages
+    # through `apply`; the transport-tagged ones drive the fold through every
+    # entry point and pin which events each step raises.
     w("state.json", {
-        "description": "Apply a sequence of decoded MIDI messages to a fresh DeviceState; assert fields.",
-        "cases": _state_cases(),
+        "description": "Apply a sequence of updates to a fresh DeviceState; assert fields. "
+                       "A case carries either \"messages\" (unframed MIDI3 hex, each through "
+                       "apply) or \"steps\" (midi3 / cbor / cbor_text / cbor_dump / "
+                       "cbor_dump_text / dump_begin / dump_end, each naming the entry point it "
+                       "drives); a \"steps\" case also pins expect.events, the ordered event "
+                       "names raised across all steps, and expect.slow_steps, how many steps "
+                       "returned an outcome with the snapshot flag set.",
+        "cases": _state_cases() + _state_step_cases(),
     })
 
     # cbor: the one write this library sends, and reading a dump's position,
@@ -678,6 +686,314 @@ def _state_cases():
                   "expect": {"current_bank": 24, "current_rig_slot": None,
                              "current_rig_index": None}})
     return cases
+
+
+# The transport-tagged cases below drive `DeviceState.apply_update` through
+# every entry point — `apply` for a MIDI3 message, `apply_cbor` /
+# `apply_cbor_text` for a live CBOR item, and a dump-phase update for an item
+# of the CBOR state dump — against one fresh state, and pin the ordered event
+# names and the number of snapshot-flagged steps alongside the tree. Each
+# expectation is derived from the fold contract's rules and the routing
+# table's rows (spec/state.toml), never from an implementation; the name of
+# each case says which rule it pins so a failure reads as a contract
+# violation, not a mystery.
+
+# Every event name the fold may raise; a typo here would pin nothing, so the
+# case builder refuses names outside this set.
+_EVENT_NAMES = frozenset({
+    "string_tag", "rig_changed", "bank_preview", "effect_changed", "param_changed",
+    "status", "beat_pulse", "tempo_bpm", "morph_changed", "morph_button",
+    "tuner_deviance", "tuner_note", "rendered_string", "current_position",
+})
+_STEP_KINDS = frozenset({"midi3", "cbor", "cbor_text", "cbor_dump", "cbor_dump_text",
+                         "dump_begin", "dump_end"})
+
+WK = PARAMS["well_known"]
+
+
+def flat(page: int, number: int) -> int:
+    """The flat address the routing table keys on: `page * 128 + number`."""
+    return page * 128 + number
+
+
+def step_midi3(msg: bytes) -> dict:
+    return {"midi3": hx(msg)}
+
+
+def step_cbor(address: int, value: int) -> dict:
+    return {"cbor": [address, value]}
+
+
+def step_cbor_text(address: int, text: str) -> dict:
+    return {"cbor_text": [address, text]}
+
+
+def step_cbor_dump(address: int, value: int) -> dict:
+    return {"cbor_dump": [address, value]}
+
+
+def step_cbor_dump_text(address: int, text: str) -> dict:
+    return {"cbor_dump_text": [address, text]}
+
+
+STEP_DUMP_BEGIN = {"dump_begin": True}
+STEP_DUMP_END = {"dump_end": True}
+
+
+def _steps_case(name: str, steps: list[dict], events: list[str], slow_steps: int,
+                **tree) -> dict:
+    """One transport-tagged case; the tree keys are whatever the loaders assert."""
+    for s in steps:
+        assert len(s) == 1 and next(iter(s)) in _STEP_KINDS, s
+    unknown = set(events) - _EVENT_NAMES
+    assert not unknown, f"{name}: unknown event names {sorted(unknown)}"
+    assert 0 <= slow_steps <= len(steps), name
+    return {"name": name, "steps": steps,
+            "expect": {**tree, "events": events, "slow_steps": slow_steps}}
+
+
+def _state_step_cases():
+    # Addresses, every one derived from the well-known keys the table's rows
+    # reference, so this file never spells an address the spec does not.
+    rig_name_addr = flat(WK["page_strings"], WK["string_rig_name"])
+    morph_button_addr = flat(WK["page_morph"], WK["morph_button_number"])
+    tempo_addr = flat(WK["page_rig_settings"], WK["tempo_number"])
+    rig_volume_addr = flat(WK["page_rig_settings"], WK["rig_volume_number"])
+    amp_on_addr = flat(WK["amp_page"], WK["amp_on_number"])
+    beat_pulse_addr = flat(WK["page_realtime"], WK["beat_pulse_number"])
+    meter_base_addr = flat(WK["page_realtime"], WK["meter_block_number"])
+    tuner_note_addr = flat(WK["page_tuner_note"], WK["tuner_note_number"])
+    headphone_addr = flat(WK["system_page"], WK["headphone_volume_number"])
+    bank_rig_name_addr = flat(WK["page_bank_preview"], WK["bank_rig_name_base"])
+    bpm_scale = WK["tempo_bpm_scale"]
+    assert MORPH_ADDRESS == flat(MORPH_PAGE, MORPH_NUMBER)
+    # The REV slot's page, as the "effect REV type+on" case above spells it.
+    rev_page = 0x3D
+    rev_type_addr = flat(rev_page, PARAMS["effect_param_numbers"]["type"])
+    rev_on_addr = flat(rev_page, PARAMS["effect_param_numbers"]["state"])
+    assert (rev_type_addr, rev_on_addr) == (7808, 7811)
+    secret = CBOR["sensitive_addresses"][0]
+    fresh_status = [0] * WK["meter_count"]
+
+    def bank(value: int) -> dict:
+        return step_midi3(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, value))
+
+    def meter_block(raw: list[int]) -> dict:
+        vals = []
+        for v in raw:
+            vals.extend(u14_split(v))
+        return step_midi3(sysex(0x00, 0x00, FN["multi_param"], WK["page_realtime"],
+                                WK["meter_block_number"], vals))
+
+    def string_tag(page: int, number: int, text: str) -> dict:
+        return step_midi3(sysex(0x00, 0x00, FN["string_param"], page, number, list(text.encode())))
+
+    def single(page: int, number: int, value: int) -> dict:
+        return step_midi3(set_single(0x00, 0x00, page, number, value))
+
+    raw = [100, 200, 300, 8000, 12000, 5000, 9000, 4000, 0, 6000, 0]
+    slot_names = ["Slot A", "Slot B", "Slot C", "Slot D", "Slot E"]
+
+    return [
+        # --- Rule 7 across wires: both channels name the same address, so a
+        #     value already stored is a no-op whichever wire repeats it.
+        _steps_case("rule 7: the same position on both wires raises one current_position",
+                    [bank(2), step_cbor(CURRENT_BANK_ADDRESS, 2)],
+                    ["current_position"], 1,
+                    current_bank=2, current_rig_slot=None),
+        _steps_case("rule 3: a stream morph position is accepted, and rule 7 drops the equal CBOR copy",
+                    [single(MORPH_PAGE, MORPH_NUMBER, 8000), step_cbor(MORPH_ADDRESS, 8000)],
+                    ["morph_changed"], 1,
+                    morph=8000),
+        _steps_case("rule 7: the same rig name on both wires raises one string_tag and one rig_changed",
+                    [string_tag(WK["page_strings"], WK["string_rig_name"], "AC30"),
+                     step_cbor_text(rig_name_addr, "AC30")],
+                    ["string_tag", "rig_changed"], 1,
+                    rig_name="AC30"),
+        _steps_case("rule 7: a repeated control numeric is a no-op",
+                    [step_cbor(rig_volume_addr, 100), step_cbor(rig_volume_addr, 100)],
+                    ["param_changed"], 1,
+                    rig_volume=100),
+        # Dedupe compares what the row would store, not the wire value: 1 and
+        # 5 are both "on" for a bool row.
+        _steps_case("rule 7: dedupe compares the decoded value, not the wire value",
+                    [step_cbor(amp_on_addr, 1), step_cbor(amp_on_addr, 5)],
+                    ["param_changed"], 1,
+                    amp_on=True),
+        _steps_case("rule 7: the momentary morph button is never deduped",
+                    [single(MORPH_PAGE, MORPH_BUTTON_NUMBER, 1),
+                     single(MORPH_PAGE, MORPH_BUTTON_NUMBER, 1)],
+                    ["morph_button", "morph_button"], 0,
+                    morph=None),
+        _steps_case("rule 7: the beat pulse is never deduped",
+                    [single(WK["page_realtime"], WK["beat_pulse_number"], 1),
+                     single(WK["page_realtime"], WK["beat_pulse_number"], 1)],
+                    ["beat_pulse", "beat_pulse"], 0),
+        _steps_case("rule 7: the meter frame is never deduped",
+                    [meter_block(raw), meter_block(raw)],
+                    ["status", "status"], 0,
+                    status_raw=raw),
+        _steps_case("rule 7: the tuner deviance is deduped on the fast lane",
+                    [single(WK["page_realtime"], WK["tuner_deviance_number"], 8192),
+                     single(WK["page_realtime"], WK["tuner_deviance_number"], 8192)],
+                    ["tuner_deviance"], 0),
+        # --- Rule 8: the control wire lands in the same rows as the stream,
+        #     raising each row's declared event.
+        _steps_case("rule 8: CBOR numerics land in tempo and rig volume with the rows' events",
+                    [step_cbor(tempo_addr, 84 * bpm_scale), step_cbor(rig_volume_addr, 8106)],
+                    ["tempo_bpm", "param_changed"], 2,
+                    tempo_bpm=84, rig_volume=8106),
+        _steps_case("rule 8: CBOR text lands in rig_name and raises string_tag then rig_changed",
+                    [step_cbor_text(rig_name_addr, "AC30")],
+                    ["string_tag", "rig_changed"], 1,
+                    rig_name="AC30"),
+        _steps_case("rule 8: effect rows land from the control wire",
+                    [step_cbor(rev_type_addr, 179), step_cbor(rev_on_addr, 1)],
+                    ["effect_changed", "effect_changed"], 2,
+                    effect={"slot": "REV", "kind": 179, "on": True, "type_name": "Easy Reverb"}),
+        _steps_case("rule 8: the control wire reaches the output volumes",
+                    [step_cbor(headphone_addr, 1000)],
+                    ["param_changed"], 1,
+                    headphone_volume=1000),
+        _steps_case("rule 8: dump text fills the bank preview one slot at a time",
+                    [step_cbor_dump_text(bank_rig_name_addr + i, n) for i, n in enumerate(slot_names)],
+                    ["bank_preview"] * BANK_SLOTS, BANK_SLOTS,
+                    bank=[{"slot": i, "rig_name": n} for i, n in enumerate(slot_names)]),
+        _steps_case("rule 8: the stream reaches the bank preview too",
+                    [string_tag(WK["page_bank_preview"], WK["bank_amp_name_base"], "Twin")],
+                    ["bank_preview"], 1,
+                    bank=[{"slot": 0, "amp_name": "Twin"}]),
+        # --- Rule 2: no row, so the stream's generic fallback or nothing.
+        _steps_case("rule 2: an untracked control address is silent",
+                    [step_cbor(secret, 1)],
+                    [], 0),
+        _steps_case("rule 2: an untracked stream numeric still raises a fast param_changed",
+                    [single(WK["page_rig_settings"], 0x10, 5)],
+                    ["param_changed"], 0),
+        _steps_case("rule 2: an untracked stream text is silent",
+                    [string_tag(WK["page_strings"], 0x05, "x")],
+                    [], 0,
+                    rig_name=None),
+        _steps_case("rule 2: an untracked extended address on the stream is silent",
+                    [step_midi3(ext_param(0x02, 0x00, 102405, 31))],
+                    [], 0,
+                    current_bank=None),
+        # --- Rule 3: a stream-only row ignores the control channel's copy.
+        _steps_case("rule 3: the control copy of the meter block is dropped",
+                    [step_cbor(meter_base_addr + 3, 1234)],
+                    [], 0,
+                    status_raw=fresh_status),
+        _steps_case("rule 3: the control copy of the beat pulse is dropped",
+                    [step_cbor(beat_pulse_addr, 16383)],
+                    [], 0,
+                    status_raw=fresh_status),
+        _steps_case("rule 3: the control copy of the tuner note is dropped",
+                    [step_cbor(tuner_note_addr, 9)],
+                    [], 0),
+        _steps_case("rule 3: the control copy of the morph button is dropped",
+                    [step_cbor(morph_button_addr, 1)],
+                    [], 0,
+                    morph=None),
+        # --- Rule 4: page 0 is dual-use, so a row accepts one face only. A
+        #     mismatch is "no route", which on the stream means the generic
+        #     fallback and on the control channel means silence.
+        _steps_case("rule 4: text at a numeric row is untracked",
+                    [step_cbor(rig_volume_addr, 100), step_cbor_text(rig_volume_addr, "x")],
+                    ["param_changed"], 1,
+                    rig_volume=100),
+        _steps_case("rule 4: a control numeric at a text row is untracked",
+                    [step_cbor_text(rig_name_addr, "AC30"), step_cbor(rig_name_addr, 5)],
+                    ["string_tag", "rig_changed"], 1,
+                    rig_name="AC30"),
+        _steps_case("rule 4: a stream numeric at a text row falls through to param_changed",
+                    [single(WK["page_strings"], WK["string_rig_name"], 5)],
+                    ["param_changed"], 0,
+                    rig_name=None),
+        # --- Rule 5: the row's kind decides the range and the decode.
+        _steps_case("rule 5: a u14 row drops a value past 16383",
+                    [step_cbor(rig_volume_addr, 100), step_cbor(rig_volume_addr, 70000)],
+                    ["param_changed"], 1,
+                    rig_volume=100),
+        _steps_case("rule 5: a u16 row drops a value past 65535",
+                    [step_cbor(CURRENT_BANK_ADDRESS, 70000)],
+                    [], 0,
+                    current_bank=None, current_rig_index=None),
+        _steps_case("rule 5: a u16 row keeps a value past 14 bits",
+                    [step_cbor(CURRENT_BANK_ADDRESS, 40000)],
+                    ["current_position"], 1,
+                    current_bank=40000),
+        _steps_case("rule 5: the stream's extended value is range-checked by the same row",
+                    [bank(70000)],
+                    [], 0,
+                    current_bank=None),
+        _steps_case("rule 5: a u7 row keeps the low seven bits",
+                    [single(WK["page_tuner_note"], WK["tuner_note_number"], 0x80 | 9)],
+                    ["tuner_note"], 1,
+                    tuner_note=9),
+        # --- Rule 6: between begin_dump and end_dump a live value beats the
+        #     dump's copy of the same address, whichever order they arrive in.
+        _steps_case("rule 6: a live position during the dump beats the dump's stale copy",
+                    [STEP_DUMP_BEGIN, bank(3), step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END],
+                    ["current_position"], 1,
+                    current_bank=3),
+        _steps_case("rule 6: after the dump ends a live position lands over the dump's",
+                    [STEP_DUMP_BEGIN, step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END, bank(3)],
+                    ["current_position", "current_position"], 2,
+                    current_bank=3),
+        _steps_case("rule 6: a live string during the dump beats the dump's stale text",
+                    [STEP_DUMP_BEGIN,
+                     string_tag(WK["page_strings"], WK["string_rig_name"], "AC30"),
+                     step_cbor_dump_text(rig_name_addr, "Old"),
+                     STEP_DUMP_END],
+                    ["string_tag", "rig_changed"], 1,
+                    rig_name="AC30"),
+        # The touch is recorded before the dedupe: a live repeat of the stored
+        # value changes nothing, but still says "this address is current".
+        _steps_case("rule 6: a live update marks its address even when deduped",
+                    [bank(3), STEP_DUMP_BEGIN, bank(3), step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END],
+                    ["current_position"], 1,
+                    current_bank=3),
+        # Rules 3 and 5 come first, so a live value they drop never reaches
+        # the touch: the dump's copy is still the best information.
+        _steps_case("rule 6: a live update dropped by range does not mark its address",
+                    [STEP_DUMP_BEGIN, step_cbor(CURRENT_BANK_ADDRESS, 70000),
+                     step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END],
+                    ["current_position"], 1,
+                    current_bank=2),
+        _steps_case("rule 6: the dump guard is per address",
+                    [STEP_DUMP_BEGIN, bank(3), step_cbor_dump(CURRENT_RIG_SLOT_ADDRESS, 1), STEP_DUMP_END],
+                    ["current_position", "current_position"], 2,
+                    current_bank=3, current_rig_slot=1, current_rig_index=16),
+        _steps_case("rule 6: end_dump clears the touched set",
+                    [STEP_DUMP_BEGIN, bank(3), STEP_DUMP_END,
+                     STEP_DUMP_BEGIN, step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END],
+                    ["current_position", "current_position"], 2,
+                    current_bank=2),
+        _steps_case("rule 6: a dump item outside a dump folds like a live one",
+                    [step_cbor_dump(rig_volume_addr, 100)],
+                    ["param_changed"], 1,
+                    rig_volume=100),
+        # --- Rule 1: a $02 block is one unit at the meter base and a run of
+        #     singles anywhere else.
+        _steps_case("rule 1: a stream block at the meter base is one status frame",
+                    [meter_block(raw)],
+                    ["status"], 0,
+                    status_raw=raw),
+        _steps_case("rule 1: a stream block off a Multi base folds element by element",
+                    [step_midi3(sysex(0x00, 0x00, FN["multi_param"], WK["page_rig_settings"],
+                                      WK["tempo_number"],
+                                      [*u14_split(84 * bpm_scale), *u14_split(9000)]))],
+                    ["tempo_bpm", "param_changed"], 1,
+                    tempo_bpm=84, rig_volume=9000),
+        # --- Outside the table: the two decodes `apply` keeps for itself.
+        _steps_case("outside the table: a rendered-string reply is a fast event with no state",
+                    [step_midi3(sysex(0x02, DEVICE_OMNI, FN["rendered_string_reply"], 0x3C, 53,
+                                      [*u14_split(8192), *b"<0.0>", 0]))],
+                    ["rendered_string"], 0),
+        _steps_case("outside the table: a non-Kemper message is ignored",
+                    [step_midi3(control_change(0, 50, 1))],
+                    [], 0),
+    ]
 
 
 def _cbor_snapshot_cases():

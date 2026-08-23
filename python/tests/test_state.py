@@ -5,26 +5,33 @@ from __future__ import annotations
 import pytest
 
 from libkp import _generated as gen
-from libkp import nrpn
+from libkp import _routes, nrpn
 from libkp.nrpn import DEVICE_OMNI, PAGE_STRINGS, set_single, sysex, u14, u14_split
 from libkp.state import (
     ApplyOutcome,
+    BankPreview,
     BeatPulse,
+    Block,
+    Channel,
     Connection,
     CurrentPosition,
     DeviceState,
     EffectChanged,
     MorphButton,
     MorphChanged,
+    Num,
     ParamChanged,
+    Phase,
     RealtimeStatus,
     RenderedString,
     RigChanged,
     Status,
     StringTag,
     TempoBpm,
+    Text,
     TunerDeviance,
     TunerNote,
+    Update,
 )
 
 FN_STRING = nrpn.FUNCTION_STRING_PARAM
@@ -124,10 +131,10 @@ def test_rig_name_string_updates_and_signals_a_rig_change():
     assert state.amp.name == "JCM"
     assert state.cabinet.name == "412"
 
-    # An untracked string tag leaves the snapshot unchanged.
+    # An untracked string tag has no row, so it is silent: nothing stored, no
+    # event, no snapshot.
     out = state.apply(sysex(0x00, 0x7F, FN_STRING, PAGE_STRINGS, 99, b"x"))
-    assert not out.slow_changed
-    assert out.events == [StringTag(99)]
+    assert out == ApplyOutcome.empty()
 
 
 def test_ext_string_recovers_amp_name():
@@ -383,3 +390,166 @@ def test_apply_cbor_routes_the_same_as_the_stream():
     # A value too wide for the field is dropped, not truncated.
     assert state.apply_cbor(gen.MORPH_ADDRESS, 70_000) == ApplyOutcome.empty()
     assert state.morph == 8192
+
+
+# ---------------------------------------------------------------------------
+# The fold: one funnel for both wires
+# ---------------------------------------------------------------------------
+
+#: A value of each kind that is in range and distinct from the fresh tree's.
+_SAMPLE_BY_KIND = {
+    gen.Kind.U14: 1234,
+    gen.Kind.U16: 40000,
+    gen.Kind.U7: 9,
+    gen.Kind.BOOL: True,
+    gen.Kind.TEXT: "sample",
+    gen.Kind.BPM: 120,
+    gen.Kind.MULTI: RealtimeStatus(raw=tuple(range(gen.METER_COUNT))),
+}
+#: Rows the tree deliberately has no field for: they are events and nothing more.
+_MOMENTARY_FIELDS = {gen.Field.MORPH_BUTTON, gen.Field.BEAT_PULSE}
+
+
+@pytest.mark.parametrize("field", list(gen.Field), ids=lambda f: f.value)
+def test_every_field_is_settable(field):
+    """Rust and Swift get exhaustiveness over ``Field`` from the compiler; here a
+    row the switch forgot would only surface when that address arrived. So walk
+    every field through the switch: a write must land where a read finds it, or,
+    for a momentary, leave the tree untouched."""
+    routes = [r for r in gen.STATE_ROUTES if r.field is field]
+    assert routes, f"{field} has no row in STATE_ROUTES"
+    for route in routes:
+        state = DeviceState()
+        value = _SAMPLE_BY_KIND[route.kind]
+        _routes.write(state, route, value)
+        if field in _MOMENTARY_FIELDS:
+            assert _routes.read(state, route) is None
+            assert state == DeviceState()
+        else:
+            assert _routes.read(state, route) == value
+            assert state != DeviceState()
+
+
+def test_every_route_address_is_found_by_lookup():
+    for route in gen.STATE_ROUTES:
+        assert _routes.lookup(route.address) is route
+    assert _routes.lookup(102_405) is None
+
+
+def test_apply_cbor_text_lands_the_same_as_a_stream_tag():
+    """A string on the control channel is the same tag as a ``$03`` on the
+    stream, and dedupes against it: the second wire's copy is a no-op."""
+    state = DeviceState()
+    out = state.apply_cbor_text(nrpn.STRING_RIG_NAME, "AC30")
+    assert state.rig.name == "AC30"
+    assert out.slow_changed
+    assert out.events == [StringTag(1), RigChanged()]
+    assert state.apply(sysex(0x00, 0x7F, FN_STRING, PAGE_STRINGS, 1, b"AC30\x00")) == (
+        ApplyOutcome.empty()
+    )
+    # The bank preview is reachable the same way, by its flat address.
+    out = state.apply_cbor_text(gen.PAGE_BANK_PREVIEW * 128 + gen.BANK_AMP_NAME_BASE + 2, "Twin")
+    assert out.events == [BankPreview(number=gen.BANK_AMP_NAME_BASE + 2)]
+    assert state.bank.slots[2].amp_name == "Twin"
+
+
+def test_control_channel_copies_of_stream_rows_are_dropped():
+    """The control channel carries its own meter, beat and tuner feeds at the
+    stream's addresses; those rows are the stream's, so the copies are silent."""
+    state = DeviceState()
+    fresh = state.snapshot()
+    for address in (
+        gen.PAGE_REALTIME * 128 + gen.METER_BLOCK_NUMBER + 3,
+        gen.PAGE_REALTIME * 128 + gen.BEAT_PULSE_NUMBER,
+        gen.PAGE_REALTIME * 128 + gen.TUNER_DEVIANCE_NUMBER,
+        gen.PAGE_TUNER_NOTE * 128 + gen.TUNER_NOTE_NUMBER,
+        gen.PAGE_MORPH * 128 + gen.MORPH_BUTTON_NUMBER,
+    ):
+        assert state.apply_cbor(address, 1) == ApplyOutcome.empty()
+    assert state == fresh
+    # An untracked control address is silent too -- no generic event on this wire.
+    assert state.apply_cbor(0x09 * 128 + 3, 5000) == ApplyOutcome.empty()
+    # A negative value is not a parameter value and never reaches the table.
+    assert state.apply_cbor(gen.MORPH_ADDRESS, -1) == ApplyOutcome.empty()
+
+
+def test_tracked_rows_dedupe_on_the_decoded_value():
+    state = DeviceState()
+    assert state.apply(set_single(0x00, 0x00, gen.AMP_PAGE, gen.AMP_ON_NUMBER, 1)).slow_changed
+    # A different wire value that decodes to the same bool is not a change.
+    assert state.apply_cbor(gen.AMP_PAGE * 128 + gen.AMP_ON_NUMBER, 5) == ApplyOutcome.empty()
+    # The meter frame is the one FAST row with state, and it never dedupes.
+    frame = sysex(
+        0x00,
+        0x00,
+        FN_MULTI,
+        gen.PAGE_REALTIME,
+        gen.METER_BLOCK_NUMBER,
+        meter_block([7] * gen.METER_COUNT),
+    )
+    assert len(state.apply(frame).events) == 1
+    assert len(state.apply(frame).events) == 1
+
+
+def test_dump_window_lets_live_pushes_outrank_dump_items():
+    """The state dump is a copy taken when it was asked for. A value pushed
+    while it streams is newer, so the dump's item for that address must not
+    overwrite it -- and only that address: the rest of the dump still lands."""
+    state = DeviceState()
+    bank = gen.CURRENT_BANK_ADDRESS
+    slot = gen.CURRENT_RIG_SLOT_ADDRESS
+
+    def dump(address: int, value: int) -> ApplyOutcome:
+        return state.apply_update(Update(Channel.CONTROL, Phase.DUMP, address, Num(value)))
+
+    state.begin_dump()
+    assert state.apply_cbor(bank, 3).events == [CurrentPosition(bank=3, slot=None)]
+    assert dump(bank, 2) == ApplyOutcome.empty()
+    assert dump(slot, 1).events == [CurrentPosition(bank=3, slot=1)]
+    state.end_dump()
+    assert (state.current_bank, state.current_rig_slot) == (3, 1)
+    # Outside a window a dump item folds like a live value.
+    assert dump(bank, 2).events == [CurrentPosition(bank=2, slot=1)]
+    # The bookkeeping is not part of the snapshot: two trees holding the same
+    # values compare equal whatever their dump windows are doing.
+    other = state.snapshot()
+    state.begin_dump()
+    state.apply_cbor(slot, 1)  # deduped, but marks the address
+    assert state == other
+
+
+def test_a_block_off_the_meter_base_folds_element_by_element():
+    state = DeviceState()
+    out = state.apply_update(
+        Update(Channel.STREAM, Phase.LIVE, gen.PAGE_RIG_SETTINGS * 128, Block((7680, 9000)))
+    )
+    assert out.slow_changed
+    assert out.events == [TempoBpm(120), ParamChanged(gen.PAGE_RIG_SETTINGS, 1, 9000)]
+    assert (state.rig.tempo_bpm, state.rig.volume) == (120, 9000)
+    # A block at the meter base but not the meter's length is not the frame: its
+    # elements are numerics at ``multi`` rows, which take no numeric, so each
+    # falls through to the stream's generic report and ``status`` is untouched.
+    base = gen.PAGE_REALTIME * 128 + gen.METER_BLOCK_NUMBER
+    out = state.apply_update(Update(Channel.STREAM, Phase.LIVE, base, Block((1, 2))))
+    assert not out.slow_changed
+    assert out.events == [
+        ParamChanged(gen.PAGE_REALTIME, gen.METER_BLOCK_NUMBER, 1),
+        ParamChanged(gen.PAGE_REALTIME, gen.METER_BLOCK_NUMBER + 1, 2),
+    ]
+    assert state.status == RealtimeStatus()
+
+
+def test_a_string_at_a_numeric_row_is_untracked():
+    """Page 0 is dual-use; a row's kind says which face it stores."""
+    state = DeviceState()
+    state.apply_cbor(gen.PAGE_RIG_SETTINGS * 128 + gen.RIG_VOLUME_NUMBER, 100)
+    numeric_row = gen.PAGE_RIG_SETTINGS * 128 + gen.RIG_VOLUME_NUMBER
+    assert state.apply_cbor_text(numeric_row, "x") == ApplyOutcome.empty()
+    assert state.rig.volume == 100
+    assert state.apply_update(Update(Channel.STREAM, Phase.LIVE, 1, Text("x"))).events == [
+        StringTag(1),
+        RigChanged(),
+    ]
+    out = state.apply_update(Update(Channel.STREAM, Phase.LIVE, 1, Num(5)))
+    assert out == ApplyOutcome.fast(ParamChanged(0, 1, 5))
+    assert state.rig.name == "x"

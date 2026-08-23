@@ -6,11 +6,12 @@
 //!
 //! - [`DeviceState`] (in [`crate::state`]) is the **pure, network-free core**: a
 //!   plain-data tree — rig, amp, cabinet, the eight effect slots, tuner, output,
-//!   morph, and the latest [`RealtimeStatus`] meter frame. It decodes one
-//!   already-unframed MIDI message at a time via [`DeviceState::apply`],
-//!   returning an [`ApplyOutcome`] (the granular [`DeviceEvent`]s produced, plus
-//!   whether any *slow* field changed). It does no IO, so unit tests drive it
-//!   with synthesized messages.
+//!   morph, and the latest [`RealtimeStatus`] meter frame. It takes one
+//!   already-unframed MIDI message at a time via [`DeviceState::apply`], or one
+//!   CBOR item via [`DeviceState::apply_cbor`], and both hand the value to the
+//!   same routing fold ([`crate::routes`]), returning an [`ApplyOutcome`] (the
+//!   granular [`DeviceEvent`]s produced, plus whether any *slow* field
+//!   changed). It does no IO, so unit tests drive it with synthesized messages.
 //!
 //! - [`DeviceModel`] is the **async handle** (cheap to `Clone`; an `Arc` inside).
 //!   [`DeviceModel::connect`] opens a [`Session`], spawns an ingest task that owns
@@ -79,22 +80,13 @@ use crate::error::SessionError;
 use crate::generated;
 use crate::midi3::{self, Unframer};
 use crate::nrpn::{
-    self, FUNCTION_EXT_PARAM, FUNCTION_EXT_STRING_PARAM, FUNCTION_MULTI_PARAM,
-    FUNCTION_RENDERED_STRING_REPLY, FUNCTION_SINGLE_PARAM, FUNCTION_STRING_PARAM, NrpnHeader,
-    PAGE_STRINGS, multi_values, parse_extended_param, request_extended_param,
-    request_extended_string, request_rendered_string, request_single, request_string, set_single,
-    u14,
+    self, PAGE_STRINGS, request_extended_param, request_extended_string, request_rendered_string,
+    request_single, request_string, set_single,
 };
 use crate::params::{self, EFFECT_PARAM_MIX, EFFECT_PARAM_STATE, EFFECT_PARAM_TYPE};
 use crate::session::{PROTOCOL_MIDI3_STREAM, Session};
-use crate::state::{Connection, DeviceState, Effect};
+use crate::state::{Connection, DeviceState};
 
-/// Volatile realtime page (meter block, beat pulse, tuner deviance).
-const PAGE_REALTIME: u8 = generated::PAGE_REALTIME;
-/// First NRPN number of the 11-value meter block on [`PAGE_REALTIME`].
-const METER_NUMBER: u8 = generated::METER_BLOCK_NUMBER;
-/// Beat-pulse number on [`PAGE_REALTIME`] (`$01`, toggles 0/16383).
-const BEAT_PULSE_NUMBER: u8 = generated::BEAT_PULSE_NUMBER;
 /// Rig Settings page (holds Tempo bpm at number 0, Rig Volume at number 1).
 const PAGE_RIG_SETTINGS: u8 = generated::PAGE_RIG_SETTINGS;
 /// Tempo bpm number on [`PAGE_RIG_SETTINGS`]; the value is `bpm * 64`.
@@ -105,36 +97,16 @@ const RIG_VOLUME_NUMBER: u8 = generated::RIG_VOLUME_NUMBER;
 const TEMPO_BPM_SCALE: u16 = generated::TEMPO_BPM_SCALE;
 /// Amplifier page (holds On/Off at number 2, Gain at number 4).
 const AMP_PAGE: u8 = generated::AMP_PAGE;
-/// On/Off number on [`AMP_PAGE`] (`$01`, 0 = off, 1 = on).
-const AMP_ON_NUMBER: u8 = generated::AMP_ON_NUMBER;
 /// Gain number on [`AMP_PAGE`] (14-bit).
 const GAIN_NUMBER: u8 = generated::GAIN_NUMBER;
 /// System/Global page (holds Main/Monitor output volumes).
 const SYSTEM_PAGE: u8 = generated::SYSTEM_PAGE;
 /// Main Output Volume number on [`SYSTEM_PAGE`] (14-bit).
 const MAIN_VOL_NUMBER: u8 = generated::MAIN_VOLUME_NUMBER;
-/// Headphone Output Volume number on [`SYSTEM_PAGE`] (14-bit); one half of the
-/// physical Master Volume knob.
-const HEADPHONE_VOL_NUMBER: u8 = generated::HEADPHONE_VOLUME_NUMBER;
-/// Monitor Output Volume number on [`SYSTEM_PAGE`] (14-bit); the other half.
+/// Monitor Output Volume number on [`SYSTEM_PAGE`] (14-bit).
 const MONITOR_VOL_NUMBER: u8 = generated::MONITOR_VOLUME_NUMBER;
-/// Bank Preview page (`0x96`): the loaded bank's five-slot name preview.
-const PAGE_BANK_PREVIEW: u8 = generated::PAGE_BANK_PREVIEW;
 /// The maximum 14-bit NRPN value (0–16383).
 const NRPN_MAX: u16 = generated::FULL_SCALE;
-/// Morph page: page 0 is dual-use, morph lives at [`MORPH_NUMBER`] and
-/// [`MORPH_BUTTON_NUMBER`].
-const PAGE_MORPH: u8 = generated::PAGE_MORPH;
-/// Morph position on [`PAGE_MORPH`] (`$01`, 0 = base .. 16383 = fully morphed).
-const MORPH_NUMBER: u8 = generated::MORPH_NUMBER;
-/// Morph button on [`PAGE_MORPH`] (`$01`, 1 on press, 0 on release).
-const MORPH_BUTTON_NUMBER: u8 = generated::MORPH_BUTTON_NUMBER;
-/// Tuner-deviance number on [`PAGE_REALTIME`] (`$01`; 8192 = in tune).
-const TUNER_DEVIANCE_NUMBER: u8 = generated::TUNER_DEVIANCE_NUMBER;
-/// Tuner-note page (holds the detected note at [`TUNER_NOTE_NUMBER`]).
-const PAGE_TUNER_NOTE: u8 = generated::PAGE_TUNER_NOTE;
-/// Tuner-note number on [`PAGE_TUNER_NOTE`] (`$01`, 0x54 = 84).
-const TUNER_NOTE_NUMBER: u8 = generated::TUNER_NOTE_NUMBER;
 /// How many 14-bit values the realtime status block carries.
 const METER_COUNT: usize = generated::METER_COUNT;
 
@@ -161,16 +133,6 @@ pub struct RealtimeStatus {
 }
 
 impl RealtimeStatus {
-    /// Decode an 11×14-bit value block (MSB/LSB pairs) into a status frame.
-    /// Missing trailing values default to 0; extra bytes are ignored.
-    fn from_values(vals: &[u8]) -> Self {
-        let mut raw = [0u16; METER_COUNT];
-        for (i, pair) in vals.chunks_exact(2).take(raw.len()).enumerate() {
-            raw[i] = u14(pair[0], pair[1]);
-        }
-        RealtimeStatus { raw }
-    }
-
     /// Tuner strobe phase (v3): a wrapping 0–16383 phase whose rotation rate
     /// tracks pitch deviance (stationary = in tune).
     pub fn strobe_phase(&self) -> u16 {
@@ -277,13 +239,14 @@ pub enum DeviceEvent {
         /// The rendered display text.
         text: String,
     },
-    /// The device's current position was learned from the CBOR state-dump
-    /// snapshot. Read [`DeviceState::current_bank`] and
-    /// [`DeviceState::current_rig_slot`] for the new values (both 0-based).
+    /// The device's current position changed — a `$06` push or reply on the
+    /// stream, a CBOR push, or a state-dump item, all landing in the same two
+    /// rows. Carries both halves as now stored, so a listener sees the whole
+    /// position whichever half moved; a half still unknown is `None`.
     CurrentPosition {
-        /// Current bank, 0-based, if the dump carried it.
+        /// Current bank, 0-based, once known.
         bank: Option<u16>,
-        /// Current rig slot within the bank, 0-based, if the dump carried it.
+        /// Current rig slot within the bank, 0-based, once known.
         slot: Option<u16>,
     },
     /// The model connected to a device.
@@ -292,8 +255,10 @@ pub enum DeviceEvent {
     Disconnected,
 }
 
-/// The result of applying one message to a [`DeviceState`]: the granular events
-/// it produced, plus whether any **slow** (snapshot) field changed.
+/// The result of applying one update to a [`DeviceState`] — one MIDI message,
+/// one CBOR item, or one [`Update`](crate::state::Update) through the funnel:
+/// the granular events it produced, plus whether any **slow** (snapshot) field
+/// changed.
 ///
 /// The store uses `slow_changed` to decide whether to emit a fresh snapshot:
 /// `true` when a rig / amp / cab / effect / output / tempo / morph / tuner-note /
@@ -303,7 +268,7 @@ pub enum DeviceEvent {
 /// [`DeviceEvent`]s are still emitted regardless, for [`DeviceModel::events`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyOutcome {
-    /// The typed deltas this message produced (in order).
+    /// The typed deltas this update produced (in order).
     pub events: Vec<DeviceEvent>,
     /// Whether a slow (snapshot-visible) field changed.
     pub slow_changed: bool,
@@ -311,12 +276,12 @@ pub struct ApplyOutcome {
 
 impl ApplyOutcome {
     /// An empty outcome: nothing happened, no slow change.
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         ApplyOutcome::default()
     }
 
     /// One event that changed no slow field (FAST lane or untracked generic).
-    fn fast(event: DeviceEvent) -> Self {
+    pub(crate) fn fast(event: DeviceEvent) -> Self {
         ApplyOutcome {
             events: vec![event],
             slow_changed: false,
@@ -324,349 +289,11 @@ impl ApplyOutcome {
     }
 
     /// Events that changed a slow (snapshot-visible) field.
-    fn slow(events: Vec<DeviceEvent>) -> Self {
+    pub(crate) fn slow(events: Vec<DeviceEvent>) -> Self {
         ApplyOutcome {
             events,
             slow_changed: true,
         }
-    }
-}
-
-/// The pure, network-free decode logic for [`DeviceState`] — the testable core.
-///
-/// Feed already-unframed MIDI messages to [`DeviceState::apply`]; the data shape
-/// itself lives in [`crate::state`].
-impl DeviceState {
-    /// Parse and apply ONE decoded MIDI message, returning the [`ApplyOutcome`]
-    /// (granular events + slow-changed flag). This is pure: no IO, no clock, no
-    /// allocation beyond the event vector. Non-Kemper or ignored messages return
-    /// an empty outcome.
-    ///
-    /// Routing:
-    /// - `$03` string on page 0 → rig/amp/cab name tags + `StringTag` (plus
-    ///   `RigChanged` for tag 1, the Rig Name). SLOW.
-    /// - `$01` single-param → beat pulse / effect / amp / rig / output / morph /
-    ///   tuner / generic `ParamChanged`; FAST for beat pulse and tuner deviance,
-    ///   SLOW for the tracked fields.
-    /// - `$02` multi-param → meter block (→ `Status`, FAST) or the rig-load dump
-    ///   (each consecutive address routed like a single-param).
-    /// - `$07` ext-string on the string page → the amp/cab/author tags the
-    ///   rig-load dump sends as extended strings (see [`Self::apply_ext_string`]).
-    /// - `$06` extended param → the device's current bank / rig slot (see
-    ///   [`Self::apply_ext_param`]).
-    /// - `$3C` rendered-string reply → a transient `RenderedString` event with a
-    ///   value's exact display text (see [`Self::apply_rendered_string`]). FAST.
-    /// - Anything else → ignored.
-    pub fn apply(&mut self, msg: &[u8]) -> ApplyOutcome {
-        // The extended ($06) and extended-string ($07) addresses are 5×7-bit
-        // encoded and do not fit the fixed `NrpnHeader` layout, so route both
-        // off the raw message first.
-        if let Some((h, _)) = NrpnHeader::parse(msg) {
-            if h.function == FUNCTION_EXT_PARAM {
-                return self.apply_ext_param(msg);
-            }
-            if h.function == FUNCTION_EXT_STRING_PARAM {
-                return self.apply_ext_string(msg);
-            }
-        }
-        let Some((h, vals)) = NrpnHeader::parse(msg) else {
-            return ApplyOutcome::empty();
-        };
-        match h.function {
-            FUNCTION_STRING_PARAM if h.page == PAGE_STRINGS => self.apply_string(h.number, vals),
-            FUNCTION_SINGLE_PARAM => {
-                if vals.len() < 2 {
-                    return ApplyOutcome::empty();
-                }
-                self.route_param(h.page, h.number, u14(vals[0], vals[1]))
-            }
-            FUNCTION_MULTI_PARAM => self.apply_multi(h.page, h.number, vals),
-            FUNCTION_RENDERED_STRING_REPLY => self.apply_rendered_string(msg),
-            _ => ApplyOutcome::empty(),
-        }
-    }
-
-    /// Fold a `$06` Extended Parameter into the tree.
-    ///
-    /// This is the device's position report. It carries a 5×7-bit address and a
-    /// 5×7-bit value; the two addresses that matter here are the current bank
-    /// and the current rig slot, both 0-based. The device pushes whichever of
-    /// the two changed on every rig change — including changes made at the front
-    /// panel — and answers [`DeviceModel::refresh_position`] with both.
-    ///
-    /// Any other extended address is ignored, and a value too large for the
-    /// 16-bit field is dropped rather than truncated into a bogus position.
-    fn apply_ext_param(&mut self, msg: &[u8]) -> ApplyOutcome {
-        let Some((address, value)) = parse_extended_param(msg) else {
-            return ApplyOutcome::empty();
-        };
-        let Ok(value) = u16::try_from(value) else {
-            return ApplyOutcome::empty();
-        };
-        self.apply_address(address, value)
-    }
-
-    /// Fold one **CBOR** address/value into the tree.
-    ///
-    /// The CBOR channel and the MIDI3 stream are two wire formats over one event
-    /// universe, so a value arriving either way lands in the same field and
-    /// raises the same event. This is the entry point for a
-    /// [`CborSession`](crate::cbor::CborSession)'s live pushes and for a state
-    /// dump's items.
-    ///
-    /// A value outside the 16-bit range is dropped rather than truncated into a
-    /// bogus reading.
-    pub fn apply_cbor(&mut self, address: u32, value: i64) -> ApplyOutcome {
-        let Ok(value) = u16::try_from(value) else {
-            return ApplyOutcome::empty();
-        };
-        self.apply_address(address, value)
-    }
-
-    /// Route one flat address to the field that tracks it, whichever transport
-    /// carried it. Unknown addresses change nothing.
-    fn apply_address(&mut self, address: u32, value: u16) -> ApplyOutcome {
-        if address == generated::CURRENT_BANK_ADDRESS {
-            if self.current_bank == Some(value) {
-                return ApplyOutcome::empty();
-            }
-            self.current_bank = Some(value);
-            ApplyOutcome::slow(vec![DeviceEvent::CurrentPosition {
-                bank: Some(value),
-                slot: self.current_rig_slot,
-            }])
-        } else if address == generated::CURRENT_RIG_SLOT_ADDRESS {
-            if self.current_rig_slot == Some(value) {
-                return ApplyOutcome::empty();
-            }
-            self.current_rig_slot = Some(value);
-            ApplyOutcome::slow(vec![DeviceEvent::CurrentPosition {
-                bank: self.current_bank,
-                slot: Some(value),
-            }])
-        } else if address == generated::MORPH_ADDRESS {
-            if self.morph == Some(value) {
-                return ApplyOutcome::empty();
-            }
-            self.morph = Some(value);
-            ApplyOutcome::slow(vec![DeviceEvent::MorphChanged(value)])
-        } else {
-            ApplyOutcome::empty()
-        }
-    }
-
-    /// Route a `$03` page-0 string tag into the tree.
-    fn apply_string(&mut self, number: u8, vals: &[u8]) -> ApplyOutcome {
-        let text: String = vals
-            .iter()
-            .take_while(|&&b| b != 0)
-            .map(|&b| b as char)
-            .collect();
-        let tracked = self.apply_string_tag(number, text);
-        let mut events = vec![DeviceEvent::StringTag { number }];
-        if number == nrpn::STRING_RIG_NAME {
-            events.push(DeviceEvent::RigChanged);
-        }
-        ApplyOutcome {
-            events,
-            slow_changed: tracked,
-        }
-    }
-
-    /// Store a decoded page-0 string tag into the matching field by its tag
-    /// `number`. Returns `true` if the tag maps to a tracked field (a slow
-    /// change), `false` for tags this tree does not model.
-    fn apply_string_tag(&mut self, number: u8, text: String) -> bool {
-        match number {
-            1 => self.rig.name = Some(text),
-            2 => self.rig.author = Some(text),
-            3 => self.rig.date = Some(text),
-            4 => self.rig.comment = Some(text),
-            10 => self.amp.name = Some(text),
-            32 => self.cabinet.name = Some(text),
-            _ => return false,
-        }
-        true
-    }
-
-    /// Route a `$07` Extended String Parameter message — how the rig-load dump
-    /// delivers the amp/cab/author metadata that plain `$03` strings omit.
-    ///
-    /// The extended address decodes as `page * 128 + number`; a string on
-    /// [`PAGE_STRINGS`] carries the same tag numbers as `$03`, so it routes via
-    /// [`Self::apply_string_tag`]. Other pages are ignored. If
-    /// [`nrpn::parse_extended_string`] returns `None`, the message is ignored.
-    fn apply_ext_string(&mut self, msg: &[u8]) -> ApplyOutcome {
-        let Some((addr, text)) = nrpn::parse_extended_string(msg) else {
-            return ApplyOutcome::empty();
-        };
-        let page = (addr / 128) as u8;
-        let number = (addr % 128) as u8;
-        if page == PAGE_BANK_PREVIEW {
-            return self.apply_bank_preview(number, text);
-        }
-        if page != PAGE_STRINGS {
-            return ApplyOutcome::empty();
-        }
-        let tracked = self.apply_string_tag(number, text);
-        let mut events = vec![DeviceEvent::StringTag { number }];
-        if number == nrpn::STRING_RIG_NAME {
-            events.push(DeviceEvent::RigChanged);
-        }
-        ApplyOutcome {
-            events,
-            slow_changed: tracked,
-        }
-    }
-
-    /// Store one bank-preview name (page `0x96`) into [`DeviceState::bank`]. The
-    /// number selects the field (rig / amp / cabinet) and slot; an out-of-range
-    /// number is ignored. A stored value is a SLOW change.
-    fn apply_bank_preview(&mut self, number: u8, text: String) -> ApplyOutcome {
-        let Some((field, slot)) = params::bank_preview_slot_field(number) else {
-            return ApplyOutcome::empty();
-        };
-        let target = &mut self.bank.slots[slot];
-        match field {
-            params::BankPreviewField::RigName => target.rig_name = Some(text),
-            params::BankPreviewField::AmpName => target.amp_name = Some(text),
-            params::BankPreviewField::CabinetName => target.cabinet_name = Some(text),
-        }
-        ApplyOutcome::slow(vec![DeviceEvent::BankPreview { number }])
-    }
-
-    /// Route one decoded numeric address/value pair into the tree. Shared by
-    /// `$01` single-param and each address of a `$02` rig-load dump.
-    fn route_param(&mut self, page: u8, number: u8, value: u16) -> ApplyOutcome {
-        // Beat pulse: volatile, not stored (FAST lane).
-        if page == PAGE_REALTIME && number == BEAT_PULSE_NUMBER {
-            return ApplyOutcome::fast(DeviceEvent::BeatPulse { on: value != 0 });
-        }
-        // Tuner pitch deviance: volatile (FAST lane).
-        if page == PAGE_REALTIME && number == TUNER_DEVIANCE_NUMBER {
-            self.tuner.deviance = Some(value);
-            return ApplyOutcome::fast(DeviceEvent::TunerDeviance(value));
-        }
-        // Effect Type / On-Off / Mix: fold into the slot (SLOW).
-        if params::is_effect_page(page)
-            && matches!(
-                number,
-                EFFECT_PARAM_TYPE | EFFECT_PARAM_STATE | EFFECT_PARAM_MIX
-            )
-        {
-            if let Some(slot) = self.apply_effect(page, number, value) {
-                return ApplyOutcome::slow(vec![DeviceEvent::EffectChanged { slot }]);
-            }
-            return ApplyOutcome::empty();
-        }
-        // Amplifier On/Off and Gain (SLOW).
-        if page == AMP_PAGE && number == AMP_ON_NUMBER {
-            self.amp.on = Some(value != 0);
-            return ApplyOutcome::slow(vec![generic(page, number, value)]);
-        }
-        if page == AMP_PAGE && number == GAIN_NUMBER {
-            self.amp.gain = Some(value);
-            return ApplyOutcome::slow(vec![generic(page, number, value)]);
-        }
-        // Tempo bpm (value is bpm * 64) and Rig Volume (SLOW).
-        if page == PAGE_RIG_SETTINGS && number == TEMPO_NUMBER {
-            let bpm = value / TEMPO_BPM_SCALE;
-            self.rig.tempo_bpm = Some(bpm);
-            return ApplyOutcome::slow(vec![DeviceEvent::TempoBpm(bpm)]);
-        }
-        if page == PAGE_RIG_SETTINGS && number == RIG_VOLUME_NUMBER {
-            self.rig.volume = Some(value);
-            return ApplyOutcome::slow(vec![generic(page, number, value)]);
-        }
-        // System output volumes (SLOW).
-        if page == SYSTEM_PAGE && number == MAIN_VOL_NUMBER {
-            self.output.main_volume = Some(value);
-            return ApplyOutcome::slow(vec![generic(page, number, value)]);
-        }
-        if page == SYSTEM_PAGE && number == HEADPHONE_VOL_NUMBER {
-            self.output.headphone_volume = Some(value);
-            return ApplyOutcome::slow(vec![generic(page, number, value)]);
-        }
-        if page == SYSTEM_PAGE && number == MONITOR_VOL_NUMBER {
-            self.output.monitor_volume = Some(value);
-            return ApplyOutcome::slow(vec![generic(page, number, value)]);
-        }
-        // Morph (page 0 is dual-use with the string page). The position is SLOW;
-        // the button is momentary, so it is an event and nothing more.
-        if page == PAGE_MORPH && number == MORPH_BUTTON_NUMBER {
-            return ApplyOutcome::fast(DeviceEvent::MorphButton(value != 0));
-        }
-        if page == PAGE_MORPH && number == MORPH_NUMBER {
-            self.morph = Some(value);
-            return ApplyOutcome::slow(vec![DeviceEvent::MorphChanged(value)]);
-        }
-        // Tuner detected note (SLOW).
-        if page == PAGE_TUNER_NOTE && number == TUNER_NOTE_NUMBER {
-            let note = (value & 0x7F) as u8;
-            self.tuner.note = Some(note);
-            return ApplyOutcome::slow(vec![DeviceEvent::TunerNote(note)]);
-        }
-        // Untracked generic parameter: leaves the snapshot unchanged, so it is
-        // not a slow change — only the granular event stream sees it.
-        ApplyOutcome::fast(generic(page, number, value))
-    }
-
-    /// Store a decoded effect-slot parameter into the matching slot: number 0
-    /// sets the Type, number 3 sets On/Off (`value != 0`), number 4 sets Mix.
-    /// Returns the slot index if the page is an effect slot.
-    fn apply_effect(&mut self, page: u8, number: u8, value: u16) -> Option<usize> {
-        let idx = params::effect_slot_index(page)?;
-        let slot: &mut Effect = &mut self.effects[idx];
-        match number {
-            EFFECT_PARAM_TYPE => slot.kind = Some(value),
-            EFFECT_PARAM_STATE => slot.on = Some(value != 0),
-            EFFECT_PARAM_MIX => slot.mix = Some(value),
-            _ => {}
-        }
-        Some(idx)
-    }
-
-    /// Route a `$3C` Rendered String reply — the transient response to
-    /// [`DeviceModel::request_render`]. It carries a value's exact display text
-    /// but is *not* stored in the snapshot tree, so it emits only a granular
-    /// `RenderedString` event with `slow_changed = false`. A malformed reply
-    /// (rejected by [`nrpn::parse_rendered_string`]) is ignored.
-    fn apply_rendered_string(&mut self, msg: &[u8]) -> ApplyOutcome {
-        let Some((page, number, value, text)) = nrpn::parse_rendered_string(msg) else {
-            return ApplyOutcome::empty();
-        };
-        ApplyOutcome::fast(DeviceEvent::RenderedString {
-            page,
-            number,
-            value,
-            text,
-        })
-    }
-
-    /// Route a `$02` multi-param message: the meter block, or a rig-load dump.
-    fn apply_multi(&mut self, page: u8, number: u8, vals: &[u8]) -> ApplyOutcome {
-        if page == PAGE_REALTIME && number == METER_NUMBER {
-            self.status = RealtimeStatus::from_values(vals);
-            return ApplyOutcome::fast(DeviceEvent::Status(self.status));
-        }
-        // Rig-load dump: consecutive addresses starting at `number`, each routed
-        // exactly like a single-param.
-        let mut out = ApplyOutcome::empty();
-        for (num, value) in multi_values(number, vals) {
-            let step = self.route_param(page, num, value);
-            out.events.extend(step.events);
-            out.slow_changed |= step.slow_changed;
-        }
-        out
-    }
-}
-
-/// Build a generic [`DeviceEvent::ParamChanged`] for an untracked address.
-fn generic(page: u8, number: u8, value: u16) -> DeviceEvent {
-    DeviceEvent::ParamChanged {
-        page,
-        number,
-        value,
     }
 }
 
@@ -1197,529 +824,5 @@ fn read_state(state: &RwLock<DeviceState>) -> std::sync::RwLockReadGuard<'_, Dev
     match state.read() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::nrpn::{sysex, u14_split};
-    use crate::state::Connection;
-
-    /// Build an 11×14-bit value block with the given values (missing = 0).
-    fn meter_block(values: &[u16; METER_COUNT]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(22);
-        for &v in values {
-            let (m, l) = u14_split(v);
-            out.push(m);
-            out.push(l);
-        }
-        out
-    }
-
-    #[test]
-    fn rig_name_string_updates_and_signals_rig_change() {
-        let mut st = DeviceState::new();
-        // $03 string reply, page 0, number 1 (Rig Name).
-        let msg = sysex(
-            0x00,
-            0x7F,
-            FUNCTION_STRING_PARAM,
-            PAGE_STRINGS,
-            1,
-            b"AC30\x00",
-        );
-        let out = st.apply(&msg);
-        assert_eq!(st.rig.name.as_deref(), Some("AC30"));
-        assert!(out.slow_changed);
-        assert_eq!(
-            out.events,
-            vec![
-                DeviceEvent::StringTag { number: 1 },
-                DeviceEvent::RigChanged
-            ]
-        );
-
-        // A non-name tag (Author) does not signal a rig change but is still slow.
-        let msg = sysex(0x00, 0x7F, FUNCTION_STRING_PARAM, PAGE_STRINGS, 2, b"Aaron");
-        let out = st.apply(&msg);
-        assert_eq!(st.rig.author.as_deref(), Some("Aaron"));
-        assert!(out.slow_changed);
-        assert_eq!(out.events, vec![DeviceEvent::StringTag { number: 2 }]);
-
-        // Amp Name (tag 10) and Cabinet Name (tag 32) route to their blocks.
-        st.apply(&sysex(
-            0x00,
-            0x7F,
-            FUNCTION_STRING_PARAM,
-            PAGE_STRINGS,
-            10,
-            b"JCM",
-        ));
-        st.apply(&sysex(
-            0x00,
-            0x7F,
-            FUNCTION_STRING_PARAM,
-            PAGE_STRINGS,
-            32,
-            b"412",
-        ));
-        assert_eq!(st.amp.name.as_deref(), Some("JCM"));
-        assert_eq!(st.cabinet.name.as_deref(), Some("412"));
-
-        // An untracked string tag leaves the snapshot unchanged (not slow).
-        let out = st.apply(&sysex(
-            0x00,
-            0x7F,
-            FUNCTION_STRING_PARAM,
-            PAGE_STRINGS,
-            99,
-            b"x",
-        ));
-        assert!(!out.slow_changed);
-        assert_eq!(out.events, vec![DeviceEvent::StringTag { number: 99 }]);
-    }
-
-    #[test]
-    fn effect_type_state_and_mix_fold_into_slot() {
-        let mut st = DeviceState::new();
-        // REV (page 0x3D) Type 179 = Easy Reverb; slot index 7.
-        let out = st.apply(&set_single(0x00, 0x7F, 0x3D, EFFECT_PARAM_TYPE, 179));
-        assert_eq!(out.events, vec![DeviceEvent::EffectChanged { slot: 7 }]);
-        assert!(out.slow_changed);
-        let rev = &st.effects[7];
-        assert_eq!(rev.kind, Some(179));
-        assert_eq!(rev.type_name(), Some("Easy Reverb"));
-
-        // On/Off = number 3.
-        let out = st.apply(&set_single(0x00, 0x7F, 0x3D, EFFECT_PARAM_STATE, 1));
-        assert_eq!(out.events, vec![DeviceEvent::EffectChanged { slot: 7 }]);
-        assert_eq!(st.effects[7].on, Some(true));
-
-        // Mix = number 4.
-        let out = st.apply(&set_single(0x00, 0x7F, 0x3D, EFFECT_PARAM_MIX, 8192));
-        assert_eq!(out.events, vec![DeviceEvent::EffectChanged { slot: 7 }]);
-        assert!(out.slow_changed);
-        assert_eq!(st.effects[7].mix, Some(8192));
-        assert_eq!(st.effect("rev").and_then(|e| e.mix), Some(8192));
-    }
-
-    #[test]
-    fn meter_block_fills_status_and_is_fast() {
-        let mut st = DeviceState::new();
-        let mut vals = [0u16; METER_COUNT];
-        vals[3] = 4096; // strobe phase
-        vals[4] = 9000; // stack level
-        vals[6] = 12000; // rig out level
-        vals[9] = 3000; // loudness
-        let msg = sysex(
-            0x00,
-            0x00,
-            FUNCTION_MULTI_PARAM,
-            PAGE_REALTIME,
-            METER_NUMBER,
-            &meter_block(&vals),
-        );
-        let out = st.apply(&msg);
-        assert_eq!(out.events, vec![DeviceEvent::Status(st.status)]);
-        assert!(!out.slow_changed); // FAST lane: no snapshot needed.
-        assert_eq!(st.status.strobe_phase(), 4096);
-        assert_eq!(st.status.stack_level(), 9000);
-        assert_eq!(st.status.rig_out_level(), 12000);
-        assert_eq!(st.status.loudness(), 3000);
-        assert_eq!(st.status.raw, vals);
-    }
-
-    #[test]
-    fn beat_pulse_is_fast_and_touches_nothing() {
-        let mut st = DeviceState::new();
-        let before = st.clone();
-        let msg = set_single(0x00, 0x00, PAGE_REALTIME, BEAT_PULSE_NUMBER, 16383);
-        let out = st.apply(&msg);
-        assert_eq!(out.events, vec![DeviceEvent::BeatPulse { on: true }]);
-        assert!(!out.slow_changed);
-        assert_eq!(st, before);
-
-        let msg = set_single(0x00, 0x00, PAGE_REALTIME, BEAT_PULSE_NUMBER, 0);
-        let out = st.apply(&msg);
-        assert_eq!(out.events, vec![DeviceEvent::BeatPulse { on: false }]);
-        assert!(!out.slow_changed);
-    }
-
-    #[test]
-    fn tempo_and_rig_volume_set_fields() {
-        let mut st = DeviceState::new();
-        // 120 BPM encodes as 120 * 64 = 7680.
-        let out = st.apply(&set_single(
-            0x00,
-            0x00,
-            PAGE_RIG_SETTINGS,
-            TEMPO_NUMBER,
-            7680,
-        ));
-        assert_eq!(out.events, vec![DeviceEvent::TempoBpm(120)]);
-        assert!(out.slow_changed);
-        assert_eq!(st.rig.tempo_bpm, Some(120));
-
-        let out = st.apply(&set_single(
-            0x00,
-            0x00,
-            PAGE_RIG_SETTINGS,
-            RIG_VOLUME_NUMBER,
-            4096,
-        ));
-        assert!(out.slow_changed);
-        assert_eq!(st.rig.volume, Some(4096));
-    }
-
-    #[test]
-    fn amp_on_and_gain_set_fields() {
-        let mut st = DeviceState::new();
-        let out = st.apply(&set_single(0x00, 0x00, AMP_PAGE, AMP_ON_NUMBER, 1));
-        assert!(out.slow_changed);
-        assert_eq!(st.amp.on, Some(true));
-
-        let out = st.apply(&set_single(0x00, 0x00, AMP_PAGE, GAIN_NUMBER, 5000));
-        assert!(out.slow_changed);
-        assert_eq!(st.amp.gain, Some(5000));
-        assert_eq!(
-            out.events,
-            vec![DeviceEvent::ParamChanged {
-                page: 0x0A,
-                number: 4,
-                value: 5000
-            }]
-        );
-    }
-
-    #[test]
-    fn output_volumes_set_fields() {
-        let mut st = DeviceState::new();
-        let out = st.apply(&set_single(0x00, 0x00, SYSTEM_PAGE, MAIN_VOL_NUMBER, 9000));
-        assert!(out.slow_changed);
-        assert_eq!(st.output.main_volume, Some(9000));
-
-        let out = st.apply(&set_single(
-            0x00,
-            0x00,
-            SYSTEM_PAGE,
-            MONITOR_VOL_NUMBER,
-            3000,
-        ));
-        assert!(out.slow_changed);
-        assert_eq!(st.output.monitor_volume, Some(3000));
-    }
-
-    #[test]
-    fn untracked_generic_param_is_not_slow() {
-        let mut st = DeviceState::new();
-        // Input Section Noise Gate Intensity (page 0x09/3): not modelled.
-        let out = st.apply(&set_single(0x00, 0x00, 0x09, 3, 5000));
-        assert!(!out.slow_changed);
-        assert_eq!(
-            out.events,
-            vec![DeviceEvent::ParamChanged {
-                page: 0x09,
-                number: 3,
-                value: 5000
-            }]
-        );
-    }
-
-    #[test]
-    fn rig_load_dump_routes_multiple_values() {
-        let mut st = DeviceState::new();
-        // A $02 dump for effect slot A (page 0x32) starting at number 0:
-        // num0 = Type (33 = Green Scream), num1/num2 arbitrary, num3 = On.
-        let vals = [
-            u14_split(33).0,
-            u14_split(33).1, // number 0: Type
-            0x10,
-            0x00, // number 1: some param
-            0x20,
-            0x00, // number 2: some param
-            0x00,
-            0x01, // number 3: On/Off = 1
-        ];
-        let msg = sysex(0x00, 0x00, FUNCTION_MULTI_PARAM, 0x32, 0, &vals);
-        let out = st.apply(&msg);
-        assert!(out.slow_changed);
-        assert_eq!(
-            out.events,
-            vec![
-                DeviceEvent::EffectChanged { slot: 0 },
-                DeviceEvent::ParamChanged {
-                    page: 0x32,
-                    number: 1,
-                    value: u14(0x10, 0x00)
-                },
-                DeviceEvent::ParamChanged {
-                    page: 0x32,
-                    number: 2,
-                    value: u14(0x20, 0x00)
-                },
-                DeviceEvent::EffectChanged { slot: 0 },
-            ]
-        );
-        assert_eq!(st.effects[0].kind, Some(33));
-        assert_eq!(st.effects[0].type_name(), Some("Green Scream"));
-        assert_eq!(st.effects[0].on, Some(true));
-    }
-
-    #[test]
-    fn non_kemper_message_is_ignored() {
-        let mut st = DeviceState::new();
-        assert_eq!(st.apply(&[0xB0, 0x20, 0x01]), ApplyOutcome::empty()); // a plain CC
-        assert_eq!(st.apply(&[]), ApplyOutcome::empty());
-    }
-
-    /// Build a `$07` Extended String Parameter message mirroring the layout
-    /// [`nrpn::parse_extended_string`] expects: a 5×7-bit big-endian address of
-    /// `page * 128 + number`, then NUL-terminated ASCII.
-    fn ext_string(page: u8, number: u8, text: &[u8]) -> Vec<u8> {
-        let addr = (page as u64) * 128 + number as u64;
-        let mut msg = vec![
-            0xF0,
-            0x00,
-            0x20,
-            0x33,
-            0x00,
-            0x00,
-            FUNCTION_EXT_STRING_PARAM,
-            0x00,
-        ];
-        msg.extend_from_slice(&nrpn::ext_encode(addr, 5));
-        msg.extend_from_slice(text);
-        msg.push(0x00);
-        msg.push(0xF7);
-        msg
-    }
-
-    #[test]
-    fn ext_string_recovers_amp_name() {
-        let mut st = DeviceState::new();
-        // Amp Name is string tag 10 on the string page.
-        let msg = ext_string(PAGE_STRINGS, 10, b"JCM800");
-        let out = st.apply(&msg);
-        assert_eq!(st.amp.name.as_deref(), Some("JCM800"));
-        assert!(out.slow_changed);
-        assert_eq!(out.events, vec![DeviceEvent::StringTag { number: 10 }]);
-    }
-
-    #[test]
-    fn ext_string_rig_name_signals_rig_change() {
-        let mut st = DeviceState::new();
-        let msg = ext_string(PAGE_STRINGS, nrpn::STRING_RIG_NAME, b"AC30");
-        let out = st.apply(&msg);
-        assert_eq!(st.rig.name.as_deref(), Some("AC30"));
-        assert_eq!(
-            out.events,
-            vec![
-                DeviceEvent::StringTag { number: 1 },
-                DeviceEvent::RigChanged
-            ]
-        );
-    }
-
-    #[test]
-    fn ext_string_off_string_page_is_ignored() {
-        let mut st = DeviceState::new();
-        // A $07 addressed to a non-string page is not routed.
-        let msg = ext_string(0x0A, 0, b"nope");
-        assert_eq!(st.apply(&msg), ApplyOutcome::empty());
-    }
-
-    #[test]
-    fn ext_string_populates_bank_preview() {
-        let mut st = DeviceState::new();
-        // Bank Preview page 0x96: number 0 = slot 1 rig name, number 5 = slot 1
-        // amp name, number 12 = slot 3 cabinet name.
-        let out = st.apply(&ext_string(PAGE_BANK_PREVIEW, 0, b"AC30"));
-        assert!(out.slow_changed);
-        assert_eq!(out.events, vec![DeviceEvent::BankPreview { number: 0 }]);
-        st.apply(&ext_string(PAGE_BANK_PREVIEW, 5, b"Vox AC30TB"));
-        st.apply(&ext_string(PAGE_BANK_PREVIEW, 12, b"2x12"));
-        assert_eq!(st.bank.slots[0].rig_name.as_deref(), Some("AC30"));
-        assert_eq!(st.bank.slots[0].amp_name.as_deref(), Some("Vox AC30TB"));
-        assert_eq!(st.bank.slots[2].cabinet_name.as_deref(), Some("2x12"));
-        // An out-of-range bank number is ignored.
-        assert_eq!(
-            st.apply(&ext_string(PAGE_BANK_PREVIEW, 15, b"x")),
-            ApplyOutcome::empty()
-        );
-    }
-
-    #[test]
-    fn headphone_volume_feeds_master() {
-        let mut st = DeviceState::new();
-        assert_eq!(st.output.master_volume(), None);
-        // Monitor alone answers for master until headphone is seen.
-        st.apply(&set_single(
-            0x00,
-            0x00,
-            SYSTEM_PAGE,
-            MONITOR_VOL_NUMBER,
-            5000,
-        ));
-        assert_eq!(st.output.master_volume(), Some(5000));
-        let out = st.apply(&set_single(
-            0x00,
-            0x00,
-            SYSTEM_PAGE,
-            HEADPHONE_VOL_NUMBER,
-            9000,
-        ));
-        assert!(out.slow_changed);
-        assert_eq!(st.output.headphone_volume, Some(9000));
-        // Headphone wins once present.
-        assert_eq!(st.output.master_volume(), Some(9000));
-    }
-
-    #[test]
-    fn morph_sets_position() {
-        let mut st = DeviceState::new();
-        // Page 0 / number 0x77, half-morphed.
-        let out = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, MORPH_NUMBER, 8192));
-        assert_eq!(out.events, vec![DeviceEvent::MorphChanged(8192)]);
-        assert!(out.slow_changed);
-        assert_eq!(st.morph, Some(8192));
-    }
-
-    #[test]
-    fn morph_button_is_momentary() {
-        let mut st = DeviceState::new();
-        let press = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, MORPH_BUTTON_NUMBER, 1));
-        assert_eq!(press.events, vec![DeviceEvent::MorphButton(true)]);
-        assert!(!press.slow_changed, "the button stores nothing");
-        let release = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, MORPH_BUTTON_NUMBER, 0));
-        assert_eq!(release.events, vec![DeviceEvent::MorphButton(false)]);
-        // The button says a morph happened; it never says where the fader sits.
-        assert_eq!(st.morph, None);
-    }
-
-    #[test]
-    fn morph_is_not_at_0x0b() {
-        // 0x0B came from a third-party mapping and is wrong: the device answers
-        // a request there with a constant 0 whether the rig is morphed or at
-        // base, and never pushes it. Nothing may land in `morph` from it, or the
-        // same silent mistake returns — a value that simply never moves.
-        let mut st = DeviceState::new();
-        let out = st.apply(&set_single(0x00, 0x00, PAGE_MORPH, 0x0B, 16383));
-        assert_eq!(st.morph, None);
-        assert!(!out.slow_changed);
-        assert_eq!(
-            out.events,
-            vec![DeviceEvent::ParamChanged {
-                page: 0x00,
-                number: 0x0B,
-                value: 16383
-            }]
-        );
-    }
-
-    /// The two channels are one event universe: a value arriving over CBOR lands
-    /// in the same field, and raises the same event, as one arriving over MIDI3.
-    #[test]
-    fn apply_cbor_routes_the_same_as_the_stream() {
-        let mut st = DeviceState::new();
-        let morph = st.apply_cbor(generated::MORPH_ADDRESS, 8192);
-        assert_eq!(morph.events, vec![DeviceEvent::MorphChanged(8192)]);
-        assert!(morph.slow_changed);
-        assert_eq!(st.morph, Some(8192));
-
-        let bank = st.apply_cbor(generated::CURRENT_BANK_ADDRESS, 3);
-        assert_eq!(
-            bank.events,
-            vec![DeviceEvent::CurrentPosition {
-                bank: Some(3),
-                slot: None
-            }]
-        );
-        let slot = st.apply_cbor(generated::CURRENT_RIG_SLOT_ADDRESS, 4);
-        assert_eq!(
-            slot.events,
-            vec![DeviceEvent::CurrentPosition {
-                bank: Some(3),
-                slot: Some(4)
-            }]
-        );
-        assert_eq!(st.current_rig_index(), Some(19));
-
-        // An unchanged value is not a change, and an unknown address is ignored.
-        assert_eq!(
-            st.apply_cbor(generated::MORPH_ADDRESS, 8192),
-            ApplyOutcome::empty()
-        );
-        assert_eq!(st.apply_cbor(102_405, 31), ApplyOutcome::empty());
-        // A value too wide for the field is dropped, not truncated.
-        assert_eq!(
-            st.apply_cbor(generated::MORPH_ADDRESS, 70_000),
-            ApplyOutcome::empty()
-        );
-        assert_eq!(st.morph, Some(8192));
-    }
-
-    #[test]
-    fn tuner_deviance_is_fast() {
-        let mut st = DeviceState::new();
-        // Page 0x7C / number 0x0F; 8192 = in tune. FAST lane.
-        let out = st.apply(&set_single(
-            0x00,
-            0x00,
-            PAGE_REALTIME,
-            TUNER_DEVIANCE_NUMBER,
-            8192,
-        ));
-        assert_eq!(out.events, vec![DeviceEvent::TunerDeviance(8192)]);
-        assert!(!out.slow_changed);
-        assert_eq!(st.tuner.deviance, Some(8192));
-        assert_eq!(st.tuner.in_tune(), Some(true));
-    }
-
-    #[test]
-    fn tuner_note_is_slow() {
-        let mut st = DeviceState::new();
-        // Page 0x7D / number 0x54; low 7 bits are the note index.
-        let out = st.apply(&set_single(
-            0x00,
-            0x00,
-            PAGE_TUNER_NOTE,
-            TUNER_NOTE_NUMBER,
-            45,
-        ));
-        assert_eq!(out.events, vec![DeviceEvent::TunerNote(45)]);
-        assert!(out.slow_changed);
-        assert_eq!(st.tuner.note, Some(45));
-    }
-
-    #[test]
-    fn rendered_string_reply_is_fast_event() {
-        let mut st = DeviceState::new();
-        // A $3C reply for page 0x3C number 53, value 8192, rendered "<0.0>".
-        let (msb, lsb) = u14_split(8192);
-        let msg = sysex(
-            0x02,
-            0x7F,
-            FUNCTION_RENDERED_STRING_REPLY,
-            0x3C,
-            53,
-            &[msb, lsb, b'<', b'0', b'.', b'0', b'>', 0],
-        );
-        let out = st.apply(&msg);
-        assert!(!out.slow_changed); // transient reply: no snapshot.
-        assert_eq!(
-            out.events,
-            vec![DeviceEvent::RenderedString {
-                page: 0x3C,
-                number: 53,
-                value: 8192,
-                text: "<0.0>".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn new_state_is_disconnected() {
-        assert_eq!(DeviceState::new().connection, Connection::Disconnected);
     }
 }
