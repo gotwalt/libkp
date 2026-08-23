@@ -1,0 +1,201 @@
+name: MetersApp release
+
+# Every push to main (i.e. every merged PR) builds MetersApp as a universal
+# macOS app bundle, signs it with Developer ID, notarizes it with Apple,
+# staples the ticket, and republishes the rolling `metersapp-latest`
+# prerelease so the download link always points at the newest build.
+#
+# Required repository secrets:
+#   MACOS_CERT_P12_BASE64        Developer ID Application cert + key, exported
+#                                as .p12 and base64'd:
+#                                  base64 -i DeveloperID.p12 | pbcopy
+#   MACOS_CERT_PASSWORD          The password used for that .p12 export
+#   MACOS_SIGNING_IDENTITY       e.g. "Developer ID Application: Your Name (TEAMID)"
+#   APP_STORE_CONNECT_KEY_ID     App Store Connect API key id
+#   APP_STORE_CONNECT_ISSUER_ID  App Store Connect issuer id (a UUID)
+#   APP_STORE_CONNECT_KEY_CONTENT  The AuthKey_<KEY_ID>.p8 file contents
+#
+# Without those secrets the job still builds the app and uploads it as an
+# unsigned workflow artifact; signing, notarization and the release are
+# skipped with a warning rather than failing the run.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: metersapp-release
+  cancel-in-progress: true
+
+jobs:
+  notarize:
+    name: Build, notarize and publish MetersApp
+    # Notarization tools require macOS environments.
+    runs-on: macos-15
+    env:
+      DIST: ${{ github.workspace }}/swift/.build/dist
+      APP: ${{ github.workspace }}/swift/.build/dist/MetersApp.app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          spec=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' spec/version.toml | head -1 | tr -d '"')
+          echo "marketing=$spec" >> "$GITHUB_OUTPUT"
+          echo "build=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "MetersApp $spec (build ${{ github.run_number }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the app bundle
+        env:
+          MARKETING_VERSION: ${{ steps.version.outputs.marketing }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build }}
+        run: swift/Scripts/build_app.sh "$DIST"
+
+      - name: Check for signing secrets
+        id: signing
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CERT" ] && [ -n "$IDENTITY" ] && [ -n "$KEY_ID" ] \
+            && [ -n "$ISSUER_ID" ] && [ -n "$KEY_CONTENT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Signing secrets are not configured; publishing an unsigned build artifact only."
+          fi
+
+      - name: Import the Developer ID certificate
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Let codesign use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+
+      - name: Sign the app
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Hardened runtime and a secure timestamp are both notarization
+          # requirements. The bundle has no nested code, so one pass is enough.
+          codesign --force --timestamp --options runtime \
+            --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Notarize and staple
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+
+          # 1. Save the p8 private key content to a local file.
+          key_dir="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$key_dir"
+          key_file="$key_dir/AuthKey_$KEY_ID.p8"
+          printf '%s\n' "$KEY_CONTENT" > "$key_file"
+          chmod 600 "$key_file"
+
+          # 2. Submit for notarization. Apple notarizes an archive, not a
+          #    bundle, so zip with ditto (which preserves the signature).
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/submit.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/submit.zip" \
+            --key-id "$KEY_ID" \
+            --issuer "$ISSUER_ID" \
+            --key "$key_file" \
+            --wait
+
+          # 3. Staple the ticket onto the .app, then re-zip so the published
+          #    download carries it and validates offline.
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type exec --verbose=4 "$APP"
+
+      - name: Package the download
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "$APP" "$DIST/MetersApp.app.zip"
+          shasum -a 256 "$DIST/MetersApp.app.zip" | tee "$DIST/MetersApp.app.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MetersApp-${{ steps.version.outputs.marketing }}-${{ github.run_number }}
+          path: |
+            ${{ env.DIST }}/MetersApp.app.zip
+            ${{ env.DIST }}/MetersApp.app.zip.sha256
+          if-no-files-found: error
+
+      - name: Publish the rolling latest prerelease
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MARKETING: ${{ steps.version.outputs.marketing }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'Notarized build of `MetersApp` (KP Meters) from the tip of `main`.' \
+            '' \
+            '| | |' \
+            '|---|---|' \
+            "| Version | $MARKETING (build ${{ github.run_number }}) |" \
+            "| Commit | ${{ github.sha }} |" \
+            '| Requires | macOS 13 or newer (universal: Apple silicon + Intel) |' \
+            '' \
+            'Unzip and drag **MetersApp.app** to /Applications. It is signed with a' \
+            'Developer ID and notarized by Apple, so it opens without a Gatekeeper' \
+            'prompt; macOS asks once for permission to find the Profiler on your' \
+            'local network.' \
+            '' \
+            'This release is replaced by every merge to `main`.' \
+            > "$RUNNER_TEMP/notes.md"
+
+          # A rolling tag: drop the old release and its tag, then recreate both
+          # at this commit so the asset URL stays stable.
+          gh release delete metersapp-latest --cleanup-tag --yes || true
+          gh release create metersapp-latest \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "KP Meters — latest build ($MARKETING)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$DIST/MetersApp.app.zip" \
+            "$DIST/MetersApp.app.zip.sha256"
+
+      - name: Clean up signing material
+        if: always()
+        run: |
+          set -euo pipefail
+          security delete-keychain "${KEYCHAIN:-}" 2>/dev/null || true
+          rm -rf "$HOME/.appstoreconnect/private_keys"

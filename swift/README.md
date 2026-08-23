@@ -157,6 +157,35 @@ IP for a device discovery cannot reach, and toggles the level list between the
 three bar meters and all eleven raw fields. When the device drops the
 connection the app says so and reconnects on its own.
 
+### The app bundle
+
+`swift run` starts a bare executable. For a double-clickable app — and for
+anything Gatekeeper will accept —
+[`Scripts/build_app.sh`](Scripts/build_app.sh) wraps the same product in a
+universal (arm64 + x86_64) `.app` with an `Info.plist`:
+
+```sh
+Scripts/build_app.sh              # -> .build/dist/MetersApp.app
+open .build/dist/MetersApp.app
+```
+
+`MARKETING_VERSION`, `BUILD_NUMBER` and `BUNDLE_ID` override the defaults; the
+marketing version otherwise comes from [`../spec/version.toml`](../spec/version.toml).
+The bundle carries `NSLocalNetworkUsageDescription`, so macOS 15 and newer ask
+once for the local-network permission discovery needs.
+
+The bundle it produces is unsigned. Every merge to `main` runs
+[`metersapp-release.yml`](../.github/workflows/metersapp-release.yml), which
+builds it on a macOS runner, signs it with a Developer ID, notarizes it with
+Apple, staples the ticket and republishes the rolling **`metersapp-latest`**
+prerelease — so
+`https://github.com/gotwalt/libkp/releases/download/metersapp-latest/MetersApp.app.zip`
+is always the newest notarized build. That workflow needs six repository
+secrets (`MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`,
+`MACOS_SIGNING_IDENTITY`, `APP_STORE_CONNECT_KEY_ID`,
+`APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_KEY_CONTENT`); until they are
+set it skips signing and uploads an unsigned workflow artifact instead.
+
 ## Tests
 
 `swift test` runs two things:
