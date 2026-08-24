@@ -130,7 +130,17 @@ public final class Session: @unchecked Sendable {
         }
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: parameters)
         let session = Session(connection: connection, ledgerPeer: ledgerPeer)
-        try await session.start(timeout: timeout)
+        do {
+            try await session.start(timeout: timeout)
+        } catch {
+            // A dial that failed still holds a started NWConnection: cancel
+            // it, or every failed attempt — a reconnect loop's worth of them
+            // — leaks one, its queue and its file descriptor for the life of
+            // the process. The ledger is not stamped: nothing opened, which
+            // is how Rust and Python leave a refused dial too.
+            connection.cancel()
+            throw error
+        }
         ConnectionLedger.shared.noteOpen(ledgerPeer)
         session.pump()
         return session

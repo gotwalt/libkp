@@ -241,7 +241,9 @@ public enum Nrpn {
             msg[6] == Generated.fnExtStringParam,
             msg[msg.count - 1] == 0xF7
         else { return nil }
-        let address = UInt32(truncatingIfNeeded: extDecode(Array(msg[8..<13])))
+        // The scheme can carry 35 bits; an address past 32 is malformed, not
+        // an address to wrap onto some other parameter.
+        guard let address = UInt32(exactly: extDecode(Array(msg[8..<13]))) else { return nil }
         return (address, Fmt.textUntilNul(msg[13..<(msg.count - 1)]))
     }
 
@@ -260,7 +262,9 @@ public enum Nrpn {
             msg[6] == Generated.fnExtParam,
             msg[msg.count - 1] == 0xF7
         else { return nil }
-        let address = UInt32(truncatingIfNeeded: extDecode(Array(msg[8..<13])))
+        // The scheme can carry 35 bits; an address past 32 is malformed, not
+        // an address to wrap onto some other parameter.
+        guard let address = UInt32(exactly: extDecode(Array(msg[8..<13]))) else { return nil }
         return (address, extDecode(Array(msg[13..<18])))
     }
 

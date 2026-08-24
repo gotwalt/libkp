@@ -488,7 +488,9 @@ public enum Cbor {
     /// this library does not know — is `nil`: not a value, so nothing to fold.
     /// An address outside the 32-bit space (negative, or past what any page or
     /// extended address can name) drops the item rather than wrapping onto some
-    /// other parameter, and an empty string is no string at all.
+    /// other parameter. An empty string is a value like any other: it is how a
+    /// cleared tag (a blank rig comment, say) reaches the tree, which could
+    /// otherwise never unlearn the old text.
     static func controlItem(_ item: CBORValue) -> ControlItem? {
         guard let fields = item.asArray else { return nil }
         // Skip a leading negative source-flags word.
@@ -515,7 +517,7 @@ public enum Cbor {
             }
             return ControlItem(base: base, entries: entries)
         } else if selector == Generated.cborSelectorString {
-            guard rest.count > 2, case .text(let text) = rest[2], !text.isEmpty else { return nil }
+            guard rest.count > 2, case .text(let text) = rest[2] else { return nil }
             return ControlItem(base: base, entries: [.text(address: base, text: text)])
         }
         return nil

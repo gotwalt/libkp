@@ -440,11 +440,16 @@ def build():
             {"hex": hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 24)), "expected": {"address": CURRENT_BANK_ADDRESS, "value": 24}},
             {"hex": hx(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, 3)), "expected": {"address": CURRENT_RIG_SLOT_ADDRESS, "value": 3}},
             {"hex": hx(ext_param(0x02, 0x00, 102405, 0x123456789)), "expected": {"address": 102405, "value": 0x123456789}},
+            # The scheme can carry 35 bits; an address past 32 is malformed,
+            # not an address to wrap onto some other parameter.
+            {"hex": hx(ext_param(0x02, 0x00, 0x1_0000_0000, 7)), "expected": None},
             {"hex": hx(set_single(0x00, 0x7F, 0x00, 0x01, 1)), "expected": None},
         ],
         "parse_extended_string": [
             {"hex": hx(bytes([0xF0, *MFR, 0x02, 0x00, 0x07, 0x00]) + ext_encode(1, 5) + b"AC30\x00\xf7"), "expected": {"address": 1, "text": "AC30"}},
             {"hex": hx(bytes([0xF0, *MFR, 0x02, 0x00, 0x07, 0x00]) + ext_encode(1280, 5) + b"JCM800\x00\xf7"), "expected": {"address": 1280, "text": "JCM800"}},
+            # As for the $06: 35 encodable bits, 32 addressable ones.
+            {"hex": hx(bytes([0xF0, *MFR, 0x02, 0x00, 0x07, 0x00]) + ext_encode(0x1_0000_0000, 5) + b"X\x00\xf7"), "expected": None},
             {"hex": hx(set_single(0x00, 0x7F, 0x00, 0x01, 1)), "expected": None},
         ],
         "parse_rendered_string": [
@@ -1086,6 +1091,11 @@ def _cbor_snapshot_cases():
              + cbor_string(1, "Maz 18 Pushed") + cbor_string(secret, "secret"),
              3, 4, None, [(1, "Maz 18 Pushed"), (secret, CBOR["redacted_placeholder"])]),
         case("an empty stream yields no position", b"", None, None, None, []),
+        # An empty string is a value like any other: it is how a cleared tag
+        # reaches a reader, which could otherwise never unlearn the old text.
+        case("an empty string clears a tag rather than vanishing",
+             cbor_string(1, "Maz 18") + cbor_string(1, ""),
+             None, None, None, [(1, "Maz 18"), (1, "")]),
         case("the dump carries the morph position alongside the indices",
              cbor_param_write(CURRENT_BANK_ADDRESS, 1) + cbor_param_write(CURRENT_RIG_SLOT_ADDRESS, 2)
              + cbor_param_write(MORPH_ADDRESS, 16383),

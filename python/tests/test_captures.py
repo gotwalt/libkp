@@ -210,8 +210,15 @@ def test_cbor_stream_decodes(entry):
     if "numeric_count" in expected:
         assert len(cbor.numeric_values(items)) == expected["numeric_count"]
     if "strings" in expected:
+        # As a reader surfaces them: a sensitive address is redacted, the
+        # same view the Rust and Swift harnesses assert off their snapshots.
         got = [
-            [address, decoded.text]
+            [
+                address,
+                gen.REDACTED_PLACEHOLDER
+                if address in gen.SENSITIVE_ADDRESSES
+                else decoded.text,
+            ]
             for item in cbor.control_items(items)
             for address, decoded in item.values
             if isinstance(decoded, Text)

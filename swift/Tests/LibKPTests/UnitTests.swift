@@ -1409,8 +1409,11 @@ final class CborTests: XCTestCase {
             ])
         XCTAssertEqual(items.lastIndex { $0.base == Generated.dumpEndAddress }, 3)
         XCTAssertNil(items.prefix(3).lastIndex { $0.base == Generated.dumpEndAddress })
-        // An empty string is no string at all.
-        XCTAssertNil(Cbor.controlItem(.tag(1, .array([.uint(4), .uint(1), .text("")]))))
+        // An empty string is a value like any other: it is how a cleared
+        // tag reaches the tree, which could otherwise never unlearn it.
+        XCTAssertEqual(
+            Cbor.controlItem(.tag(1, .array([.uint(4), .uint(1), .text("")]))),
+            ControlItem(base: 1, entries: [.text(address: 1, text: "")]))
     }
 
     /// A negative or oversized address is malformed; wrapping it into a

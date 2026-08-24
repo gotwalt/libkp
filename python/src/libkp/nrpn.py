@@ -365,7 +365,12 @@ def parse_extended_param(msg: bytes) -> tuple[int, int] | None:
         or msg[-1] != 0xF7
     ):
         return None
-    return ext_decode(msg[8:13]), ext_decode(msg[13:18])
+    address = ext_decode(msg[8:13])
+    # The scheme can carry 35 bits; an address past 32 is malformed, not an
+    # address to wrap onto some other parameter. The value keeps its 35.
+    if address > 0xFFFF_FFFF:
+        return None
+    return address, ext_decode(msg[13:18])
 
 
 def parse_extended_string(msg: bytes) -> tuple[int, str] | None:
@@ -387,6 +392,9 @@ def parse_extended_string(msg: bytes) -> tuple[int, str] | None:
     ):
         return None
     address = ext_decode(msg[8:13])
+    # As for the $06: 35 encodable bits, 32 addressable ones.
+    if address > 0xFFFF_FFFF:
+        return None
     return address, _ascii_until_nul(msg[13 : len(msg) - 1])
 
 

@@ -253,7 +253,9 @@ pub fn parse_extended_string(msg: &[u8]) -> Option<(u32, String)> {
     {
         return None;
     }
-    let address = ext_decode(&msg[8..13]) as u32;
+    // The scheme can carry 35 bits; an address past 32 is malformed, not an
+    // address to wrap onto some other parameter.
+    let address = u32::try_from(ext_decode(&msg[8..13])).ok()?;
     let text: String = msg[13..msg.len() - 1]
         .iter()
         .take_while(|&&b| b != 0)
@@ -279,7 +281,10 @@ pub fn parse_extended_param(msg: &[u8]) -> Option<(u32, u64)> {
     {
         return None;
     }
-    Some((ext_decode(&msg[8..13]) as u32, ext_decode(&msg[13..18])))
+    // The scheme can carry 35 bits; an address past 32 is malformed, not an
+    // address to wrap onto some other parameter. The value keeps its 35.
+    let address = u32::try_from(ext_decode(&msg[8..13])).ok()?;
+    Some((address, ext_decode(&msg[13..18])))
 }
 
 /// Request an extended-address numeric parameter (function $46) at a flat
