@@ -84,6 +84,36 @@ impl Default for Channels {
     }
 }
 
+/// Where the model's Navigator stands: the part of its state machine a UI
+/// shows. Set by [`DeviceModel::navigate_to`](crate::model::DeviceModel::navigate_to)
+/// and its step and slot conveniences, never by the device.
+///
+/// A rig load is aimed, not sent: the aim lands at once, so a slot highlight
+/// or a position readout can answer every tap, while the model rations the
+/// sending so that loads never overlap. [`DeviceState::aimed_rig_index`] is
+/// the readout to bind: the aim while there is one, the device's own
+/// position otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Navigation {
+    /// The flat rig index the model is trying to reach, until the device
+    /// reports it (see [`DeviceEvent::NavigationSettled`]) or the aim is
+    /// dropped (see [`DeviceEvent::NavigationDropped`]).
+    pub aim: Option<u16>,
+    /// A load was sent less than [`generated::RIG_LOAD_SETTLE_MS`] ago and
+    /// the next one, if the aim has moved, waits for it.
+    pub in_flight: bool,
+}
+
+/// Why the Navigator gave up on an aim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavDrop {
+    /// The device never reported the aimed index within
+    /// [`generated::PENDING_WINDOW_MS`] of the move settling — the index is
+    /// past the end of what the device holds, and it stayed where it was —
+    /// or the stream was not there to send the load on.
+    Unconfirmed,
+}
+
 /// Which wire carried an [`Update`].
 ///
 /// The two channels are one event universe in two wire formats, but they are
@@ -359,6 +389,10 @@ pub struct DeviceState {
     /// whose control link is off, unavailable or lost never learns it, so this
     /// stays `None` (or goes stale) there; `channels.control` says which.
     pub morph: Option<u16>,
+    /// Where the model's Navigator stands: the rig index it is aiming at, if
+    /// any, and whether a load is in flight. The model's own bookkeeping,
+    /// mirrored here so a UI can show the aim before the device confirms it.
+    pub navigation: Navigation,
     /// The most recent realtime status / meter frame (the FAST lane).
     pub status: RealtimeStatus,
     /// Dump-authority bookkeeping; never part of the snapshot's value.
@@ -373,6 +407,17 @@ impl DeviceState {
     /// rig outside the current bank.
     pub fn current_rig_index(&self) -> Option<u16> {
         Some(self.current_bank? * generated::BANK_SLOTS as u16 + self.current_rig_slot?)
+    }
+
+    /// The rig index a UI should show and step from: the Navigator's aim
+    /// while it has one, else [`current_rig_index`](Self::current_rig_index).
+    ///
+    /// Reading the device's own position instead, right after a tap, would
+    /// address the next tap to the bank the device is *leaving* — the
+    /// stale-index bug this exists to prevent. `None` until the device has
+    /// reported a position and nothing has been aimed at.
+    pub fn aimed_rig_index(&self) -> Option<u16> {
+        self.navigation.aim.or(self.current_rig_index())
     }
 
     /// A fresh, empty state: [`Connection::Disconnected`], no rig data, all eight
@@ -401,6 +446,7 @@ impl DeviceState {
             current_bank: None,
             current_rig_slot: None,
             morph: None,
+            navigation: Navigation::default(),
             status: RealtimeStatus::default(),
             dump: DumpGuard::default(),
         }
@@ -632,6 +678,20 @@ mod tests {
                 .all(|e| e.kind.is_none() && e.on.is_none() && e.mix.is_none())
         );
         assert_eq!(s, DeviceState::default());
+    }
+
+    #[test]
+    fn aimed_rig_index_prefers_the_aim() {
+        let mut s = DeviceState::new();
+        assert_eq!(s.aimed_rig_index(), None);
+        s.current_bank = Some(3);
+        s.current_rig_slot = Some(1);
+        assert_eq!(s.aimed_rig_index(), Some(16));
+        s.navigation.aim = Some(14);
+        assert_eq!(s.aimed_rig_index(), Some(14));
+        // Index 0 is a real aim, not an absence.
+        s.navigation.aim = Some(0);
+        assert_eq!(s.aimed_rig_index(), Some(0));
     }
 
     #[test]

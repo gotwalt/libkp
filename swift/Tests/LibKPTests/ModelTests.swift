@@ -447,7 +447,9 @@ final class SupervisorTests: XCTestCase {
         XCTAssertFalse(events.finished, "only close() finishes the streams")
         XCTAssertFalse(snapshots.finished)
         await model.close()
+        // The two streams finish on their own tasks; wait for each.
         await events.wait { _ in events.finished }
+        await snapshots.wait { _ in snapshots.finished }
         XCTAssertTrue(events.finished)
         XCTAssertTrue(snapshots.finished)
     }
@@ -507,5 +509,211 @@ final class SupervisorTests: XCTestCase {
         let stream = await device.connections(atLeast: 1)[0]
         let closed = await stream.wait { $0.isClosed }
         XCTAssertTrue(closed)
+    }
+}
+
+// MARK: - The Navigator
+
+final class NavigatorTests: XCTestCase {
+    private func connect(_ device: FakeDevice) async throws -> DeviceModel {
+        try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(control: .off, sync: .off))
+    }
+
+    /// The two messages one load puts on the wire for a flat index: the bank
+    /// preselect, then the slot load's press and release.
+    private func loadPair(_ index: UInt16) -> [[UInt8]] {
+        let slots = UInt16(Params.bankSlots)
+        return [
+            Control.bankPreselect(UInt8(index / slots)).message(),
+            Control.loadSlot(UInt8(index % slots) + 1).message(),
+        ]
+    }
+
+    /// The `$06` pair a device pushes when it lands on a flat index.
+    private func report(_ index: UInt16, on stream: FakeConnection) {
+        let slots = UInt16(Params.bankSlots)
+        stream.push(
+            FakeDevice.extParam(address: Generated.currentBankAddress, value: UInt64(index / slots))
+        )
+        stream.push(
+            FakeDevice.extParam(
+                address: Generated.currentRigSlotAddress, value: UInt64(index % slots)))
+    }
+
+    /// A burst of taps is exactly two loads — the first tap and the final aim
+    /// — spaced by at least the settle time, and the position report for the
+    /// final aim retires it.
+    func testABurstCostsTwoLoadsSpacedByTheSettle() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let (events, snapshots) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        await model.navigateTo(14)
+        await model.navigateTo(15)
+        await model.navigateTo(16)
+        var state = await model.snapshot()
+        XCTAssertEqual(state.navigation, Navigation(aim: 16, inFlight: true))
+        XCTAssertEqual(state.aimedRigIndex, 16)
+
+        let received = await stream.received(atLeast: 4)
+        XCTAssertEqual(received, loadPair(14) + loadPair(16))
+        let times = stream.receivedAt
+        XCTAssertGreaterThanOrEqual(
+            times[0].duration(to: times[2]),
+            .milliseconds(Generated.rigLoadSettleMs) - .milliseconds(20),
+            "the second load waits for the first to settle")
+        XCTAssertLessThan(times[0].duration(to: times[1]), .milliseconds(100))
+
+        // The device lands on the final aim: settled, and nothing more sent.
+        report(16, on: stream)
+        let seen = await events.wait { $0.contains(.navigationSettled(index: 16)) }
+        XCTAssertTrue(seen.contains(.navigationSettled(index: 16)))
+        XCTAssertFalse(seen.contains { if case .navigationDropped = $0 { true } else { false } })
+        state = await model.snapshot()
+        XCTAssertNil(state.navigation.aim)
+        XCTAssertEqual(state.currentRigIndex, 16)
+        XCTAssertEqual(state.aimedRigIndex, 16)
+        try? await Task.sleep(for: .milliseconds(Generated.rigLoadSettleMs + 200))
+        XCTAssertEqual(stream.received.count, 4, "a burst is two loads, however long")
+        let aims = snapshots.all.map(\.navigation.aim)
+        XCTAssertTrue(aims.contains(16))
+        XCTAssertEqual(aims.last ?? 0, nil, "the aim is gone from the snapshot")
+        await model.close()
+    }
+
+    /// The direct routes are refused before a byte is written.
+    func testRigLoadsOutsideTheNavigatorAreRefused() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        for control in [
+            Control.loadSlot(1), .up, .down, .programChange(3), .bankSelect(msb: 0, lsb: 1),
+        ] {
+            do {
+                try await model.send(control: control)
+                XCTFail("\(control) must be refused")
+            } catch let error as CommandError {
+                XCTAssertEqual(error, .rigLoadRequiresNavigator, "\(control)")
+            }
+        }
+        for raw in [[0xC0, 5], Control.loadSlot(2).message(), Control.up.message()] {
+            do {
+                try await model.sendRaw(raw)
+                XCTFail("\(raw) must be refused")
+            } catch let error as CommandError {
+                XCTAssertEqual(error, .rigLoadRequiresNavigator)
+            }
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(stream.received, [], "nothing reached the wire")
+
+        // The preselect alone loads nothing, and passes.
+        try await model.bank(3)
+        try await model.sendRaw(Control.bankPreselect(1).message())
+        let received = await stream.received(atLeast: 2)
+        XCTAssertEqual(
+            received, [Control.bankPreselect(2).message(), Control.bankPreselect(1).message()])
+        await model.close()
+    }
+
+    /// An aim the device never confirms — past the last rig — is dropped after
+    /// the window, and the same index may be tried again afterwards.
+    func testAnUnconfirmedAimIsDroppedAfterTheWindow() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        let started = ContinuousClock.Instant.now
+        await model.navigateTo(999)
+        // The device stays put and says so; that is not the aim.
+        report(13, on: stream)
+        let seen = await events.wait(within: .seconds(4)) {
+            $0.contains(.navigationDropped(index: 999, reason: .unconfirmed))
+        }
+        let elapsed = started.duration(to: .now)
+        XCTAssertTrue(seen.contains(.navigationDropped(index: 999, reason: .unconfirmed)))
+        XCTAssertGreaterThanOrEqual(
+            elapsed,
+            .milliseconds(Generated.rigLoadSettleMs + Generated.pendingWindowMs) - .milliseconds(30)
+        )
+        let state = await model.snapshot()
+        XCTAssertEqual(state.navigation, Navigation())
+        XCTAssertEqual(state.aimedRigIndex, 13, "the device's position is the truth again")
+        XCTAssertEqual(stream.received, loadPair(999), "an index already sent is never re-sent")
+
+        await model.navigateTo(999)
+        let received = await stream.received(atLeast: 4)
+        XCTAssertEqual(received, loadPair(999) + loadPair(999), "a drop forgets the sent index")
+        await model.close()
+    }
+
+    /// The steppers compute in the flat index from the aim, and do nothing
+    /// before a position is known.
+    func testSteppersAimFromTheAimAndNeedAPosition() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        await model.stepRig(by: 1)
+        await model.stepBank(forward: true)
+        await model.selectSlot(3)
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(stream.received, [], "nothing to step from yet")
+        let idle = await model.snapshot()
+        XCTAssertEqual(idle.navigation, Navigation())
+
+        report(16, on: stream)  // bank 3, slot 2
+        await events.wait { $0.contains(.currentPosition(bank: 3, slot: 1)) }
+        await model.stepBank(forward: true)  // 21, sent at once
+        await model.stepRig(by: -1)  // 20, from the aim, not the position
+        await model.selectSlot(5)  // slot 5 of the aimed bank 4: 24
+        let state = await model.snapshot()
+        XCTAssertEqual(state.navigation, Navigation(aim: 24, inFlight: true))
+        let received = await stream.received(atLeast: 4)
+        XCTAssertEqual(received, loadPair(21) + loadPair(24))
+        // Stepping below zero floors at zero.
+        report(24, on: stream)
+        await events.wait { $0.contains(.navigationSettled(index: 24)) }
+        await model.stepRig(by: -100)
+        let floored = await model.snapshot()
+        XCTAssertEqual(floored.navigation.aim, 0)
+        await model.close()
+    }
+
+    /// Losing the stream forgets the aim without a drop; a load with no
+    /// stream is dropped at once.
+    func testAStreamLossClearsTheAimAndALoadWithNoStreamIsDropped() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let (events, _) = await attach(model)
+
+        await model.navigateTo(7)
+        let aimed = await model.snapshot()
+        XCTAssertEqual(aimed.navigation, Navigation(aim: 7, inFlight: true))
+        device.hangUpAll()
+        await events.wait { $0.contains(.disconnected) }
+        let state = await model.snapshot()
+        XCTAssertEqual(state.navigation, Navigation())
+        XCTAssertFalse(
+            events.all.contains { if case .navigationDropped = $0 { true } else { false } })
+
+        await model.navigateTo(8)
+        let seen = await events.wait {
+            $0.contains(.navigationDropped(index: 8, reason: .unconfirmed))
+        }
+        XCTAssertTrue(seen.contains(.navigationDropped(index: 8, reason: .unconfirmed)))
+        let after = await model.snapshot()
+        XCTAssertEqual(after.navigation, Navigation())
+        await model.close()
     }
 }

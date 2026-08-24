@@ -11,7 +11,10 @@ import Foundation
 /// ``DeviceModel`` and the CBOR tooling: any number of concurrent connections,
 /// each with the greeting, the protocol-selection ack (`+` only for a protocol
 /// in ``accepts``, `-` otherwise — the reserved GUID is offered and rejected,
-/// as on the device), the preamble, then the protocol's own traffic:
+/// as on the device), the preamble, then the protocol's own traffic. The
+/// greeting and the ack can be held back by ``Config/handshakeDelay``, or
+/// withheld altogether with ``Config/greets``, to stand in for a slow or a
+/// sulking device:
 ///
 /// - **MIDI3**: framed MIDI in both directions. Received messages are unframed
 ///   and recorded per connection; while ``answers`` is on, every request form
@@ -102,6 +105,14 @@ final class FakeDevice: @unchecked Sendable {
         var tailMessages: [[UInt8]] = []
         /// What a CBOR connection serves when the dump trigger arrives.
         var dumpItems: [CBORValue] = FakeDevice.defaultDump
+        /// How long a connection sits silent before the greeting, and again
+        /// before its answer to the protocol selection — a device that has
+        /// served a few sessions takes most of a second over each.
+        var handshakeDelay: TimeInterval = 0
+        /// Whether a connection greets at all. Off, it accepts and then holds
+        /// the socket open in silence until the client hangs up, as a device
+        /// poked inside its cooldown does.
+        var greets = true
 
         init(offerCbor: Bool) {
             offers = [Generated.protocolReserved, Generated.protocolMidi3Stream]
@@ -375,6 +386,12 @@ final class FakeConnection: @unchecked Sendable {
             if !wasClosed { close(fd) }
         }
 
+        guard config.greets else {
+            // Say nothing, and stay open until the client gives up.
+            while readChunk() != nil {}
+            return
+        }
+        pauseBeforeSpeaking()
         let greeting = config.offers.map { $0 + Generated.handshakeTerminator }.joined()
         write(Array((greeting + Generated.handshakeListEnd + Generated.handshakeTerminator).utf8))
 
@@ -382,6 +399,7 @@ final class FakeConnection: @unchecked Sendable {
         lock.lock()
         selectedName = name
         lock.unlock()
+        pauseBeforeSpeaking()
         guard config.accepts.contains(name) else {
             write(
                 Array((Generated.handshakeRejectPrefix + "NO" + Generated.handshakeTerminator).utf8)
@@ -411,6 +429,13 @@ final class FakeConnection: @unchecked Sendable {
         } else {
             serveMidi3(initial: buffer)
         }
+    }
+
+    /// The configured ``FakeDevice/Config/handshakeDelay``, on this
+    /// connection's own thread so nothing else is held up.
+    private func pauseBeforeSpeaking() {
+        guard config.handshakeDelay > 0 else { return }
+        Thread.sleep(forTimeInterval: config.handshakeDelay)
     }
 
     private func serveMidi3(initial: [UInt8]) {

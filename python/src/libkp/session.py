@@ -10,6 +10,14 @@ Sequence (documented from observed experimentation):
 5. For the streaming protocol the client then writes an 8-byte zero preamble and
    the framed stream begins.
 
+The two device replies in that sequence -- the greeting and the answer to the
+selection -- are each read at two speeds. A fresh device greets within a few
+milliseconds, but one that has served a few sessions has been measured taking
+most of a second (777 ms on one occasion) before its first greeting byte, so
+that first byte is waited for up to :data:`HANDSHAKE_TIMEOUT`. Once a reply has
+begun, its lines arrive back to back, and the short inter-chunk ``idle`` gap
+callers pass is enough to know it has ended.
+
 Connection spacing is enforced here, not by callers. The device tolerates
 concurrent sessions but not connection *churn*: it refuses to greet, or resets,
 a session opened too soon after another socket to it was opened or closed
@@ -45,6 +53,7 @@ __all__ = [
     "HANDSHAKE_TERMINATOR",
     "SESSION_PREAMBLE",
     "CONNECTION_COOLDOWN",
+    "HANDSHAKE_TIMEOUT",
     "HandshakeOutcome",
     "Session",
     "parse_protocol_list",
@@ -68,6 +77,15 @@ SESSION_PREAMBLE: bytes = b"\x00" * gen.SESSION_PREAMBLE_LEN
 
 #: Default connect timeout.
 CONNECT_TIMEOUT: float = float(gen.CONNECT_TIMEOUT_SECS)
+
+#: How long, in seconds, :meth:`Session.handshake` waits for the *first* byte
+#: of the greeting, and :meth:`Session.select_protocol` for the first byte of
+#: the device's answer. This is a different wait from the ``idle`` gap those
+#: methods also take: the gap only decides when a reply that has started is
+#: over, while this bounds how long the device may take to start one. A device
+#: that has served a few sessions can sit for most of a second before greeting,
+#: far longer than any inter-chunk gap, and connecting must not fail on that.
+HANDSHAKE_TIMEOUT: float = gen.HANDSHAKE_TIMEOUT_MS / 1000.0
 
 #: Minimum quiet gap, in seconds, between any two sockets to the same peer:
 #: one closing and the next opening, or one opening and another opening beside
@@ -321,32 +339,70 @@ class Session:
 
     # -- handshake ---------------------------------------------------------
 
-    async def select_protocol(self, name: str, resp_idle: float) -> bytes:
+    async def _read_reply(self, phase: str, timeout: float, idle: float) -> bytes:
+        """Read one handshake reply: wait up to ``timeout`` for its first byte,
+        then keep collecting until an ``idle`` gap with no data.
+
+        Built from the two read primitives rather than a third: :meth:`read_once`
+        is the wait for the device to *start* answering, and :meth:`read_available`
+        then gathers the rest of a reply that is already under way. Raises
+        :class:`TimeoutErrorLibKP` for ``phase``, reporting the full ``timeout``,
+        if the first byte never comes; a peer that hangs up instead raises
+        :class:`ConnectionClosedError` from the first read, while a hang-up after
+        the reply began just ends it, as it would any read.
+        """
+        first = await self.read_once(timeout, _GREETING_MAX)
+        if not first:
+            raise TimeoutErrorLibKP(phase, timeout)
+        if len(first) >= _GREETING_MAX:
+            return first
+        try:
+            rest = await self.read_available(idle, _GREETING_MAX - len(first))
+        except ConnectionClosedError:
+            rest = b""
+        return first + rest
+
+    async def select_protocol(
+        self, name: str, resp_idle: float, timeout: float = HANDSHAKE_TIMEOUT
+    ) -> bytes:
         """Send ``name`` + ``"\\r\\n"`` and read the device's response line.
 
-        Raises :class:`ProtocolRejectedError` if the response begins with ``-``.
+        Waits up to ``timeout`` for the response to begin and then until a
+        ``resp_idle`` gap for it to end. Raises :class:`ProtocolRejectedError`
+        if the response begins with ``-`` and :class:`TimeoutErrorLibKP` for the
+        ``"protocol selection"`` phase if no response comes at all.
         """
         await self.write_all(name.encode("ascii") + HANDSHAKE_TERMINATOR)
-        resp = await self.read_available(resp_idle, _GREETING_MAX)
+        resp = await self._read_reply("protocol selection", timeout, resp_idle)
         if resp[:1] == gen.HANDSHAKE_REJECT_PREFIX.encode("ascii"):
             raise ProtocolRejectedError(name, resp.decode("utf-8", "replace").strip())
         return resp
 
     async def handshake(
-        self, preferred: list[str] | tuple[str, ...] = (PROTOCOL_MIDI3_STREAM,), idle: float = 0.03
+        self,
+        preferred: list[str] | tuple[str, ...] = (PROTOCOL_MIDI3_STREAM,),
+        idle: float = 0.03,
+        timeout: float = HANDSHAKE_TIMEOUT,
     ) -> HandshakeOutcome:
         """Full handshake: read the greeting, pick the first ``preferred`` protocol
-        the device offers (falling back to its first offered), and select it."""
-        greeting = await self.read_available(idle, _GREETING_MAX)
+        the device offers (falling back to its first offered), and select it.
+
+        ``timeout`` bounds the wait for the first byte of the greeting, and again
+        of the selection response; ``idle`` is the quiet gap that ends each once
+        it has begun. Raises :class:`TimeoutErrorLibKP` for the ``"greeting"``
+        phase -- reporting ``timeout``, the wait actually made -- when the device
+        never greets, or greets with no protocol to choose.
+        """
+        greeting = await self._read_reply("greeting", timeout, idle)
         offered = parse_protocol_list(greeting)
 
         selected = next((p for p in preferred if p in offered), None)
         if selected is None:
             selected = offered[0] if offered else None
         if selected is None:
-            raise TimeoutErrorLibKP("greeting", idle)
+            raise TimeoutErrorLibKP("greeting", timeout)
 
-        response = await self.select_protocol(selected, idle)
+        response = await self.select_protocol(selected, idle, timeout)
         return HandshakeOutcome(
             greeting=greeting, offered=offered, selected=selected, response=response
         )

@@ -300,6 +300,13 @@ public enum DeviceEvent: Sendable, Equatable {
     /// A request at `address` (`page * 128 + number`, or the extended address)
     /// drew no reply inside ``Generated/requestTimeoutMs`` and was dropped.
     case requestTimedOut(address: UInt32)
+    /// The device reported the rig index the Navigator was aiming at; the aim
+    /// is retired and ``DeviceState/navigation`` is empty again.
+    case navigationSettled(index: UInt16)
+    /// The Navigator gave up on an aim: the device never confirmed it inside
+    /// ``Generated/pendingWindowMs`` of its move settling (an index past the
+    /// last rig, typically), or the stream was not open to send it.
+    case navigationDropped(index: UInt16, reason: NavDrop)
 }
 
 /// The result of applying one message to a ``DeviceState``: the granular events
@@ -418,15 +425,20 @@ struct DumpGuard: Sendable, Equatable {
 /// A cheap-to-copy bag of plain data. Callers read fields directly
 /// (`state.rig.name`, `state.effects[0].on`, …). The decode logic in
 /// ``apply(_:)`` and ``applyUpdate(_:)`` is pure: no IO, no clock, so tests
-/// drive it with synthesized messages and hand-built updates. `connection` and
-/// `channels` are the one part the model writes on its own, from what its
-/// sockets do rather than from anything the device sent.
+/// drive it with synthesized messages and hand-built updates. `connection`,
+/// `channels` and `navigation` are the one part the model writes on its own,
+/// from what its sockets and its Navigator do rather than from anything the
+/// device sent.
 public struct DeviceState: Sendable, Equatable {
     /// Whether the stream is up, and whether the control link is beside it.
     public var connection: Connection
     /// Where each of the two links is. `connection` summarises this; a client
     /// that wants to know *which* link is down reads it here.
     public var channels: Channels
+    /// What the Navigator has outstanding: the rig index last aimed at and not
+    /// yet confirmed by the device, and whether a load is in flight. Empty
+    /// whenever the device's own position is the whole truth.
+    public var navigation: Navigation
     /// The loaded rig's metadata and settings.
     public var rig: Rig
     /// The amplifier block.
@@ -459,6 +471,12 @@ public struct DeviceState: Sendable, Equatable {
         guard let currentBank, let currentRigSlot else { return nil }
         return currentBank * UInt16(Params.bankSlots) + currentRigSlot
     }
+    /// The flat rig index navigation steps *from*: the Navigator's outstanding
+    /// aim while it has one, otherwise ``currentRigIndex``. The device takes a
+    /// moment to report a move, so two taps inside that gap would both step
+    /// from the same stale index and the second would re-send the first one's
+    /// target; stepping from the aim makes them compose.
+    public var aimedRigIndex: UInt16? { navigation.aim ?? currentRigIndex }
     /// Latest morph position (0 = base, 16383 = fully morphed), once seen.
     ///
     /// Filled only by the control link — from the state dump it asks for on
@@ -472,11 +490,13 @@ public struct DeviceState: Sendable, Equatable {
     /// Dump-phase bookkeeping (``beginDump()``); never part of the snapshot.
     var dumpGuard = DumpGuard()
 
-    /// A fresh, empty state: disconnected with both links closed, no rig data,
-    /// all eight effect slots seeded in signal-chain order, zeroed meters.
+    /// A fresh, empty state: disconnected with both links closed, nothing
+    /// aimed, no rig data, all eight effect slots seeded in signal-chain
+    /// order, zeroed meters.
     public init() {
         connection = .disconnected
         channels = Channels()
+        navigation = Navigation()
         rig = Rig()
         amp = Amp()
         cabinet = Cabinet()

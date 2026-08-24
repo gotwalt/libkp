@@ -25,8 +25,10 @@
 //!
 //! Most callers want [`model::DeviceModel`] — the curated, state-consistent
 //! handle. Its commands split into **parameters** (NRPN-backed, tracked in
-//! state) and **actions** (CC-backed, momentary). The [`control`] module is the
-//! full raw CC vocabulary behind [`model::DeviceModel::send_control`].
+//! state), **actions** (CC-backed, momentary), and **navigation** — rig
+//! loads, which only the model's Navigator sends, one at a time, so that two
+//! can never overlap. The [`control`] module is the full raw CC vocabulary
+//! behind [`model::DeviceModel::send_control`], less the loads.
 //!
 //! ```no_run
 //! use std::net::Ipv4Addr;
@@ -38,6 +40,7 @@
 //! model.set_gain(8192).await?;          // a tracked parameter
 //! model.tap_tempo().await?;             // a momentary action
 //! model.send_control(Control::Freeze(true)).await?; // any raw control
+//! model.step_rig(1);                    // aim at the next rig; the Navigator loads it
 //! # Ok(())
 //! # }
 //! ```
@@ -74,7 +77,8 @@ pub use error::{DiscoverError, ParseError, SessionError};
 pub use midi3::Unframer;
 pub use model::{
     ApplyOutcome, Backoff, ChannelError, CommandError, ConnectOptions, ControlPolicy, DeviceEvent,
-    DeviceModel, RealtimeStatus, ReconnectPolicy, RequestError, SyncStrategy,
+    DeviceModel, NavAction, NavigatorState, RealtimeStatus, ReconnectPolicy, RequestError,
+    SyncStrategy,
 };
 pub use nrpn::{
     NrpnHeader, beacon, control_change, ext_decode, multi_values, parse_extended_string,
@@ -90,5 +94,5 @@ pub use session::{
 };
 pub use state::{
     Amp, Cabinet, Channel, ChannelState, Channels, Connection, Decoded, DeviceState, Effect,
-    Output, Phase, Rig, Tuner, Update,
+    NavDrop, Navigation, Output, Phase, Rig, Tuner, Update,
 };

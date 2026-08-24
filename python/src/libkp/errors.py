@@ -20,6 +20,7 @@ __all__ = [
     "CommandError",
     "DisconnectedError",
     "UnknownSlotError",
+    "RigLoadRequiresNavigatorError",
     "RequestError",
     "RequestDisconnectedError",
     "RequestTimeoutError",
@@ -169,6 +170,30 @@ class UnknownSlotError(CommandError):
     def __init__(self, slot: str) -> None:
         super().__init__(f"unknown effect slot {slot!r}; use A B C D X MOD DLY REV")
         self.slot = slot
+
+
+class RigLoadRequiresNavigatorError(CommandError):
+    """A command that would load a rig was refused before any byte was written.
+
+    Rig loads -- the up/down and slot-load Control Changes
+    (:data:`libkp._generated.RIG_LOAD_CONTROLLERS`), a Program Change, and the
+    Bank Select pair that only exists to qualify one -- go through the model's
+    Navigator alone (:meth:`~libkp.model.DeviceModel.navigate_to`,
+    :meth:`~libkp.model.DeviceModel.step_rig`,
+    :meth:`~libkp.model.DeviceModel.step_bank`,
+    :meth:`~libkp.model.DeviceModel.select_slot`), which serialises them so two
+    can never overlap on the wire: an overlapping load leaves the device on a
+    delayed fuse that only a power cycle clears. The bank preselect (CC47) loads
+    nothing and is not refused.
+    """
+
+    def __init__(self, what: str) -> None:
+        super().__init__(
+            f"{what} would load a rig; use the model's Navigator (navigate_to, "
+            f"step_rig, step_bank, select_slot) so loads cannot overlap"
+        )
+        #: What was refused, for the message.
+        self.what = what
 
 
 # ---------------------------------------------------------------------------

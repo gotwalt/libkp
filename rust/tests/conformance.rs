@@ -17,7 +17,7 @@ use serde_json::Value;
 use libkp::cbor::{self, Decoder};
 use libkp::control::{Control, ModuleSlot};
 use libkp::midi3::{Unframer, frame};
-use libkp::model::{ApplyOutcome, DeviceEvent, RealtimeStatus};
+use libkp::model::{ApplyOutcome, DeviceEvent, NavAction, NavigatorState, RealtimeStatus};
 use libkp::nrpn::{self, NrpnHeader};
 use libkp::params;
 use libkp::protocol::{TagStream, build_poll_request};
@@ -744,6 +744,94 @@ fn state_apply_vectors() {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// navigation.json
+// ---------------------------------------------------------------------------
+
+/// The vector's spelling of a [`NavAction`], as `expect.actions` lists them.
+fn action_name(action: &NavAction) -> String {
+    match action {
+        NavAction::Send(index) => format!("send:{index}"),
+        NavAction::StartSettle => "start_settle".to_string(),
+        NavAction::StartWindow => "start_window".to_string(),
+        NavAction::Settled(index) => format!("settled:{index}"),
+        NavAction::Dropped(index) => format!("dropped:{index}"),
+    }
+}
+
+/// Drive one step of a navigation case: a `navigate` or `position` carries
+/// the index, a `settle` or `window` is the timer firing.
+fn run_nav_step(machine: &mut NavigatorState, step: &Value) -> Vec<NavAction> {
+    let obj = step.as_object().expect("a step is an object");
+    assert_eq!(obj.len(), 1, "a step names exactly one entry point: {step}");
+    let (kind, arg) = obj.iter().next().unwrap();
+    let index = || arg.as_u64().expect("a rig index") as u16;
+    let fired = || assert_eq!(arg.as_bool(), Some(true), "a timer step is `true`");
+    match kind.as_str() {
+        "navigate" => machine.navigate(index()),
+        "position" => machine.position(index()),
+        "settle" => {
+            fired();
+            machine.settle_elapsed()
+        }
+        "window" => {
+            fired();
+            machine.window_elapsed()
+        }
+        other => panic!("unknown navigation step {other:?}"),
+    }
+}
+
+/// The Navigator's state machine, transition for transition: the exact,
+/// ordered actions every step produces, the wire log of sends, and where
+/// the machine ends up.
+#[test]
+fn navigation_vectors() {
+    let doc = vector("navigation.json");
+    for c in cases(&doc, "cases") {
+        let name = str_of(c, "name");
+        let mut machine = NavigatorState::default();
+        let actions: Vec<NavAction> = cases(c, "steps")
+            .iter()
+            .flat_map(|step| run_nav_step(&mut machine, step))
+            .collect();
+        let expect = &c["expect"];
+
+        let got: Vec<String> = actions.iter().map(action_name).collect();
+        let want: Vec<&str> = cases(expect, "actions")
+            .iter()
+            .map(|a| a.as_str().expect("action name"))
+            .collect();
+        assert_eq!(got, want, "[{name}] actions");
+
+        let sent: Vec<u16> = actions
+            .iter()
+            .filter_map(|a| match a {
+                NavAction::Send(index) => Some(*index),
+                _ => None,
+            })
+            .collect();
+        let want_sent: Vec<u16> = cases(expect, "sent")
+            .iter()
+            .map(|i| i.as_u64().expect("a sent index") as u16)
+            .collect();
+        assert_eq!(sent, want_sent, "[{name}] sent");
+
+        let aim = expect["aim"].as_u64().map(|i| i as u16);
+        assert_eq!(machine.aim, aim, "[{name}] aim");
+        assert_eq!(
+            machine.in_flight,
+            expect["in_flight"].as_bool().expect("in_flight"),
+            "[{name}] in_flight"
+        );
+        assert_eq!(
+            machine.awaiting,
+            expect["awaiting"].as_bool().expect("awaiting"),
+            "[{name}] awaiting"
+        );
     }
 }
 

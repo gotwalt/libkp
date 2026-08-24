@@ -82,6 +82,14 @@ class StreamLink:
         """Queue one raw (pre-framing) MIDI message for the writer."""
         await self._commands.put(message)
 
+    def send_nowait(self, message: bytes) -> None:
+        """Queue one message without waiting, for a caller that cannot -- the
+        Navigator's timers fire in plain callbacks. Raises
+        :class:`asyncio.QueueFull` when the writer is
+        :data:`COMMAND_QUEUE_DEPTH` messages behind, which is a socket that
+        has stopped taking bytes, not a burst of commands."""
+        self._commands.put_nowait(message)
+
     async def close(self) -> None:
         """Stop both tasks and close the socket. Idempotent."""
         if self._closed:

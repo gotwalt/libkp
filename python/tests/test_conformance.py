@@ -13,6 +13,7 @@ from conftest import VECTORS_DIR, vector
 
 from libkp import _generated as gen
 from libkp import cbor, control, midi3, nrpn, params, protocol
+from libkp._nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
 from libkp.state import (
     ApplyOutcome,
     Channel,
@@ -36,7 +37,17 @@ def test_spec_version_matches():
 def test_every_vector_file_is_covered():
     """Guard against a new vector file landing without a test for it."""
     present = {p.stem for p in VECTORS_DIR.glob("*.json")}
-    covered = {"u14", "discovery", "midi3", "nrpn", "controls", "params", "state", "cbor"}
+    covered = {
+        "u14",
+        "discovery",
+        "midi3",
+        "nrpn",
+        "controls",
+        "params",
+        "state",
+        "cbor",
+        "navigation",
+    }
     assert present == covered, f"uncovered vector files: {sorted(present - covered)}"
 
 
@@ -441,3 +452,52 @@ def test_cbor_extract_snapshot(case):
     if "strings" in expect:
         want = [(s["addr"], s["text"]) for s in expect["strings"]]
         assert snap.strings == want
+
+
+# ---------------------------------------------------------------------------
+# navigation.json
+# ---------------------------------------------------------------------------
+
+
+def _nav_action_name(action: NavAction) -> str:
+    """The vectors name actions ``send:14`` / ``start_settle`` / ``start_window``
+    / ``settled:14`` / ``dropped:99``."""
+    if isinstance(action, Send):
+        return f"send:{action.index}"
+    if isinstance(action, StartSettle):
+        return "start_settle"
+    if isinstance(action, StartWindow):
+        return "start_window"
+    if isinstance(action, Settled):
+        return f"settled:{action.index}"
+    if isinstance(action, Dropped):
+        return f"dropped:{action.index}"
+    raise AssertionError(f"unknown action {action!r}")
+
+
+def _nav_step(machine: NavigatorState, step: dict) -> list[NavAction]:
+    """Drive one ``steps`` entry: an aim, a timer expiry, or a position report."""
+    ((kind, arg),) = step.items()
+    if kind == "navigate":
+        return machine.navigate(arg)
+    if kind == "settle":
+        return machine.settle_elapsed()
+    if kind == "window":
+        return machine.window_elapsed()
+    if kind == "position":
+        return machine.position(arg)
+    raise AssertionError(f"unknown step kind {kind!r}")
+
+
+@pytest.mark.parametrize("case", vector("navigation")["cases"], ids=lambda c: c["name"])
+def test_navigation_state_machine(case):
+    """A fresh machine through the steps: the actions are exact and ordered,
+    the sent list is the wire log, and the final state is pinned."""
+    machine = NavigatorState()
+    actions = [action for step in case["steps"] for action in _nav_step(machine, step)]
+    expect = case["expect"]
+    assert [_nav_action_name(a) for a in actions] == expect["actions"]
+    assert [a.index for a in actions if isinstance(a, Send)] == expect["sent"]
+    assert machine.aim == expect["aim"]
+    assert machine.in_flight is expect["in_flight"]
+    assert machine.awaiting is expect["awaiting"]

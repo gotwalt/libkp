@@ -251,3 +251,75 @@ final class SessionCooldownTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(closedAt.duration(to: accepts[1]), cooldown - .milliseconds(20))
     }
 }
+
+// MARK: - The handshake's wait for a slow device
+
+/// The greeting and the selection reply are each given ``Session/handshakeTimeout``
+/// to begin, not just the inter-segment `idle` gap; these pin that against a
+/// fake that dawdles and one that never speaks.
+final class SessionHandshakeTests: XCTestCase {
+    private let host = "127.0.0.1"
+    /// The inter-segment gap the model uses on the stream, well under the
+    /// delays below.
+    private let idle: TimeInterval = 0.03
+
+    /// A device that takes ten idle gaps to greet — and as long again to
+    /// acknowledge the selection — still completes the handshake, because each
+    /// line's first byte is waited for on the handshake budget.
+    func testASlowGreetingStillHandshakes() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.handshakeDelay = 0.3 }
+
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        defer { session.close() }
+        let started = ContinuousClock.Instant.now
+        let outcome = try await session.handshake(
+            preferred: [Session.protocolMidi3Stream], idle: idle)
+        let elapsed = started.duration(to: .now)
+
+        XCTAssertEqual(outcome.selected, Session.protocolMidi3Stream)
+        XCTAssertEqual(
+            outcome.offered, [Generated.protocolReserved, Session.protocolMidi3Stream])
+        XCTAssertEqual(
+            outcome.response.first, Array(Generated.handshakeAcceptPrefix.utf8).first)
+        XCTAssertEqual(
+            String(decoding: outcome.response, as: UTF8.self),
+            Generated.handshakeAcceptPrefix + Session.protocolMidi3Stream
+                + Generated.handshakeTerminator)
+        // Two delayed lines, and the wait was for them rather than a timeout.
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(600) - .milliseconds(20))
+        XCTAssertLessThan(elapsed, .seconds(Session.handshakeTimeout))
+    }
+
+    /// A device that never greets fails with the greeting timeout, after the
+    /// budget it was given and reporting that budget — shortened here so the
+    /// test does not sit out the real two seconds.
+    func testADeviceThatNeverGreetsTimesOut() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.greets = false }
+
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        defer { session.close() }
+        let started = ContinuousClock.Instant.now
+        do {
+            _ = try await session.handshake(
+                preferred: [Session.protocolMidi3Stream], idle: idle, greetingTimeout: 0.2)
+            XCTFail("a silent device must not complete the handshake")
+        } catch SessionError.timeout(let phase, let ms) {
+            XCTAssertEqual(phase, "greeting")
+            XCTAssertEqual(ms, 200)
+        }
+        let elapsed = started.duration(to: .now)
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(200) - .milliseconds(20))
+        XCTAssertLessThan(elapsed, .seconds(1))
+    }
+
+    /// The default budget is the generated constant, so the library and the
+    /// spec agree on how patient a connect is.
+    func testTheDefaultBudgetIsTheSpecConstant() {
+        XCTAssertEqual(Session.handshakeTimeout, 2.0)
+        XCTAssertEqual(UInt64(Session.handshakeTimeout * 1000), Generated.handshakeTimeoutMs)
+    }
+}

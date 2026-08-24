@@ -47,6 +47,8 @@ __all__ = [
     "Connection",
     "ChannelState",
     "Channels",
+    "Navigation",
+    "NavDrop",
     "RealtimeStatus",
     "Rig",
     "Amp",
@@ -72,6 +74,8 @@ __all__ = [
     "TunerNote",
     "RenderedString",
     "CurrentPosition",
+    "NavigationSettled",
+    "NavigationDropped",
     "Connected",
     "Disconnected",
     "ConnectionChanged",
@@ -132,6 +136,37 @@ class Channels:
     stream: ChannelState = ChannelState.CLOSED
     #: The CBOR control channel: the state dump and the morph position.
     control: ChannelState = ChannelState.CLOSED
+
+
+@dataclass(slots=True)
+class Navigation:
+    """Where the model's Navigator is between the client's aim and the device.
+
+    The Navigator (:meth:`libkp.model.DeviceModel.navigate_to` and its
+    siblings) is the only way libkp loads a rig: it serialises loads so two
+    can never overlap on the wire, which is what wedges the device. This is
+    its public face -- enough for a UI to highlight the slot a client tapped
+    before the device confirms it.
+    """
+
+    #: The flat, 0-based rig index the client is aiming at, until the device
+    #: reports it as the current position (then ``None``) or never does and
+    #: the aim is dropped (:class:`NavigationDropped`).
+    aim: int | None = None
+    #: Whether a load is on the wire and inside its settle
+    #: (:data:`libkp._generated.RIG_LOAD_SETTLE_MS`), during which a new aim
+    #: waits.
+    in_flight: bool = False
+
+
+class NavDrop(Enum):
+    """Why the Navigator gave up on an aim."""
+
+    #: The device never reported the aim as its position inside
+    #: :data:`libkp._generated.PENDING_WINDOW_MS` of the move settling -- an
+    #: index past the last rig, typically, where the device stays put and says
+    #: so. Also the reason when the stream was down at the moment of the send.
+    UNCONFIRMED = "unconfirmed"
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +531,28 @@ class CurrentPosition(DeviceEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class NavigationSettled(DeviceEvent):
+    """The device reported the Navigator's aim as its current position: the
+    load landed, and :attr:`DeviceState.navigation` has no aim."""
+
+    #: The flat, 0-based rig index that was aimed at and confirmed.
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationDropped(DeviceEvent):
+    """The Navigator gave up on an aim the device never confirmed.
+
+    :attr:`DeviceState.navigation` has no aim, and
+    :attr:`DeviceState.current_rig_index` is where the device actually is.
+    """
+
+    #: The flat, 0-based rig index that was aimed at.
+    index: int
+    reason: NavDrop
+
+
+@dataclass(frozen=True, slots=True)
 class Connected(DeviceEvent):
     """The model connected to a device."""
 
@@ -683,6 +740,8 @@ class DeviceState:
     reconnect_attempt: int = 0
     #: The state of each of the model's two sockets.
     channels: Channels = field(default_factory=Channels)
+    #: The Navigator's aim and whether a rig load is in flight.
+    navigation: Navigation = field(default_factory=Navigation)
     #: The loaded rig's metadata and settings.
     rig: Rig = field(default_factory=Rig)
     #: The amplifier block.
@@ -720,6 +779,18 @@ class DeviceState:
         if self.current_bank is None or self.current_rig_slot is None:
             return None
         return self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
+
+    @property
+    def aimed_rig_index(self) -> int | None:
+        """Where the Navigator is headed: its aim while it has one, else
+        :attr:`current_rig_index`.
+
+        The index a UI's rig browser should highlight, and what
+        :meth:`libkp.model.DeviceModel.step_rig` steps from -- so a burst of
+        taps counts from the last tap, not from wherever the device has got to.
+        """
+        aim = self.navigation.aim
+        return aim if aim is not None else self.current_rig_index
 
     #: Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
     #: ``0x00/0x77``). Filled only from the CBOR control channel -- its state

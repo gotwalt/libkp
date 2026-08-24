@@ -56,7 +56,7 @@ let replies = port.poll(&libkp::Options::default()).await?;
 | `generated` | **Data only** — constants and lookup tables emitted from the shared `spec/` by `codegen/generate.py`. Never edited by hand. |
 | `protocol` | The tag-stream wire encoding and the `DSCV` discovery poll packet. |
 | `discovery` | Async UDP broadcast discovery (`DiscoveryPort`, `discover`, `find_first`). |
-| `session` | TCP connect, the protocol-list handshake, and the stream preamble. Every open passes the process-wide connection ledger, which waits out `CONNECTION_COOLDOWN` since the last open or close to the same device. |
+| `session` | TCP connect, the protocol-list handshake, and the stream preamble. Every open passes the process-wide connection ledger, which waits out `CONNECTION_COOLDOWN` since the last open or close to the same device. The handshake gives the greeting, and then the selection reply, `HANDSHAKE_TIMEOUT` (2 s) to *begin* — a device that has served a few sessions can take most of a second to send its first byte — and only the short idle gap between chunks once it has. |
 | `midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
 | `cbor` | The native CBOR channel: codec, and the one open-and-ingest path the model's control link is built on. `StateSnapshot::fetch` (a one-shot read of the current bank/rig/morph) and `CborSession` (a live raw feed) are tools on the same path for reading the channel on its own. |
 | `nrpn` | Kemper SysEx/NRPN builders and parsers (14-bit values, string tags, extended strings, the beacon). |
@@ -65,7 +65,7 @@ let replies = port.poll(&libkp::Options::default()).await?;
 | `registry` | Typed descriptors (`ParamKind`, `format_value`) layered over `params`. |
 | `state` | The immutable `DeviceState` tree — rig, amp, cabinet, eight effect slots, tuner, output, morph, meters — and its decoders: `apply` (one MIDI3 message), `apply_cbor` / `apply_cbor_text` (one CBOR item), each a thin front on the fold. |
 | `routes` | The state routing fold: `DeviceState::apply_update`, the one funnel every value passes through whichever wire carried it, driven by the generated `STATE_ROUTES` table (`spec/state.toml`) — which addresses are tracked, which channel may write them, how they decode, whether a repeat is a no-op. |
-| `model` | `DeviceModel`, the async observable store: the only object that holds a socket to the device. Owns the MIDI3 stream (ingest, writer, the request lane) and the CBOR control link, feeds both into the one funnel, and supervises connect, loss and reconnect. |
+| `model` | `DeviceModel`, the async observable store: the only object that holds a socket to the device. Owns the MIDI3 stream (ingest, writer, the request lane) and the CBOR control link, feeds both into the one funnel, supervises connect, loss and reconnect, and holds the Navigator — the one way a rig is loaded (`model::nav`). |
 | `error` | `DiscoverError`, `SessionError`, `ParseError`. |
 | `fmt` | Small hex/ASCII formatting helpers. |
 
@@ -131,12 +131,50 @@ or `close()`, closes both links and raises `Disconnected`.
   retried). At most `MAX_IN_FLIGHT_REQUESTS` (16) are on the wire at once; the
   rest queue. The morph position is `Unreadable` over the stream and is
   refused without sending.
-- **Actions** (`tap_tempo`, `rig_up`, `select_rig`, `tuner_mode`, …) go out as
-  7-bit Control Changes. They are momentary and carry no read-back, so they are
-  not reflected in state.
+- **Actions** (`tap_tempo`, `tuner_mode`, `bank`, the buttons and pedals, …)
+  go out as 7-bit Control Changes. They are momentary and carry no read-back,
+  so they are not reflected in state.
 
 `set_param`, `send_control` and `send_raw` are the escape hatches for any
-address, any raw control, or any MIDI bytes at all.
+address, any raw control, or any MIDI bytes at all — all but a rig load, which
+only the Navigator sends.
+
+### The Navigator
+
+A rig load makes the device replay its whole parameter tree, and two loads
+close together (8 ms apart is enough) wedge it on a delayed fuse: it answers
+the first normally, closes the session some twenty seconds later, and stops
+accepting connections until it is power cycled. So libkp never sends a load
+directly. A caller *aims*:
+
+```rust,no_run
+# use libkp::model::DeviceModel;
+# fn run(model: &DeviceModel) {
+model.navigate_to(14);      // a flat, 0-based rig index: bank 3, slot 5
+model.step_rig(1);          // the next rig, from wherever the aim (or the device) is
+model.step_bank(false);     // the same slot a bank down
+model.select_slot(2);       // slot 2 of the bank the aim is in
+# }
+```
+
+Each returns at once. The aim lands in `state.navigation.aim` immediately, so
+a slot highlight answers every tap, and `state.aimed_rig_index()` — the aim
+while there is one, the device's own position otherwise — is the readout to
+bind and to step from. The Navigator sends one load at a time — the bank
+preselect (CC47) and the slot load (CC50–54), the documented pair — and the
+next only `RIG_LOAD_SETTLE_MS` (500 ms) after the last, so a burst of taps
+costs two loads however long it is. A position report that matches the aim,
+on either wire, retires it with `DeviceEvent::NavigationSettled`; an aim the
+device never confirms (one past the end of its rigs — it stays put and says
+so) is dropped after `PENDING_WINDOW_MS` (1.5 s) with
+`DeviceEvent::NavigationDropped`. `send_control` and `send_raw` refuse the
+load controllers (`RIG_LOAD_CONTROLLERS`), Program Change and Bank Select
+with `CommandError::RigLoadRequiresNavigator` before a byte goes out; the
+bare preselect (`bank`) still passes, since it loads nothing.
+
+The state machine behind this, `model::nav::NavigatorState`, is pure and
+pinned by `spec/vectors/navigation.json`, so the Rust, Python and Swift
+Navigators make exactly the same moves.
 
 ## The `meters` example
 
@@ -151,7 +189,8 @@ cargo run --example meters -- --ip 192.168.1.50
 cargo run --example meters -- --all --width 60 # all 11 raw realtime fields
 ```
 
-Ctrl-C quits and restores the terminal.
+`←`/`→` step to the previous or next rig through the Navigator; Ctrl-C quits
+and restores the terminal.
 
 ## Tests
 
@@ -162,7 +201,8 @@ cargo test
 `tests/model.rs` drives `DeviceModel` against the fake device in
 `tests/common/mod.rs` — a multi-connection, protocol-aware stand-in that
 answers requests from value tables, serves a CBOR dump on the trigger, and
-can hang up either link — through connect, the dump, the request lane, loss,
+can hang up either link — through connect, the dump, the request lane, the
+Navigator (a burst of taps is two loads on the wire, a settle apart), loss,
 reconnect, close and drop. The fake takes an ephemeral port, so the
 connection ledger only ever spaces a model's own second socket.
 

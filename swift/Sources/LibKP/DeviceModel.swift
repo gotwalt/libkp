@@ -44,6 +44,13 @@ import Foundation
 /// - **Actions** (verbs) — momentary presses and live expression that carry no
 ///   stored value. They go out as 7-bit Control Change messages via ``Control``
 ///   and are *not* reflected in state.
+/// - **Navigation** (``navigateTo(_:)``, ``stepRig(by:)``, ``stepBank(forward:)``,
+///   ``selectSlot(_:)``) — the one way to load a rig. Every load goes through
+///   the model's Navigator (see Navigator.swift), which serialises them so two
+///   can never overlap on the wire; the direct routes — ``Control/loadSlot(_:)``,
+///   ``Control/up``, ``Control/down``, a Program Change — are refused with
+///   ``CommandError/rigLoadRequiresNavigator``. The outstanding aim is
+///   ``DeviceState/navigation``.
 public actor DeviceModel {
     /// Product byte addressed in outbound SysEx (0x00 = Profiler).
     public static let product: UInt8 = Generated.productProfiler
@@ -102,6 +109,14 @@ public actor DeviceModel {
     var inFlight = 0
     var laneWaiters: [CheckedContinuation<Bool, Never>] = []
 
+    // The Navigator (see Navigator.swift): the machine, and its two timers,
+    // each armed under a serial so a superseded one cannot call back in.
+    var navigator = NavigatorState()
+    var navSettleTask: Task<Void, Never>?
+    var navSettleSerial = 0
+    var navWindowTask: Task<Void, Never>?
+    var navWindowSerial = 0
+
     init(host: String, port: UInt16, options: ConnectOptions) {
         self.host = host
         self.port = port
@@ -116,7 +131,10 @@ public actor DeviceModel {
     deinit {
         stream?.close()
         control?.close()
-        for task in [controlIngestTask, syncTask, settleTask, reopenTask, reconnectTask] {
+        for task in [
+            controlIngestTask, syncTask, settleTask, reopenTask, reconnectTask, navSettleTask,
+            navWindowTask,
+        ] {
             task?.cancel()
         }
         for (_, continuation) in eventContinuations { continuation.finish() }
@@ -261,44 +279,57 @@ public actor DeviceModel {
     // MARK: - Actions (CC, momentary, NOT stored in state)
 
     /// Send an arbitrary ``Control`` on the command channel.
+    ///
+    /// The ones that load a rig — ``Control/loadSlot(_:)``, ``Control/up``,
+    /// ``Control/down``, ``Control/programChange(_:)`` and
+    /// ``Control/bankSelect(msb:lsb:)`` — are refused with
+    /// ``CommandError/rigLoadRequiresNavigator`` before anything is written:
+    /// a load that overlaps another wedges the device, and only the
+    /// Navigator (``navigateTo(_:)`` and its steppers) can keep them apart.
     public func send(control: Control) async throws {
-        try await write(control.message(channel: DeviceModel.ccChannel))
+        switch control {
+        case .loadSlot, .up, .down, .programChange, .bankSelect:
+            throw CommandError.rigLoadRequiresNavigator
+        default:
+            try await write(control.message(channel: DeviceModel.ccChannel))
+        }
     }
 
     /// Frame and write raw (pre-framing) MIDI bytes to the device, exactly as
-    /// given. The escape hatch under every command here; nothing is refused
-    /// yet.
+    /// given — the escape hatch under every command here, with one refusal: a
+    /// Program Change (status `0xC0`–`0xCF`), or a Control Change whose
+    /// controller is one of ``Generated/rigLoadControllers``, is a rig load
+    /// and throws ``CommandError/rigLoadRequiresNavigator`` before any byte
+    /// is written. The bank preselect (CC47) loads nothing and passes.
     public func sendRaw(_ midi: [UInt8]) async throws {
+        guard !DeviceModel.loadsARig(midi) else { throw CommandError.rigLoadRequiresNavigator }
         try await write(midi)
     }
 
-    /// Select rig slot 1–5 in the current bank (CC50–54).
-    public func selectRig(_ slot: UInt8) async throws { try await send(control: .loadSlot(slot)) }
-
-    /// Step to the next rig (CC48).
-    public func rigUp() async throws { try await send(control: .up) }
-    /// Step to the previous rig (CC49).
-    public func rigDown() async throws { try await send(control: .down) }
-    /// Preselect bank `n` (1-based; CC47).
-    public func bank(_ n: UInt16) async throws {
-        try await send(control: .bankPreselect(UInt8(truncatingIfNeeded: max(n, 1) - 1)))
+    /// Whether raw MIDI carries a rig load anywhere in it. Data bytes are
+    /// below `0x80`, so every byte at or above it is a status byte, and a
+    /// Control Change's controller is the byte after its status.
+    static func loadsARig(_ midi: [UInt8]) -> Bool {
+        for (i, byte) in midi.enumerated() where byte >= 0x80 {
+            switch byte & 0xF0 {
+            case Generated.programChangeStatus:
+                return true
+            case Generated.controlChangeStatus:
+                if i + 1 < midi.count, Generated.rigLoadControllers.contains(midi[i + 1]) {
+                    return true
+                }
+            default:
+                continue
+            }
+        }
+        return false
     }
 
-    /// Load a rig by its flat, 0-based index — the device's own numbering, and
-    /// the only address that reaches a rig outside the current bank.
-    ///
-    /// Sent as the documented pair: the absolute bank preselect (CC47) followed
-    /// by the slot load (CC50–54) that commits it. The index divides by
-    /// ``Params/bankSlots``, so index 123 is bank 25, slot 4.
-    ///
-    /// Nothing here assumes how many banks a device has. Aim past the end and
-    /// the device simply stays where it is — and says so in the `$06` position
-    /// push that follows, so ``DeviceState/currentRigIndex`` always reflects
-    /// where it actually landed, not where this aimed.
-    public func selectRigIndex(_ index: UInt16) async throws {
-        let slots = UInt16(Params.bankSlots)
-        try await bank(index / slots + 1)
-        try await selectRig(UInt8(index % slots) + 1)
+    /// Preselect bank `n` (1-based; CC47). A preselect alone loads nothing —
+    /// the device waits for the slot load that commits it, which only the
+    /// Navigator sends — so this is the one bank control that passes.
+    public func bank(_ n: UInt16) async throws {
+        try await send(control: .bankPreselect(UInt8(truncatingIfNeeded: max(n, 1) - 1)))
     }
     /// Tap the tempo (CC30).
     public func tapTempo() async throws { try await send(control: .tapTempo) }

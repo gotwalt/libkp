@@ -18,8 +18,10 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{broadcast, oneshot};
 
 use super::{ControlPolicy, DeviceEvent, RealtimeStatus};
+use crate::generated;
 use crate::state::{
-    Channel, ChannelState, Connection, Decoded, DeviceState, StreamMessage, Update, decode_stream,
+    Channel, ChannelState, Connection, Decoded, DeviceState, Navigation, StreamMessage, Update,
+    decode_stream,
 };
 
 /// What a pending request is waiting for.
@@ -158,10 +160,10 @@ impl Core {
     /// Fold one chunk of updates from either link: every update through the
     /// funnel under one lock, every event broadcast, and — if any slow field
     /// moved — exactly one snapshot. Then settle whatever requests the chunk
-    /// answered.
-    pub(crate) fn apply_updates(&self, epoch: u64, updates: &[Update]) {
+    /// answered. Returns the positions the chunk reported, for the Navigator.
+    pub(crate) fn apply_updates(&self, epoch: u64, updates: &[Update]) -> Vec<u16> {
         if !self.current(epoch) || updates.is_empty() {
-            return;
+            return Vec::new();
         }
         let mut events = Vec::new();
         let mut slow = false;
@@ -175,12 +177,13 @@ impl Core {
         }
         self.publish(&events, slow);
         self.settle_updates(updates);
+        positions(&events)
     }
 
     /// Fold one read chunk of unframed stream messages, the same way.
-    pub(crate) fn apply_messages(&self, epoch: u64, msgs: &[Vec<u8>]) {
+    pub(crate) fn apply_messages(&self, epoch: u64, msgs: &[Vec<u8>]) -> Vec<u16> {
         if !self.current(epoch) || msgs.is_empty() {
-            return;
+            return Vec::new();
         }
         let decoded: Vec<StreamMessage> = msgs.iter().map(|m| decode_stream(m)).collect();
         let mut events = Vec::new();
@@ -214,6 +217,7 @@ impl Core {
         self.publish(&events, slow);
         self.settle_updates(&updates);
         self.settle_rendered(&events);
+        positions(&events)
     }
 
     /// Broadcast the events of one chunk, then its one snapshot if a slow
@@ -311,6 +315,8 @@ impl Core {
                 });
             }
             st.end_dump();
+            // No wire, no aim: the Navigator forgets its own, and says nothing.
+            st.navigation = Navigation::default();
             events.extend(self.transition(&mut st, next));
         }
         self.fail_pending();
@@ -413,11 +419,38 @@ impl Core {
                 }
             }
             st.end_dump();
+            st.navigation = Navigation::default();
             events.extend(self.transition(&mut st, Connection::Disconnected));
         }
         self.fail_pending();
         if !events.is_empty() {
             self.publish(&events, true);
+        }
+    }
+
+    // ---- the Navigator's mirror -------------------------------------------
+
+    /// The Navigator moved: mirror its `{aim, in_flight}` into the snapshot
+    /// and raise the events its transition produced. The mirror is a slow
+    /// field — a UI binds the aim — so a change to it republishes; the events
+    /// go out either way, before the snapshot, like every other chunk's.
+    pub(crate) fn set_navigation(
+        &self,
+        epoch: u64,
+        navigation: Navigation,
+        events: Vec<DeviceEvent>,
+    ) {
+        if !self.current(epoch) {
+            return;
+        }
+        let slow = {
+            let mut st = self.write();
+            let changed = st.navigation != navigation;
+            st.navigation = navigation;
+            changed
+        };
+        if slow || !events.is_empty() {
+            self.publish(&events, slow);
         }
     }
 
@@ -576,4 +609,21 @@ impl Core {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+}
+
+/// The flat rig indices a chunk's [`DeviceEvent::CurrentPosition`] events
+/// carry, in order — every one whose two halves are both known. The
+/// Navigator is told each of them: only a report equal to its aim means
+/// anything to it, and it is the one to judge that.
+fn positions(events: &[DeviceEvent]) -> Vec<u16> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DeviceEvent::CurrentPosition {
+                bank: Some(bank),
+                slot: Some(slot),
+            } => Some(bank * generated::BANK_SLOTS as u16 + slot),
+            _ => None,
+        })
+        .collect()
 }

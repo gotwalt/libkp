@@ -43,6 +43,33 @@ Parameters, requests and actions
 - **Actions** (verbs) — momentary presses and live expression that carry no
   stored value. They go out as 7-bit Control Change messages from the
   :mod:`libkp.control` vocabulary and are *not* reflected in state.
+- **Navigation** (:meth:`DeviceModel.navigate_to`, :meth:`DeviceModel.step_rig`,
+  :meth:`DeviceModel.step_bank`, :meth:`DeviceModel.select_slot`) — the one
+  way to load a rig, described below.
+
+The Navigator
+-------------
+
+A rig load is the one command that can wedge the device: a second load
+arriving while the first is still landing leaves it on a delayed fuse that
+only a power cycle clears. So nothing in libkp sends a load directly --
+:meth:`DeviceModel.send_control` and :meth:`DeviceModel.send_raw` refuse one
+with :class:`~libkp.errors.RigLoadRequiresNavigatorError` before a byte is
+written -- and a client *aims* instead. The Navigator serialises the loads:
+the first aim goes out at once as the documented pair (the bank preselect,
+CC47, then the slot load, CC50-54, that commits it) and is *in flight* for
+:data:`libkp._generated.RIG_LOAD_SETTLE_MS`; every aim that arrives meanwhile
+only moves the target, and when the settle elapses the final target is sent,
+once. A burst of taps therefore costs two loads however long it is. The device
+reports its position on both wires as it lands, and a report that matches the
+aim retires it (:class:`~libkp.state.NavigationSettled`); an aim it never
+confirms -- one past the last rig, where it stays put and says so -- is
+dropped :data:`libkp._generated.PENDING_WINDOW_MS` after its move settled
+(:class:`~libkp.state.NavigationDropped`). The settle is never shortened by an
+early report: it is the measured time the device needs, not a guess.
+:attr:`~libkp.state.DeviceState.navigation` shows the aim and whether a move
+is in flight, and :attr:`~libkp.state.DeviceState.aimed_rig_index` is where
+the client is headed -- the slot a rig browser should highlight.
 
 The two links
 -------------
@@ -78,6 +105,7 @@ from . import control as control_mod
 from ._broadcast import Broadcast as _Broadcast
 from ._lane import RequestLane
 from ._link import StreamLink
+from ._nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
 from .cbor import ControlItem, ControlLink
 from .control import Control
 from .errors import (
@@ -90,6 +118,7 @@ from .errors import (
     RequestError,
     RequestTimeoutError,
     RequestUnreadableError,
+    RigLoadRequiresNavigatorError,
     SessionError,
     UnknownSlotError,
 )
@@ -103,9 +132,14 @@ from .state import (
     Connected,
     Connection,
     ConnectionChanged,
+    CurrentPosition,
     DeviceEvent,
     DeviceState,
     Disconnected,
+    NavDrop,
+    Navigation,
+    NavigationDropped,
+    NavigationSettled,
     Num,
     Phase,
     RealtimeStatus,
@@ -141,6 +175,25 @@ CC_CHANNEL: int = 0
 DUMP_SETTLE: float = gen.DUMP_SETTLE_MS / 1000.0
 #: The least time between two control opens, in seconds.
 CONTROL_REOPEN_MIN_GAP: float = gen.CONTROL_REOPEN_MIN_GAP_MS / 1000.0
+#: How long a rig load is in flight after it is sent, in seconds.
+RIG_LOAD_SETTLE: float = gen.RIG_LOAD_SETTLE_MS / 1000.0
+#: How long after its move settled an unconfirmed aim is kept, in seconds.
+PENDING_WINDOW: float = gen.PENDING_WINDOW_MS / 1000.0
+
+#: The controls that load a rig, refused by :meth:`DeviceModel.send_control`.
+#: :class:`~libkp.control.BankSelect` loads nothing by itself but exists only
+#: to qualify a Program Change, so it is refused with it.
+_RIG_LOAD_CONTROLS = (
+    control_mod.LoadSlot,
+    control_mod.Up,
+    control_mod.Down,
+    control_mod.ProgramChange,
+    control_mod.BankSelect,
+)
+#: Program Change is status ``0xC0 | channel``.
+_STATUS_PROGRAM_CHANGE = 0xC0
+#: Control Change is status ``0xB0 | channel``.
+_STATUS_CONTROL_CHANGE = 0xB0
 
 #: One past the last flat address the page/number request forms can name; at
 #: or above it a request goes out in its extended (``$46`` / ``$47``) form.
@@ -261,6 +314,9 @@ class DeviceModel:
         "_last_control_open",
         "_dump_open",
         "_dump_timer",
+        "_nav",
+        "_settle_timer",
+        "_window_timer",
     )
 
     def __init__(self, ip: str, options: ConnectOptions) -> None:
@@ -286,6 +342,13 @@ class DeviceModel:
         self._last_control_open = float("-inf")
         self._dump_open = False
         self._dump_timer: asyncio.TimerHandle | None = None
+        #: The Navigator's state machine, and the one timer of each kind it
+        #: can have armed: re-arming replaces the last, and both are cancelled
+        #: when a life ends, so a timer from a previous life never fires into
+        #: the next.
+        self._nav = NavigatorState()
+        self._settle_timer: asyncio.TimerHandle | None = None
+        self._window_timer: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -614,42 +677,26 @@ class DeviceModel:
 
     async def send_control(self, control: Control, channel: int = CC_CHANNEL) -> None:
         """Send an arbitrary :class:`~libkp.control.Control` — the generic entry
-        point behind every action convenience method below."""
-        await self._enqueue(control.message(channel))
+        point behind every action convenience method below.
 
-    async def select_rig(self, rig: int) -> None:
-        """Select rig slot 1–5 in the current bank (CC50–54)."""
-        await self.send_control(control_mod.LoadSlot(rig))
-
-    async def rig_up(self) -> None:
-        """Step to the next rig (CC48)."""
-        await self.send_control(control_mod.Up())
-
-    async def rig_down(self) -> None:
-        """Step to the previous rig (CC49)."""
-        await self.send_control(control_mod.Down())
+        A control that loads a rig -- :class:`~libkp.control.LoadSlot`,
+        :class:`~libkp.control.Up`, :class:`~libkp.control.Down`,
+        :class:`~libkp.control.ProgramChange` and the
+        :class:`~libkp.control.BankSelect` that qualifies one -- is refused
+        with :class:`~libkp.errors.RigLoadRequiresNavigatorError` before any
+        byte is written: loads go through the Navigator alone, so two can never
+        overlap on the wire.
+        """
+        if isinstance(control, _RIG_LOAD_CONTROLS):
+            raise RigLoadRequiresNavigatorError(type(control).__name__)
+        message = control.message(channel)
+        _refuse_rig_loads(message)
+        await self._enqueue(message)
 
     async def bank(self, n: int) -> None:
-        """Preselect bank ``n`` (1-based; CC47). Takes effect with the next rig."""
+        """Preselect bank ``n`` (1-based; CC47). Loads nothing: it takes effect
+        with the next slot load, which is the Navigator's to send."""
         await self.send_control(control_mod.BankPreselect(max(n - 1, 0)))
-
-    async def select_rig_index(self, index: int) -> None:
-        """Load a rig by its flat, 0-based index.
-
-        This is the device's own numbering, and the only address that reaches a
-        rig outside the current bank. Sent as the documented pair: the absolute
-        bank preselect (CC47) followed by the slot load (CC50-54) that commits
-        it. The index divides by ``BANK_SLOTS``, so index 123 is bank 25, slot 4.
-
-        Nothing here assumes how many banks a device has. Aim past the end and
-        the device simply stays where it is -- and says so in the ``$06``
-        position push that follows, so
-        :attr:`~libkp.state.DeviceState.current_rig_index` always reflects where
-        it actually landed, not where this aimed.
-        """
-        bank, slot = divmod(index, gen.BANK_SLOTS)
-        await self.bank(bank + 1)
-        await self.select_rig(slot + 1)
 
     async def tap_tempo(self) -> None:
         """Tap the tempo (CC30)."""
@@ -704,8 +751,182 @@ class DeviceModel:
         await self.send_control(control_mod.Panorama(value))
 
     async def send_raw(self, message: bytes) -> None:
-        """Enqueue raw (pre-framing) MIDI bytes for the stream's writer."""
+        """Enqueue raw (pre-framing) MIDI bytes for the stream's writer.
+
+        Refused with :class:`~libkp.errors.RigLoadRequiresNavigatorError`,
+        with nothing written, when the bytes hold a Program Change (status
+        ``0xC0``-``0xCF``) or a Control Change on one of the rig-loading
+        controllers (:data:`libkp._generated.RIG_LOAD_CONTROLLERS`): the raw
+        door is not a way around the Navigator.
+        """
+        _refuse_rig_loads(message)
         await self._enqueue(message)
+
+    # ------------------------------------------------------------------
+    # The Navigator — the only way to load a rig
+    # ------------------------------------------------------------------
+
+    def navigate_to(self, index: int) -> None:
+        """Aim at a rig by its flat, 0-based index and return at once.
+
+        The device's own numbering, and the only address that reaches a rig
+        outside the current bank: the index divides by ``BANK_SLOTS``, so
+        index 123 is bank 25, slot 4. The load goes out now if none is in
+        flight, otherwise when the current one settles -- see the module
+        notes: a burst of aims costs two loads however long it is.
+
+        Nothing here assumes how many banks a device has. Aim past the end and
+        the device stays where it is and says so, so
+        :attr:`~libkp.state.DeviceState.current_rig_index` reflects where it
+        actually is, and the aim is dropped after the pending window
+        (:class:`~libkp.state.NavigationDropped`). While the stream is down the
+        aim is dropped at once, the same way, rather than raising: an aim is
+        not a command that failed, it is a destination the model could not
+        reach.
+        """
+        self._navigate(max(index, 0))
+
+    def step_rig(self, delta: int) -> None:
+        """Aim ``delta`` rigs from :attr:`~libkp.state.DeviceState.aimed_rig_index`,
+        floored at index 0, so a run of steps counts from the last step rather
+        than from wherever the device has got to. Ignored while no position is
+        known yet (before the connect burst has answered): there is nothing to
+        step *from*, and doing nothing beats a guess. A step that lands where
+        the aim already is sends nothing."""
+        aimed = self._state.aimed_rig_index
+        if aimed is None:
+            return
+        target = max(aimed + delta, 0)
+        if target != aimed:
+            self._navigate(target)
+
+    def step_bank(self, forward: bool) -> None:
+        """Aim one bank up (``True``) or down from
+        :attr:`~libkp.state.DeviceState.aimed_rig_index`, keeping the slot,
+        floored at index 0. Ignored while no position is known yet."""
+        self.step_rig(gen.BANK_SLOTS if forward else -gen.BANK_SLOTS)
+
+    def select_slot(self, slot: int) -> None:
+        """Aim at ``slot`` (1..``BANK_SLOTS``) of the aimed bank -- the bank
+        of :attr:`~libkp.state.DeviceState.aimed_rig_index`, so a slot tapped
+        right after a bank step lands in the bank that step is heading for,
+        which the device's own position would not yet show. Ignored for a slot
+        out of range, and while no position is known yet: there is no bank to
+        name."""
+        if not 1 <= slot <= gen.BANK_SLOTS:
+            return
+        aimed = self._state.aimed_rig_index
+        if aimed is None:
+            return
+        self._navigate(aimed // gen.BANK_SLOTS * gen.BANK_SLOTS + slot - 1)
+
+    def _navigate(self, index: int) -> None:
+        """One aim through the machine, its actions carried out, and a
+        snapshot if the aim or the flight changed."""
+        if self._run_nav(self._nav.navigate(index)):
+            self._snapshots.send(self._state.snapshot())
+
+    def _run_nav(self, actions: list[NavAction]) -> bool:
+        """Carry out the machine's actions in order -- bytes, timers, events --
+        then mirror its aim and flight into the tree. Returns whether that
+        mirror changed, which is a slow change the caller reports.
+
+        A send while the stream is down cannot be carried out: the machine is
+        reset and the aim reported dropped, with nothing else of the list
+        done, since the timer it would arm belongs to a move that never went.
+        """
+        epoch = self._epoch
+        for action in actions:
+            if isinstance(action, Send):
+                if not self._send_rig_load(action.index):
+                    self._nav = NavigatorState()
+                    self._emit(NavigationDropped(action.index, NavDrop.UNCONFIRMED))
+                    break
+            elif isinstance(action, StartSettle):
+                self._settle_timer = self._arm(
+                    self._settle_timer, RIG_LOAD_SETTLE, self._on_settle_elapsed, epoch
+                )
+            elif isinstance(action, StartWindow):
+                self._window_timer = self._arm(
+                    self._window_timer, PENDING_WINDOW, self._on_window_elapsed, epoch
+                )
+            elif isinstance(action, Settled):
+                self._emit(NavigationSettled(action.index))
+            elif isinstance(action, Dropped):
+                self._emit(NavigationDropped(action.index, NavDrop.UNCONFIRMED))
+        return self._mirror_navigation()
+
+    def _send_rig_load(self, index: int) -> bool:
+        """The documented pair for a flat index: the absolute bank preselect
+        (CC47), then the slot load (CC50-54) that commits it. Returns whether
+        both were queued; they are not while the stream is down, and not when
+        the writer has stopped draining, which is the same thing about to be
+        noticed."""
+        stream = self._stream
+        if self._closed or stream is None or self._state.channels.stream is not ChannelState.OPEN:
+            return False
+        bank, slot = divmod(index, gen.BANK_SLOTS)
+        try:
+            stream.send_nowait(control_mod.BankPreselect(bank).message(CC_CHANNEL))
+            stream.send_nowait(control_mod.LoadSlot(slot + 1).message(CC_CHANNEL))
+        except asyncio.QueueFull:
+            return False
+        return True
+
+    def _arm(
+        self,
+        current: asyncio.TimerHandle | None,
+        delay: float,
+        callback: Callable[[int], None],
+        epoch: int,
+    ) -> asyncio.TimerHandle:
+        """Arm one of the Navigator's timers, replacing the one of its kind:
+        a window armed for a new aim must not be cut short by the window of
+        the aim it replaced."""
+        if current is not None:
+            current.cancel()
+        return asyncio.get_running_loop().call_later(delay, callback, epoch)
+
+    def _on_settle_elapsed(self, epoch: int) -> None:
+        if epoch != self._epoch or self._closed:
+            return
+        self._settle_timer = None
+        if self._run_nav(self._nav.settle_elapsed()):
+            self._snapshots.send(self._state.snapshot())
+
+    def _on_window_elapsed(self, epoch: int) -> None:
+        if epoch != self._epoch or self._closed:
+            return
+        self._window_timer = None
+        if self._run_nav(self._nav.window_elapsed()):
+            self._snapshots.send(self._state.snapshot())
+
+    def _on_position(self, index: int) -> bool:
+        """A position the core folded, from either wire, forwarded to the
+        machine. Returns whether the navigation changed, for the chunk's one
+        snapshot."""
+        return self._run_nav(self._nav.position(index))
+
+    def _mirror_navigation(self) -> bool:
+        """Keep :attr:`~libkp.state.DeviceState.navigation` equal to the
+        machine's public half; returns whether it moved."""
+        navigation = self._state.navigation
+        nav = self._nav
+        if navigation.aim == nav.aim and navigation.in_flight == nav.in_flight:
+            return False
+        self._state.navigation = Navigation(aim=nav.aim, in_flight=nav.in_flight)
+        return True
+
+    def _reset_navigation(self) -> None:
+        """A life ended: no timer may fire into the next, and an aim the
+        device can no longer be asked for is cleared without an event."""
+        for timer in (self._settle_timer, self._window_timer):
+            if timer is not None:
+                timer.cancel()
+        self._settle_timer = None
+        self._window_timer = None
+        self._nav = NavigatorState()
+        self._mirror_navigation()
 
     # ------------------------------------------------------------------
     # Supervisor: one life of the connection
@@ -854,6 +1075,7 @@ class DeviceModel:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._finish_dump(report=False)
+        self._reset_navigation()
         control, self._control = self._control, None
         if control is not None:
             await control.close()
@@ -916,14 +1138,22 @@ class DeviceModel:
             self._snapshots.send(self._state.snapshot())
 
     def _fold(self, update: Update) -> bool:
-        """One value through the funnel: fold it, raise its events, and answer
-        any request waiting on its address. Returns whether a slow field
-        changed. A request is answered whether or not the fold stored anything:
-        a reply carrying the value already held is deduped to nothing, yet it
-        is the answer all the same."""
+        """One value through the funnel: fold it, raise its events, hand a
+        position to the Navigator, and answer any request waiting on its
+        address. Returns whether a slow field changed. A request is answered
+        whether or not the fold stored anything: a reply carrying the value
+        already held is deduped to nothing, yet it is the answer all the
+        same."""
         outcome: ApplyOutcome = self._state.apply_update(update)
+        slow_changed = outcome.slow_changed
         for event in outcome.events:
             self._emit(event)
+            if isinstance(event, CurrentPosition):
+                # Whichever wire carried it, and whichever half changed: the
+                # machine only cares where the device says it is now.
+                index = self._state.current_rig_index
+                if index is not None:
+                    slow_changed = self._on_position(index) or slow_changed
         decoded = update.decoded
         if isinstance(decoded, Num):
             self._lane.resolve((update.address, Num), decoded.value)
@@ -932,7 +1162,7 @@ class DeviceModel:
         elif isinstance(decoded, Block):
             for i, value in enumerate(decoded.values):
                 self._lane.resolve((update.address + i, Num), value)
-        return outcome.slow_changed
+        return slow_changed
 
     def _on_control_closed(self, epoch: int) -> None:
         """The device ended the control socket: the channel is ``LOST``, the
@@ -1135,6 +1365,36 @@ _POSITION_FIELDS = frozenset({gen.Field.CURRENT_BANK, gen.Field.CURRENT_RIG_SLOT
 def _now() -> float:
     """The event loop's monotonic clock, the one the ledger keeps time by."""
     return asyncio.get_running_loop().time()
+
+
+def _refuse_rig_loads(message: bytes) -> None:
+    """Walk the MIDI messages in ``message`` (a control may render several
+    back to back) and raise :class:`~libkp.errors.RigLoadRequiresNavigatorError`
+    at the first that would load a rig: a Program Change, or a Control Change
+    on a rig-loading controller. SysEx is skipped to its end; anything else is
+    taken at its status byte's length."""
+    i, n = 0, len(message)
+    while i < n:
+        status = message[i]
+        if status == 0xF0:
+            end = message.find(b"\xf7", i)
+            i = n if end < 0 else end + 1
+            continue
+        kind = status & 0xF0
+        if kind == _STATUS_PROGRAM_CHANGE:
+            raise RigLoadRequiresNavigatorError("a Program Change")
+        if kind == _STATUS_CONTROL_CHANGE and i + 1 < n:
+            controller = message[i + 1]
+            if controller in gen.RIG_LOAD_CONTROLLERS:
+                raise RigLoadRequiresNavigatorError(f"CC{controller}")
+        # Program Change and Channel Pressure carry one data byte; the other
+        # channel messages two. Anything unrecognised is stepped past by one.
+        if kind in (_STATUS_PROGRAM_CHANGE, 0xD0):
+            i += 2
+        elif 0x80 <= status < 0xF0:
+            i += 3
+        else:
+            i += 1
 
 
 def _slot_page(slot: str) -> int:

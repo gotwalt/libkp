@@ -17,7 +17,7 @@ final class ConformanceTests: XCTestCase {
     func testEveryVectorFileIsCovered() throws {
         let covered: Set<String> = [
             "u14.json", "discovery.json", "midi3.json", "nrpn.json",
-            "controls.json", "params.json", "state.json", "cbor.json",
+            "controls.json", "params.json", "state.json", "cbor.json", "navigation.json",
         ]
         let present = Set(try Fixtures.vectorFiles().map(\.lastPathComponent))
         XCTAssertEqual(present, covered, "spec/vectors changed; update the conformance suite")
@@ -461,6 +461,8 @@ final class ConformanceTests: XCTestCase {
         case .channelChanged: return "channel_changed"
         case .syncCompleted: return "sync_completed"
         case .requestTimedOut: return "request_timed_out"
+        case .navigationSettled: return "navigation_settled"
+        case .navigationDropped: return "navigation_dropped"
         }
     }
 
@@ -626,6 +628,59 @@ final class ConformanceTests: XCTestCase {
                     )
                 }
             }
+        }
+    }
+
+    // MARK: - navigation.json
+
+    /// The Navigator's state machine, replayed step by step from a fresh
+    /// machine: the actions must match exactly and in order, the wire log
+    /// must be every `send`, and the final state must be the one expected.
+    func testNavigationVectors() throws {
+        let vector = try Fixtures.vector("navigation")
+        let cases = vector.cases("cases")
+        XCTAssertFalse(cases.isEmpty)
+        for entry in cases {
+            let name = entry.string("name")
+            var machine = NavigatorState()
+            var actions: [String] = []
+            var sent: [Int] = []
+            for step in entry.cases("steps") {
+                let produced: [NavAction]
+                if let target = step["navigate"] as? NSNumber {
+                    produced = machine.navigate(target.uint16Value)
+                } else if step["settle"] as? NSNumber != nil {
+                    produced = machine.settleElapsed()
+                } else if step["window"] as? NSNumber != nil {
+                    produced = machine.windowElapsed()
+                } else if let index = step["position"] as? NSNumber {
+                    produced = machine.position(index.uint16Value)
+                } else {
+                    XCTFail("\(name): unknown step \(step)")
+                    continue
+                }
+                for action in produced {
+                    switch action {
+                    case .send(let index):
+                        actions.append("send:\(index)")
+                        sent.append(Int(index))
+                    case .startSettle: actions.append("start_settle")
+                    case .startWindow: actions.append("start_window")
+                    case .settled(let index): actions.append("settled:\(index)")
+                    case .dropped(let index): actions.append("dropped:\(index)")
+                    }
+                }
+            }
+            guard let expect = entry["expect"] as? [String: Any] else {
+                XCTFail("case \"\(name)\" has no expect block")
+                continue
+            }
+            XCTAssertEqual(actions, expect["actions"] as? [String] ?? [], "\(name): actions")
+            XCTAssertEqual(
+                sent, (expect["sent"] as? [NSNumber])?.map(\.intValue) ?? [], "\(name): sent")
+            XCTAssertEqual(machine.aim, (expect["aim"] as? NSNumber)?.uint16Value, "\(name): aim")
+            XCTAssertEqual(machine.inFlight, expect.bool("in_flight"), "\(name): in_flight")
+            XCTAssertEqual(machine.awaiting, expect.bool("awaiting"), "\(name): awaiting")
         }
     }
 

@@ -43,7 +43,7 @@ struct DashboardView: View {
         case let .connected(host, name):
             if let name = name?.trimmed.nonEmpty { return "KP Meters - \(name) · \(host)" }
             return "KP Meters - \(host)"
-        case let .connecting(host):
+        case let .connecting(host), let .reconnecting(host, _):
             return "KP Meters - \(host)"
         default:
             return "KP Meters"
@@ -132,9 +132,10 @@ struct DashboardView: View {
 /// preselect plus a slot load, so any rig is one hop away and bank boundaries
 /// are not special. Nothing assumes how many rigs the device holds.
 ///
-/// The highlighted slot prefers this app's last tap until the device reports
-/// where it landed, then the device's own slot, then matching the loaded rig
-/// name against the five preview names (`DeviceStore.deviceSlot`).
+/// The highlighted slot prefers the model's outstanding aim — the last tap,
+/// until the device reports where it landed — then the device's own slot,
+/// then matching the loaded rig name against the five preview names
+/// (`DeviceStore.deviceSlot`).
 struct RigNavigationView: View {
     @EnvironmentObject private var store: DeviceStore
 
@@ -333,6 +334,15 @@ struct ConnectionPlaceholderView: View {
                 Text("Connecting to \(host)…")
                     .font(.title3)
                     .fontWeight(.medium)
+            case let .reconnecting(host, attempt):
+                ProgressView()
+                    .controlSize(.large)
+                Text("Reconnecting to \(host)…")
+                    .font(.title3)
+                    .fontWeight(.medium)
+                Text("The device closed the connection. Attempt \(attempt).")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             case let .failed(message):
                 Image(systemName: "antenna.radiowaves.left.and.right.slash")
                     .font(.system(size: 36))

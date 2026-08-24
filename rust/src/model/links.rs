@@ -8,6 +8,9 @@
 //!   and hands each chunk to the core tagged with the dump phase, ending the
 //!   phase at the dump's end marker or its settle time. It writes nothing —
 //!   the trigger went out with the open, and there is no queue.
+//!
+//! Both hand every position the core folds from their chunk to the
+//! Navigator, which is how an aim is confirmed whichever wire says so first.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -16,6 +19,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::nav;
 use super::supervisor::Shared;
 use crate::cbor::{self, ControlLink};
 use crate::error::SessionError;
@@ -70,11 +74,11 @@ async fn run_stream(
 ) {
     let mut unframer = Unframer::new();
     // Decode anything that rode in on the handshake acceptance tail.
-    shared.core.apply_messages(epoch, &unframer.push(&tail));
+    fold_messages(&shared, epoch, &unframer.push(&tail));
     loop {
         tokio::select! {
             read = session.read_once(READ_IDLE, READ_MAX) => match read {
-                Ok(chunk) => shared.core.apply_messages(epoch, &unframer.push(&chunk)),
+                Ok(chunk) => fold_messages(&shared, epoch, &unframer.push(&chunk)),
                 // EOF or a read error: the socket is gone, and so is this life.
                 Err(_) => return,
             },
@@ -88,6 +92,22 @@ async fn run_stream(
                 None => return,
             },
         }
+    }
+}
+
+/// One read chunk of the stream into the core, and its positions on to the
+/// Navigator.
+fn fold_messages(shared: &Arc<Shared>, epoch: u64, msgs: &[Vec<u8>]) {
+    for index in shared.core.apply_messages(epoch, msgs) {
+        nav::position(shared, epoch, index);
+    }
+}
+
+/// One chunk of control-link updates into the core, and its positions on to
+/// the Navigator.
+pub(crate) fn fold_updates(shared: &Arc<Shared>, epoch: u64, updates: &[crate::state::Update]) {
+    for index in shared.core.apply_updates(epoch, updates) {
+        nav::position(shared, epoch, index);
     }
 }
 
@@ -153,7 +173,7 @@ pub(crate) async fn run_control(shared: Arc<Shared>, epoch: u64) -> Result<(), S
                     } else {
                         cbor::updates(&items, Phase::Dump)
                     };
-                    core.apply_updates(epoch, &updates);
+                    fold_updates(&shared, epoch, &updates);
                     if ended {
                         dumping = false;
                         core.end_dump(epoch, true);

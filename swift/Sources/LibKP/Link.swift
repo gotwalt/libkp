@@ -261,12 +261,24 @@ extension DeviceModel {
                 for event in outcome.events { emit(event) }
                 slow = slow || outcome.slowChanged
                 resolve(update)
+                slow = forwardPosition(outcome) || slow
             case let .renderedString(page, number, value, text):
                 emit(.renderedString(page: page, number: number, value: value, text: text))
                 resolveRender(page: page, number: number, value: value, text: text)
             }
         }
         if slow { publishSnapshot() }
+    }
+
+    /// A folded update moved the device's position: hand the flat index to
+    /// the Navigator, whichever wire carried it. Returns whether the
+    /// snapshot's navigation changed.
+    private func forwardPosition(_ outcome: ApplyOutcome) -> Bool {
+        let moved = outcome.events.contains {
+            if case .currentPosition = $0 { true } else { false }
+        }
+        guard moved, let index = state.currentRigIndex else { return false }
+        return navigationPosition(index)
     }
 
     /// The stream ended — a read error, EOF, or a failed write. Both links go
@@ -286,12 +298,15 @@ extension DeviceModel {
     }
 
     /// Close both sockets, stop every task of this life, and refuse whatever
-    /// was still waiting. The tree keeps its values; only `channels` changes,
-    /// because they say what is true now: the stream is `lost` when the device
-    /// ended it and `closed` when this side did. Bumps the epoch, so nothing
+    /// was still waiting. The tree keeps its values; only `channels` and the
+    /// navigation change, because they say what is true now: the stream is
+    /// `lost` when the device ended it and `closed` when this side did, and
+    /// an aim made in this life is forgotten with it — silently, since there
+    /// is no session left for a drop to be about. Bumps the epoch, so nothing
     /// started under this life can report back.
     private func tearDownLinks(lost: Bool) {
         epoch += 1
+        resetNavigation()
         syncTask?.cancel()
         syncTask = nil
         settleTask?.cancel()
@@ -486,6 +501,7 @@ extension DeviceModel {
                 for event in outcome.events { emit(event) }
                 slow = slow || outcome.slowChanged
                 resolve(update)
+                slow = forwardPosition(outcome) || slow
             }
             if dumpActive && item.base == Generated.dumpEndAddress { finishDump() }
         }

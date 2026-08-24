@@ -17,7 +17,10 @@ rejected, as on the device), the preamble, then the protocol's own traffic:
   :data:`~libkp._generated.DUMP_END_ADDRESS`), and
   :meth:`FakeDevice.push_items` sends more at any time.
 
-Either kind of connection, or all of them, can be hung up.
+Either kind of connection, or all of them, can be hung up. The greeting can
+be held back for a while (``greeting_delay``), as a device that has served a
+few sessions does, or withheld altogether (``greet=False``) to exercise the
+handshake's timeout.
 """
 
 from __future__ import annotations
@@ -145,6 +148,8 @@ class FakeDevice:
         close_after_handshake: bool = False,
         responder: Callable[[bytes], list[bytes]] | None = None,
         dump_items: list | None = None,
+        greeting_delay: float = 0.0,
+        greet: bool = True,
     ) -> None:
         """
         ``offered`` is the greeting (by default the reserved GUID and the MIDI3
@@ -154,7 +159,10 @@ class FakeDevice:
         rejects every selection. ``responder`` answers each received MIDI
         message with the messages it returns. ``dump_items`` is what a CBOR
         connection serves when the dump trigger arrives (default
-        :data:`DEFAULT_DUMP`; ``[]`` serves nothing).
+        :data:`DEFAULT_DUMP`; ``[]`` serves nothing). ``greeting_delay`` is how
+        many seconds the fake sits on a fresh connection before greeting, and
+        ``greet=False`` never greets at all, holding the socket open until the
+        client gives up.
         """
         if offered is None:
             offered = [PROTOCOL_RESERVED, PROTOCOL_MIDI3_STREAM]
@@ -172,6 +180,8 @@ class FakeDevice:
         self.close_after_handshake = close_after_handshake
         self.responder = responder
         self.dump_items = DEFAULT_DUMP if dump_items is None else dump_items
+        self.greeting_delay = greeting_delay
+        self.greet = greet
 
         #: Every connection accepted so far, in order.
         self.connections: list[FakeConnection] = []
@@ -279,6 +289,13 @@ class FakeDevice:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        if not self.greet:
+            # Say nothing, ever; the connection ends when the client hangs up.
+            while await reader.read(4096):
+                pass
+            return
+        if self.greeting_delay:
+            await asyncio.sleep(self.greeting_delay)
         greeting = "".join(f"{name}\r\n" for name in self.offered) + ".\r\n"
         writer.write(greeting.encode("ascii"))
         await writer.drain()
