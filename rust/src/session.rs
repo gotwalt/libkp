@@ -12,6 +12,18 @@
 //! 5. For the streaming session the client then writes an 8-byte zero preamble
 //!    and the framed stream begins.
 //!
+//! # Handshake timing
+//!
+//! The greeting is not instant. A freshly booted device answers within a few
+//! milliseconds, but one that has served a few sessions has been measured
+//! taking close to 800 ms to send its first byte, and the reply to the
+//! protocol selection can lag the same way. Both waits are therefore bounded
+//! by [`HANDSHAKE_TIMEOUT`] (2 s) for the *first* byte; once the device has
+//! started talking, the rest of the line is collected until the short
+//! inter-chunk `idle` gap the caller passes — the gap that also paces the live
+//! stream's reads — falls silent. Only a device that says nothing at all for
+//! the whole timeout fails the connect.
+//!
 //! # Connection spacing
 //!
 //! The device tolerates concurrent sessions but not connection *churn*: a
@@ -68,6 +80,17 @@ pub const SESSION_PREAMBLE: [u8; generated::SESSION_PREAMBLE_LEN] =
 /// [`DeviceModel`](crate::model::DeviceModel)) needs no spacing of its own; the
 /// constant is exported so callers can budget for the wait.
 pub const CONNECTION_COOLDOWN: Duration = Duration::from_millis(generated::CONNECTION_COOLDOWN_MS);
+
+/// How long the handshake waits for the device to *start* answering — the
+/// first byte of the greeting after connect, and the first byte of the reply
+/// to the protocol selection. A device that has served a few sessions has
+/// been measured taking close to 800 ms to greet, far longer than the
+/// inter-chunk idle gap that paces the stream, so the two waits are bounded
+/// separately: this for the first byte, the caller's `idle` for the rest.
+/// [`Session::handshake`] and [`Session::select_protocol`] use it;
+/// [`Session::handshake_within`] and [`Session::select_protocol_within`]
+/// take an explicit one.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(generated::HANDSHAKE_TIMEOUT_MS);
 
 /// What the ledger remembers about one peer: when a socket to it last opened
 /// and when one last closed. Either is `None` until it has happened.
@@ -282,17 +305,38 @@ impl Session {
     }
 
     /// Read whatever the device sends until an `idle` gap with no data (or
-    /// `max` bytes, or EOF). Used both to capture the greeting and to drain the
-    /// live stream. Returns the bytes collected (possibly empty).
+    /// `max` bytes, or EOF). Used to drain the live stream. Returns the bytes
+    /// collected (possibly empty). The first byte is given no longer than any
+    /// other, so this suits a device already talking; a reply that may take a
+    /// while to *begin* wants
+    /// [`read_available_within`](Self::read_available_within).
     pub async fn read_available(
         &mut self,
         idle: Duration,
         max: usize,
     ) -> Result<Vec<u8>, SessionError> {
+        self.read_available_within(idle, idle, max).await
+    }
+
+    /// Wait up to `first` for the device to start sending, then read as
+    /// [`read_available`](Self::read_available) does: until an `idle` gap with
+    /// no data, `max` bytes, or EOF. Returns the bytes collected — empty only
+    /// if nothing at all arrived within `first`, which the handshake reports
+    /// as a timeout. The two bounds exist because a device can take most of a
+    /// second to begin its greeting yet, once started, delivers the rest of
+    /// the line within milliseconds; waiting the long bound between every
+    /// chunk would make every read of the stream that long.
+    pub async fn read_available_within(
+        &mut self,
+        first: Duration,
+        idle: Duration,
+        max: usize,
+    ) -> Result<Vec<u8>, SessionError> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
+        let mut wait = first;
         loop {
-            match timeout(idle, self.stream.read(&mut chunk)).await {
+            match timeout(wait, self.stream.read(&mut chunk)).await {
                 // EOF: report a closed connection unless we already collected
                 // data this call (then hand that back; the next call errors).
                 Ok(Ok(0)) if buf.is_empty() => return Err(SessionError::Closed),
@@ -302,6 +346,8 @@ impl Session {
                     if buf.len() >= max {
                         break;
                     }
+                    // The device has started; from here the gap is the short one.
+                    wait = idle;
                 }
                 Ok(Err(source)) => {
                     return Err(SessionError::Io {
@@ -348,7 +394,8 @@ impl Session {
             })
     }
 
-    /// Send `name` + `"\r\n"` and read the device's response line.
+    /// Send `name` + `"\r\n"` and read the device's response line, giving the
+    /// reply [`HANDSHAKE_TIMEOUT`] to begin and `resp_idle` to finish.
     ///
     /// Returns the raw response. `Err(ProtocolRejected)` if it begins with `-`.
     pub async fn select_protocol(
@@ -356,10 +403,30 @@ impl Session {
         name: &str,
         resp_idle: Duration,
     ) -> Result<Vec<u8>, SessionError> {
+        self.select_protocol_within(name, resp_idle, HANDSHAKE_TIMEOUT)
+            .await
+    }
+
+    /// [`select_protocol`](Self::select_protocol) with an explicit bound on
+    /// how long the reply may take to *begin*; `resp_idle` still bounds the
+    /// gap between its chunks. Exists so a test against a fake that never
+    /// answers need not sit out the full two seconds.
+    ///
+    /// A reply that never begins is handed back empty rather than raised: the
+    /// device's `+`/`-` verdict is what the caller inspects, and an absent
+    /// verdict is left for it to judge as it did before the wait was lengthened.
+    pub async fn select_protocol_within(
+        &mut self,
+        name: &str,
+        resp_idle: Duration,
+        reply_timeout: Duration,
+    ) -> Result<Vec<u8>, SessionError> {
         let mut msg = name.as_bytes().to_vec();
         msg.extend_from_slice(HANDSHAKE_TERMINATOR);
         self.write_all(&msg).await?;
-        let resp = self.read_available(resp_idle, 256).await?;
+        let resp = self
+            .read_available_within(reply_timeout, resp_idle, 256)
+            .await?;
         match resp.first() {
             Some(b) if *b == generated::HANDSHAKE_REJECT_PREFIX.as_bytes()[0] => {
                 Err(SessionError::ProtocolRejected {
@@ -373,14 +440,38 @@ impl Session {
 
     /// Full handshake: read the greeting, pick the first `preferred` protocol
     /// that the device offers (falling back to its first offered), select it.
+    ///
+    /// The greeting and the selection reply are each given
+    /// [`HANDSHAKE_TIMEOUT`] to begin; `idle` is the gap that ends each line
+    /// once the device is talking. A device that sends nothing for the whole
+    /// timeout fails with `SessionError::Timeout { phase: "greeting", .. }`
+    /// reporting that wait.
     pub async fn handshake(
         &mut self,
         preferred: &[&str],
         idle: Duration,
     ) -> Result<HandshakeOutcome, SessionError> {
-        let greeting = self.read_available(idle, 256).await?;
+        self.handshake_within(preferred, idle, HANDSHAKE_TIMEOUT)
+            .await
+    }
+
+    /// [`handshake`](Self::handshake) with an explicit bound on how long the
+    /// greeting, and then the selection reply, may take to begin. Exists so a
+    /// test against a fake that never greets need not sit out the full two
+    /// seconds; real callers want the default.
+    pub async fn handshake_within(
+        &mut self,
+        preferred: &[&str],
+        idle: Duration,
+        greeting_timeout: Duration,
+    ) -> Result<HandshakeOutcome, SessionError> {
+        let greeting = self
+            .read_available_within(greeting_timeout, idle, 256)
+            .await?;
         let offered = parse_protocol_list(&greeting);
 
+        // Silence for the whole wait and a greeting that offers nothing are
+        // the same failure to the caller: there is no protocol to select.
         let selected = preferred
             .iter()
             .find(|p| offered.iter().any(|o| o == *p))
@@ -388,10 +479,12 @@ impl Session {
             .or_else(|| offered.first().cloned())
             .ok_or(SessionError::Timeout {
                 phase: "greeting",
-                ms: idle.as_millis() as u64,
+                ms: greeting_timeout.as_millis() as u64,
             })?;
 
-        let response = self.select_protocol(&selected, idle).await?;
+        let response = self
+            .select_protocol_within(&selected, idle, greeting_timeout)
+            .await?;
         Ok(HandshakeOutcome {
             greeting,
             offered,
@@ -643,5 +736,132 @@ mod tests {
             .expect("nothing listens there");
         assert!(matches!(err, SessionError::Connect { .. }));
         assert!(LEDGER.ready_at(peer(port), CONNECTION_COOLDOWN) > Instant::now());
+    }
+
+    // ---- the handshake's waits, against a fake that is slow to answer ------
+
+    /// The inter-chunk gap the model uses for its reads: far shorter than any
+    /// delay below, so a pass proves the first-byte wait is what covered it.
+    const IDLE: Duration = Duration::from_millis(30);
+
+    /// A device that pauses `before_greeting` before its protocol list and
+    /// `before_reply` before acknowledging the selection; `None` for either
+    /// means it never sends that line at all and just holds the socket open.
+    async fn slow_device(before_greeting: Option<Duration>, before_reply: Option<Duration>) -> u16 {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let Some(pause) = before_greeting else {
+                std::future::pending::<()>().await;
+                unreachable!();
+            };
+            tokio::time::sleep(pause).await;
+            let greeting = format!("{PROTOCOL_MIDI3_STREAM}\r\n.\r\n");
+            stream.write_all(greeting.as_bytes()).await.unwrap();
+
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while !line.ends_with(HANDSHAKE_TERMINATOR) {
+                stream.read_exact(&mut byte).await.unwrap();
+                line.push(byte[0]);
+            }
+            let Some(pause) = before_reply else {
+                std::future::pending::<()>().await;
+                unreachable!();
+            };
+            tokio::time::sleep(pause).await;
+            let mut reply = b"+".to_vec();
+            reply.extend_from_slice(&line);
+            stream.write_all(&reply).await.unwrap();
+            // Keep the socket open until the test side drops it.
+            std::future::pending::<()>().await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_greeting_slower_than_the_idle_gap_still_connects() {
+        // Ten times the idle gap, well short of the handshake timeout: the
+        // shape of the 777 ms greeting measured on a device that had already
+        // served a few sessions.
+        let port = slow_device(Some(Duration::from_millis(300)), Some(Duration::ZERO)).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let outcome = session
+            .handshake(&[PROTOCOL_MIDI3_STREAM], IDLE)
+            .await
+            .unwrap();
+        assert_eq!(outcome.offered, vec![PROTOCOL_MIDI3_STREAM]);
+        assert_eq!(outcome.selected, PROTOCOL_MIDI3_STREAM);
+        assert!(outcome.response.starts_with(b"+"));
+    }
+
+    #[tokio::test]
+    async fn a_slow_selection_reply_is_waited_for_too() {
+        let port = slow_device(Some(Duration::ZERO), Some(Duration::from_millis(300))).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let outcome = session
+            .handshake(&[PROTOCOL_MIDI3_STREAM], IDLE)
+            .await
+            .unwrap();
+        let expected = format!("+{PROTOCOL_MIDI3_STREAM}\r\n");
+        assert_eq!(outcome.response, expected.as_bytes());
+        assert!(outcome.response_tail().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_device_that_never_greets_times_out_reporting_the_wait() {
+        let port = slow_device(None, None).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let wait = Duration::from_millis(150);
+        let started = Instant::now();
+        let err = session
+            .handshake_within(&[PROTOCOL_MIDI3_STREAM], IDLE, wait)
+            .await
+            .expect_err("nothing to select from");
+        assert!(started.elapsed() >= wait);
+        assert!(started.elapsed() < HANDSHAKE_TIMEOUT);
+        assert!(
+            matches!(
+                err,
+                SessionError::Timeout {
+                    phase: "greeting",
+                    ms: 150
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_selection_reply_that_never_begins_is_handed_back_empty() {
+        let port = slow_device(Some(Duration::ZERO), None).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let wait = Duration::from_millis(150);
+        let outcome = session
+            .handshake_within(&[PROTOCOL_MIDI3_STREAM], IDLE, wait)
+            .await
+            .unwrap();
+        assert_eq!(outcome.selected, PROTOCOL_MIDI3_STREAM);
+        assert!(outcome.response.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_default_handshake_waits_the_generated_timeout() {
+        assert_eq!(
+            HANDSHAKE_TIMEOUT,
+            Duration::from_millis(generated::HANDSHAKE_TIMEOUT_MS)
+        );
+        assert!(HANDSHAKE_TIMEOUT > IDLE);
     }
 }

@@ -1,6 +1,6 @@
 //! The async [`DeviceModel`] store, driven against the fake device in
-//! `tests/common`: both links, the request lane, loss and reconnect, close and
-//! drop.
+//! `tests/common`: both links, the request lane, the Navigator, loss and
+//! reconnect, close and drop.
 //!
 //! Every test opens its own fake on a fresh ephemeral port, so the connection
 //! ledger in `libkp::session` never makes one test wait on another. It does
@@ -13,15 +13,16 @@ mod common;
 use std::time::Duration;
 
 use common::{Config, FakeDevice, default_dump, multi_item, wait_for};
+use libkp::control::Control;
 use libkp::generated;
 use libkp::model::{
-    Backoff, ChannelError, ConnectOptions, ControlPolicy, DeviceEvent, DeviceModel,
+    Backoff, ChannelError, CommandError, ConnectOptions, ControlPolicy, DeviceEvent, DeviceModel,
     ReconnectPolicy, RequestError, SyncStrategy,
 };
-use libkp::nrpn::{self, set_single};
+use libkp::nrpn::{self, FUNCTION_EXT_PARAM, set_single};
 use libkp::params::{BankPreviewField, bank_preview_address};
 use libkp::session::CONNECTION_COOLDOWN;
-use libkp::state::{Channel, ChannelState, Connection, DeviceState};
+use libkp::state::{Channel, ChannelState, Connection, DeviceState, NavDrop, Navigation};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, timeout};
 
@@ -69,6 +70,56 @@ fn quiet(fake: &FakeDevice) -> ConnectOptions {
 
 fn channel_event(channel: Channel, state: ChannelState) -> impl Fn(&DeviceEvent) -> bool {
     move |e| matches!(e, DeviceEvent::ChannelChanged { channel: c, state: s } if *c == channel && *s == state)
+}
+
+/// A `$06` Extended Parameter push, as the device sends its position: the
+/// 5×7-bit address, then the 5×7-bit value.
+fn ext_param(address: u32, value: u64) -> Vec<u8> {
+    let mut msg = vec![0xF0, 0x00, 0x20, 0x33, 0x00, 0x00, FUNCTION_EXT_PARAM, 0x00];
+    msg.extend(nrpn::ext_encode(u64::from(address), 5));
+    msg.extend(nrpn::ext_encode(value, 5));
+    msg.push(0xF7);
+    msg
+}
+
+/// Push the device's position — bank then slot, as two `$06` messages in
+/// one write — for the flat rig `index`.
+async fn push_position(stream: &common::Connection, index: u16) {
+    let slots = index / generated::BANK_SLOTS as u16;
+    let mut burst = Vec::new();
+    burst.extend(libkp::midi3::frame(&ext_param(
+        generated::CURRENT_BANK_ADDRESS,
+        u64::from(slots),
+    )));
+    burst.extend(libkp::midi3::frame(&ext_param(
+        generated::CURRENT_RIG_SLOT_ADDRESS,
+        u64::from(index % generated::BANK_SLOTS as u16),
+    )));
+    stream.push_raw(&burst).await;
+}
+
+/// The two messages the Navigator puts on the wire for one rig index: the
+/// bank preselect, then the slot load that commits it.
+fn load_pair(index: u16) -> [Vec<u8>; 2] {
+    let slots = index / generated::BANK_SLOTS as u16;
+    [
+        Control::BankPreselect(slots as u8).message(0),
+        Control::LoadSlot((index % generated::BANK_SLOTS as u16) as u8 + 1).message(0),
+    ]
+}
+
+/// Every navigation event the receiver holds right now.
+fn drain_navigation(events: &mut broadcast::Receiver<DeviceEvent>) -> Vec<DeviceEvent> {
+    let mut out = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            DeviceEvent::NavigationSettled { .. } | DeviceEvent::NavigationDropped { .. }
+        ) {
+            out.push(event);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +699,333 @@ async fn a_stream_read_chunk_republishes_the_snapshot_once() {
     assert_eq!(published[0].amp.gain, Some(1));
     assert_eq!(published[0].rig.tempo_bpm, Some(120));
     assert_eq!(published[0].effects[7].kind, Some(179));
+    model.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// The Navigator
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_burst_of_taps_costs_two_loads_spaced_by_the_settle() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    // Three taps before anything could settle: the first goes out at once,
+    // the aim moves on to the last.
+    model.navigate_to(14);
+    model.navigate_to(15);
+    model.navigate_to(16);
+    assert_eq!(
+        model.state().navigation,
+        Navigation {
+            aim: Some(16),
+            in_flight: true
+        }
+    );
+    assert!(wait_for(|| stream.received().len() >= 2, PATIENCE).await);
+    let first_at = Instant::now();
+    assert_eq!(stream.received(), load_pair(14));
+
+    // The settle sends the final aim, and nothing in between.
+    assert!(wait_for(|| stream.received().len() >= 4, PATIENCE).await);
+    let settle = Duration::from_millis(generated::RIG_LOAD_SETTLE_MS);
+    let gap = first_at.elapsed();
+    assert!(gap >= settle - Duration::from_millis(20), "{gap:?}");
+    let received = stream.received();
+    assert_eq!(received.len(), 4);
+    assert_eq!(&received[2..], &load_pair(16));
+
+    // The device never confirms, so the second settle opens the window and
+    // sends nothing more: exactly two loads for three taps.
+    tokio::time::sleep(settle + Duration::from_millis(100)).await;
+    assert_eq!(stream.received().len(), 4);
+    assert_eq!(
+        model.state().navigation,
+        Navigation {
+            aim: Some(16),
+            in_flight: false
+        }
+    );
+    assert!(drain_navigation(&mut events).is_empty());
+    model.close().await;
+}
+
+#[tokio::test]
+async fn a_matching_position_on_the_stream_settles_the_aim() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let mut snapshots = model.subscribe();
+    drain(&mut snapshots);
+    let stream = fake.wait_for_stream(0).await;
+
+    model.navigate_to(14);
+    // The aim is a slow change: the snapshot shows it before the wire does.
+    let aimed = drain(&mut snapshots).pop().expect("a snapshot for the aim");
+    assert_eq!(aimed.navigation.aim, Some(14));
+    assert_eq!(aimed.aimed_rig_index(), Some(14));
+    assert!(wait_for(|| stream.received().len() == 2, PATIENCE).await);
+
+    // A report of somewhere else keeps the aim; the aimed index does.
+    push_position(&stream, 13).await;
+    next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::CurrentPosition { slot: Some(3), .. })
+    })
+    .await;
+    assert_eq!(model.state().navigation.aim, Some(14));
+    push_position(&stream, 14).await;
+    let settled = next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::NavigationSettled { .. })
+    })
+    .await;
+    assert_eq!(settled, DeviceEvent::NavigationSettled { index: 14 });
+    let state = model.state();
+    assert_eq!(state.navigation.aim, None);
+    assert_eq!(state.current_rig_index(), Some(14));
+    assert_eq!(state.aimed_rig_index(), Some(14));
+
+    // An early confirmation does not shorten the flight: the next aim waits
+    // for the settle, and the confirmed one is not sent again.
+    assert!(state.navigation.in_flight);
+    model.navigate_to(15);
+    assert_eq!(stream.received().len(), 2);
+    assert!(wait_for(|| stream.received().len() == 4, PATIENCE).await);
+    assert_eq!(&stream.received()[2..], &load_pair(15));
+    model.close().await;
+}
+
+#[tokio::test]
+async fn a_position_from_the_control_link_settles_the_aim_too() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            sync: SyncStrategy::Off,
+            ..fake.options()
+        },
+    )
+    .await
+    .unwrap();
+    let mut events = model.events();
+    // Let the dump land first: it reports bank 3 / slot 1, which is nobody's
+    // aim yet.
+    next_event(&mut events, |e| {
+        matches!(
+            e,
+            DeviceEvent::SyncCompleted {
+                source: Channel::Control
+            }
+        )
+    })
+    .await;
+    assert_eq!(model.state().current_rig_index(), Some(16));
+
+    model.navigate_to(14);
+    let control = fake.wait_for_control(0).await;
+    control
+        .push_items(&[
+            libkp::cbor::param_write(generated::CURRENT_BANK_ADDRESS, 2),
+            libkp::cbor::param_write(generated::CURRENT_RIG_SLOT_ADDRESS, 4),
+        ])
+        .await;
+    let settled = next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::NavigationSettled { .. })
+    })
+    .await;
+    assert_eq!(settled, DeviceEvent::NavigationSettled { index: 14 });
+    assert_eq!(model.state().navigation.aim, None);
+    model.close().await;
+}
+
+#[tokio::test]
+async fn an_aim_past_the_end_is_dropped_after_the_window_and_may_be_sent_again() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    let aimed_at = Instant::now();
+    model.navigate_to(999);
+    assert!(wait_for(|| stream.received().len() == 2, PATIENCE).await);
+    // The device stays put and says so; that is not a confirmation.
+    push_position(&stream, 16).await;
+    next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::CurrentPosition { slot: Some(1), .. })
+    })
+    .await;
+    assert_eq!(model.state().navigation.aim, Some(999));
+
+    let dropped = next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::NavigationDropped { .. })
+    })
+    .await;
+    assert_eq!(
+        dropped,
+        DeviceEvent::NavigationDropped {
+            index: 999,
+            reason: NavDrop::Unconfirmed
+        }
+    );
+    let after = Duration::from_millis(generated::RIG_LOAD_SETTLE_MS + generated::PENDING_WINDOW_MS);
+    let elapsed = aimed_at.elapsed();
+    assert!(elapsed >= after - Duration::from_millis(20), "{elapsed:?}");
+    let state = model.state();
+    assert_eq!(state.navigation, Navigation::default());
+    assert_eq!(
+        state.aimed_rig_index(),
+        Some(16),
+        "back to the device's own"
+    );
+    assert_eq!(stream.received().len(), 2, "never re-sent while aimed");
+
+    // A drop forgets the sent index, so the same aim goes out again.
+    model.navigate_to(999);
+    assert!(wait_for(|| stream.received().len() == 4, PATIENCE).await);
+    assert_eq!(&stream.received()[2..], &load_pair(999));
+    model.close().await;
+}
+
+#[tokio::test]
+async fn rig_loads_are_refused_outside_the_navigator_before_any_byte() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let stream = fake.wait_for_stream(0).await;
+
+    for control in [
+        Control::LoadSlot(1),
+        Control::Up,
+        Control::Down,
+        Control::ProgramChange(3),
+        Control::BankSelect { msb: 0, lsb: 1 },
+    ] {
+        assert!(
+            matches!(
+                model.send_control(control).await,
+                Err(CommandError::RigLoadRequiresNavigator)
+            ),
+            "{control:?}"
+        );
+    }
+    assert!(matches!(
+        model.send_raw(&[0xC0, 5]).await,
+        Err(CommandError::RigLoadRequiresNavigator)
+    ));
+    for controller in generated::RIG_LOAD_CONTROLLERS {
+        assert!(matches!(
+            model.send_raw(&[0xB0, controller, 1]).await,
+            Err(CommandError::RigLoadRequiresNavigator)
+        ));
+    }
+    // The preselect alone loads nothing, and goes.
+    model.bank(3).await.unwrap();
+    model
+        .send_raw(&Control::BankPreselect(4).message(0))
+        .await
+        .unwrap();
+    assert!(wait_for(|| stream.received().len() == 2, PATIENCE).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        stream.received(),
+        vec![
+            Control::BankPreselect(2).message(0),
+            Control::BankPreselect(4).message(0)
+        ]
+    );
+    model.close().await;
+}
+
+#[tokio::test]
+async fn stepping_moves_the_aim_and_needs_a_position_to_step_from() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    // Nothing to step from yet: nothing happens.
+    model.step_rig(1);
+    model.step_bank(true);
+    model.select_slot(2);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(stream.received().is_empty());
+    assert_eq!(model.state().navigation, Navigation::default());
+
+    push_position(&stream, 16).await;
+    next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::CurrentPosition { slot: Some(1), .. })
+    })
+    .await;
+    // A step from the device's position goes out; the next steps go from
+    // the aim, not from where the device still is.
+    model.step_rig(-1);
+    assert!(wait_for(|| stream.received().len() == 2, PATIENCE).await);
+    assert_eq!(stream.received(), load_pair(15));
+    model.step_bank(true);
+    assert_eq!(model.state().aimed_rig_index(), Some(20));
+    model.select_slot(3);
+    assert_eq!(model.state().aimed_rig_index(), Some(22));
+    // Out of range slots and a step to where the aim already is do nothing.
+    model.select_slot(0);
+    model.select_slot(generated::BANK_SLOTS as u8 + 1);
+    model.step_rig(0);
+    assert_eq!(model.state().aimed_rig_index(), Some(22));
+    // The floor is 0.
+    model.step_rig(-100);
+    assert_eq!(model.state().aimed_rig_index(), Some(0));
+    model.navigate_to(22);
+
+    // One settle later the final aim is the second and last load.
+    assert!(wait_for(|| stream.received().len() == 4, PATIENCE).await);
+    assert_eq!(&stream.received()[2..], &load_pair(22));
+    tokio::time::sleep(Duration::from_millis(generated::RIG_LOAD_SETTLE_MS + 100)).await;
+    assert_eq!(stream.received().len(), 4);
+    model.close().await;
+}
+
+#[tokio::test]
+async fn a_stream_loss_forgets_the_aim_without_a_word() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    model.navigate_to(14);
+    assert!(wait_for(|| stream.received().len() == 2, PATIENCE).await);
+    stream.hang_up().await;
+    next_event(&mut events, |e| matches!(e, DeviceEvent::Disconnected)).await;
+    assert_eq!(model.state().navigation, Navigation::default());
+
+    // The timers were cancelled with the life: nothing fires late.
+    tokio::time::sleep(Duration::from_millis(
+        generated::RIG_LOAD_SETTLE_MS + generated::PENDING_WINDOW_MS + 100,
+    ))
+    .await;
+    assert!(drain_navigation(&mut events).is_empty());
+
+    // With no stream to send on, an aim is dropped at once, and says so.
+    model.navigate_to(3);
+    assert_eq!(
+        drain_navigation(&mut events),
+        vec![DeviceEvent::NavigationDropped {
+            index: 3,
+            reason: NavDrop::Unconfirmed
+        }]
+    );
+    assert_eq!(model.state().navigation, Navigation::default());
     model.close().await;
 }
 

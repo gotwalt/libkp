@@ -37,6 +37,14 @@ public struct HandshakeOutcome: Sendable {
 /// 4. The device replies with a line beginning `+` (accept) or `-` (reject).
 /// 5. For the streaming session the client then writes an 8-byte zero preamble
 ///    and the encapsulated stream begins.
+///
+/// Neither of the device's two lines is prompt. The greeting has been measured
+/// arriving 777 ms after the socket opened on a device that had served a few
+/// sessions, and the acceptance can lag the same way, so each is awaited with
+/// two separate budgets: up to ``handshakeTimeout`` for its **first** byte, and
+/// then the caller's `idle` gap — the 30 ms or so that separates one segment
+/// from the next — to gather the rest. A single `idle`-sized wait would fail a
+/// healthy but slow device with a spurious ``SessionError/timeout(phase:ms:)``.
 public final class Session: @unchecked Sendable {
     /// The protocol identifier that streams live MIDI data (meters, params,
     /// tuner) — the only offered protocol observed to push data unprompted.
@@ -64,6 +72,14 @@ public final class Session: @unchecked Sendable {
     /// should not open and close in a loop: the ledger makes churn slow, not
     /// harmless.
     public static let connectionCooldown = TimeInterval(Generated.connectionCooldownMs) / 1000.0
+
+    /// How long ``handshake(preferred:idle:greetingTimeout:)`` waits for the
+    /// first byte of the greeting, and
+    /// ``selectProtocol(_:idle:replyTimeout:)`` for the first byte of the
+    /// device's answer, before giving the connection up as unresponsive. This
+    /// is the budget for the device to *start* speaking; once it has, the
+    /// shorter `idle` gap decides when the line is complete.
+    public static let handshakeTimeout = TimeInterval(Generated.handshakeTimeoutMs) / 1000.0
 
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.libkp.session")
@@ -191,8 +207,10 @@ public final class Session: @unchecked Sendable {
     }
 
     /// Read whatever the device sends until an `idle` gap with no data (or `max`
-    /// bytes, or EOF). Used both to capture the greeting and to drain the live
-    /// stream. Returns the bytes collected, possibly empty.
+    /// bytes, or EOF). Used to drain the live stream; the handshake lines, which
+    /// may take far longer than one gap to begin, go through
+    /// ``readAvailable(first:idle:max:)``. Returns the bytes collected, possibly
+    /// empty.
     public func readAvailable(idle: TimeInterval, max: Int) async throws -> [UInt8] {
         var buffer = [UInt8]()
         while true {
@@ -203,6 +221,31 @@ public final class Session: @unchecked Sendable {
             } catch {
                 // EOF: report the closure unless data was already collected.
                 if buffer.isEmpty { throw error }
+                break
+            }
+        }
+        return buffer
+    }
+
+    /// Read one reply from the device: wait up to `first` for it to begin, then
+    /// collect until an `idle` gap with no data (or `max` bytes, or EOF).
+    ///
+    /// This is ``readAvailable(idle:max:)`` with a separate, longer budget for
+    /// the opening byte, for the handshake lines that a device may take far
+    /// longer than one inter-segment gap to produce. Returns empty only when
+    /// nothing at all arrived inside `first`; the caller names the phase that
+    /// timed out. EOF before the first byte is a closed connection; EOF after
+    /// it hands back what arrived, as ``readAvailable(idle:max:)`` does.
+    public func readAvailable(
+        first: TimeInterval, idle: TimeInterval, max: Int
+    ) async throws -> [UInt8] {
+        var buffer = try await readOnce(wait: first)
+        guard !buffer.isEmpty else { return [] }
+        while buffer.count < max {
+            do {
+                guard let chunk = try await inbox.next(timeout: idle) else { break }
+                buffer.append(contentsOf: chunk)
+            } catch {
                 break
             }
         }
@@ -249,13 +292,24 @@ public final class Session: @unchecked Sendable {
 
     /// Send `name` + `"\r\n"` and read the device's response line.
     ///
-    /// Throws ``SessionError/protocolRejected(name:detail:)`` if the response
-    /// begins with `-`.
-    public func selectProtocol(_ name: String, idle: TimeInterval) async throws -> [UInt8] {
+    /// Waits up to `replyTimeout` (``handshakeTimeout`` by default) for the
+    /// response to begin — a device can be as slow to answer the selection as
+    /// it is to greet — then `idle` for the rest of it. Throws
+    /// ``SessionError/timeout(phase:ms:)`` for phase `"protocol selection"` if
+    /// nothing at all arrives in `replyTimeout`, and
+    /// ``SessionError/protocolRejected(name:detail:)`` if the response begins
+    /// with `-`; anything else is handed back for the caller to judge.
+    public func selectProtocol(
+        _ name: String, idle: TimeInterval, replyTimeout: TimeInterval = Session.handshakeTimeout
+    ) async throws -> [UInt8] {
         var message = Array(name.utf8)
         message.append(contentsOf: Array(Generated.handshakeTerminator.utf8))
         try await writeAll(message)
-        let response = try await readAvailable(idle: idle, max: 256)
+        let response = try await readAvailable(first: replyTimeout, idle: idle, max: 256)
+        guard !response.isEmpty else {
+            throw SessionError.timeout(
+                phase: "protocol selection", ms: UInt64((replyTimeout * 1000).rounded()))
+        }
         if response.first == Array(Generated.handshakeRejectPrefix.utf8).first {
             let detail = String(decoding: response, as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -266,15 +320,30 @@ public final class Session: @unchecked Sendable {
 
     /// Full handshake: read the greeting, pick the first `preferred` protocol
     /// the device offers (falling back to its first offered), and select it.
-    public func handshake(preferred: [String], idle: TimeInterval) async throws -> HandshakeOutcome
-    {
-        let greeting = try await readAvailable(idle: idle, max: 256)
+    ///
+    /// The greeting is given `greetingTimeout` to begin and `idle` to finish,
+    /// and the selection's reply the same two budgets; a device that says
+    /// nothing at all in `greetingTimeout` fails with
+    /// ``SessionError/timeout(phase:ms:)`` for phase `"greeting"`, reporting
+    /// the wait actually spent. One that greets without offering anything
+    /// usable fails with ``SessionError/noProtocolOffered``. The default is
+    /// ``handshakeTimeout``; tests shorten it.
+    public func handshake(
+        preferred: [String], idle: TimeInterval,
+        greetingTimeout: TimeInterval = Session.handshakeTimeout
+    ) async throws -> HandshakeOutcome {
+        let greeting = try await readAvailable(first: greetingTimeout, idle: idle, max: 256)
+        guard !greeting.isEmpty else {
+            throw SessionError.timeout(
+                phase: "greeting", ms: UInt64((greetingTimeout * 1000).rounded()))
+        }
         let offered = Session.parseProtocolList(greeting)
         guard let selected = preferred.first(where: { offered.contains($0) }) ?? offered.first
         else {
             throw SessionError.noProtocolOffered
         }
-        let response = try await selectProtocol(selected, idle: idle)
+        let response = try await selectProtocol(
+            selected, idle: idle, replyTimeout: greetingTimeout)
         return HandshakeOutcome(
             greeting: greeting, offered: offered, selected: selected, response: response
         )

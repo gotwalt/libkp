@@ -22,7 +22,7 @@ Requires Swift 6.0 or newer and macOS 13+.
 | `Sources/LibKP/Generated.swift` | **Generated** constants and lookup tables — do not edit; see [`../codegen`](../codegen) |
 | `Sources/LibKP/Protocol.swift` | The discovery TagStream encoding and the poll packet |
 | `Sources/LibKP/Discovery.swift` | UDP discovery over an exclusively-bound BSD socket |
-| `Sources/LibKP/Session.swift` | TCP session, protocol handshake, stream preamble, and the per-peer connection ledger that spaces opens by the cooldown |
+| `Sources/LibKP/Session.swift` | TCP session, protocol handshake, stream preamble, and the per-peer connection ledger that spaces opens by the cooldown. The handshake gives the greeting, and then the selection reply, `Session.handshakeTimeout` (2 s) to *begin* — a device that has served a few sessions can take most of a second to send its first byte — and only the short idle gap between chunks once it has |
 | `Sources/LibKP/Inbox.swift` | The timed read buffer behind the session's async reads |
 | `Sources/LibKP/Midi3.swift` | Stream framing/unframing |
 | `Sources/LibKP/Nrpn.swift` | SysEx/NRPN builders and parsers |
@@ -35,6 +35,7 @@ Requires Swift 6.0 or newer and macOS 13+.
 | `Sources/LibKP/DeviceModel.swift` | The `actor` that owns both links and publishes state |
 | `Sources/LibKP/Link.swift` | Connect options, the stream link, and the supervisor: connect order, reconnect, channel health |
 | `Sources/LibKP/Lane.swift` | The request lane: requests that resolve with their reply, and `refresh()` |
+| `Sources/LibKP/Navigator.swift` | The Navigator: the vector-pinned state machine that serialises rig loads, and `navigateTo` / `stepRig` / `stepBank` / `selectSlot` |
 | `Sources/meters/main.swift` | A live full-screen terminal view |
 | `Sources/MetersApp/` | The same dashboard as a native SwiftUI macOS app |
 
@@ -120,6 +121,15 @@ code the model uses. An app that holds a model should not open either beside
 it: the model already has the dump and the live pushes, and a third session is
 churn the device objects to.
 
+Every socket goes through `Session.connect`, whose ledger spaces opens to a
+peer by `Session.connectionCooldown`; once dialled, `Session.handshake` waits
+up to `Session.handshakeTimeout` (`Generated.handshakeTimeoutMs`, 2000) for
+the first byte of the greeting, and again for the first byte of the reply to
+the protocol selection, before reading the rest of each with the short idle
+gap. A device that has served a few sessions can take most of a second to
+greet, and a connect must not fail on that. A device that never greets throws
+`SessionError.timeout` for the `"greeting"` phase, reporting that full wait.
+
 Discovery is a one-liner when the address is unknown:
 
 ```swift
@@ -157,9 +167,11 @@ block, the beat pulse and tuner deviance — high-rate data best polled through
   echo it back, so follow a set with `requestParam` when the snapshot should
   confirm the new value — the `$41` reply flows through normal ingest, which is
   what `MetersApp` does when you click an effect block.
-- **Actions** (`tapTempo`, `rigUp`, `selectRig`, `send(control:)`, …) are
+- **Actions** (`tapTempo`, `morphPedal`, `bank`, `send(control:)`, …) are
   momentary presses and live expression. They go out as 7-bit Control Change
   messages and are *not* reflected in state.
+- **Navigation** (`navigateTo`, `stepRig(by:)`, `stepBank(forward:)`,
+  `selectSlot`) is the one way to load a rig — see below.
 - **Requests** (`requestParam`, `requestString`, `requestExtParam`,
   `requestExtString`, `requestRender`, and `refresh` with its `refreshRig` /
   `refreshBank` / `refreshPosition` subsets) are read-only: they ask the
@@ -169,6 +181,40 @@ block, the beat pulse and tuner deviance — high-rate data best polled through
   way), or throws `RequestError.timeout` after `Generated.requestTimeoutMs`
   with no retry. The morph position is `RequestError.unreadable` without a
   byte sent: the stream never answers it, the control link carries it.
+
+### Loading rigs: the Navigator
+
+Two rig loads that land on top of each other wedge the device: it answers the
+first, closes the session some twenty seconds later, and stops accepting
+connections until it is power-cycled. So the model is the only thing that
+loads a rig, through its **Navigator**, and the direct routes —
+`send(control: .loadSlot(_:))`, `.up`, `.down`, a Program Change or Bank
+Select, and `sendRaw` bytes carrying any of them — throw
+`CommandError.rigLoadRequiresNavigator` before a byte is written. The bank
+preselect (`bank(_:)`, CC47) loads nothing on its own and still passes.
+
+```swift
+await model.navigateTo(16)          // a flat 0-based rig index: bank 4, slot 2
+await model.stepRig(by: 1)          // from state.aimedRigIndex, floored at 0
+await model.stepBank(forward: true) // ± Params.bankSlots
+await model.selectSlot(3)           // slot 1…5 of the aimed bank
+```
+
+Every call returns at once with the aim recorded in `state.navigation`
+(`aim`, `inFlight`); `state.aimedRigIndex` is the aim while there is one,
+else `currentRigIndex`, and is what the steppers step from — so two taps
+inside the device's reporting delay compose instead of both stepping from the
+same stale index. A load is the documented pair, bank preselect then slot
+load, and is in flight for `Generated.rigLoadSettleMs` (500 ms, the measured
+edge of the device pushing the landed rig on both wires); taps during the
+flight only move the aim, and the final aim is sent once the flight settles, so
+a burst costs two loads however long it is. The device's position report
+(either wire) that matches the aim retires it with `navigationSettled`; an
+aim the device never confirms — past the last rig, which it ignores — is
+dropped `Generated.pendingWindowMs` (1500 ms) after its move settled, with
+`navigationDropped`, and the device's own position is the truth again. The
+steppers do nothing until a position is known. The state machine is pure
+(`NavigatorState`) and pinned by `spec/vectors/navigation.json`.
 
 ## The `meters` example
 
@@ -209,9 +255,15 @@ swift run MetersApp
 
 It discovers a device on the LAN by default. Settings (⌘,) switches to a manual
 IP for a device discovery cannot reach, and toggles the level list between the
-three bar meters and all eleven raw fields. When the device drops the
-connection the app says so and reconnects on its own. The morph readout comes
-from the model's control link; while the model is `.degraded` it shows `—`.
+three bar meters and all eleven raw fields. The app connects with
+`ReconnectPolicy(stream: .defaultStream())`, so when the device drops the
+connection the model dials again on its own and the app only shows the
+attempt count; its rig buttons forward to the model's Navigator, and the
+highlighted slot is `state.navigation.aim` until the device confirms the move.
+The morph readout comes from the model's control link; while the model is
+`.degraded` it shows `—`. With `KP_DEBUG_PORT` set it also listens on loopback
+for the same taps as text commands, plus a `state` line that reports the
+connection, channels, navigation and position as JSON.
 
 ## Tests
 

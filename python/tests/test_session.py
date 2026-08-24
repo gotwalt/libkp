@@ -17,6 +17,7 @@ from fake_device import FakeDevice
 from libkp.errors import ConnectError, ProtocolRejectedError, TimeoutErrorLibKP
 from libkp.session import (
     CONNECTION_COOLDOWN,
+    HANDSHAKE_TIMEOUT,
     PROTOCOL_MIDI3_STREAM,
     PROTOCOL_RESERVED,
     HandshakeOutcome,
@@ -91,17 +92,75 @@ def test_handshake_surfaces_a_rejection():
     assert "NO" in str(error)
 
 
-def test_handshake_without_a_greeting_times_out():
+def test_handshake_with_an_empty_greeting_fails_as_a_greeting_timeout():
+    # The device answered, but offered nothing to choose: the handshake reports
+    # it the same way as never hearing back, and names the wait it was given.
     async def scenario():
         async with FakeDevice(offered=[]) as device:
             session = await Session.connect("127.0.0.1", device.port)
             try:
-                with pytest.raises(TimeoutErrorLibKP):
-                    await session.handshake([PROTOCOL_MIDI3_STREAM], 0.05)
+                with pytest.raises(TimeoutErrorLibKP) as excinfo:
+                    await session.handshake([PROTOCOL_MIDI3_STREAM], IDLE, timeout=0.2)
+                return excinfo.value
             finally:
                 await session.close()
 
-    asyncio.run(scenario())
+    error = asyncio.run(scenario())
+    assert error.phase == "greeting"
+    assert error.seconds == 0.2
+
+
+def test_handshake_waits_out_a_slow_greeting():
+    # A device that has served a few sessions has been seen taking most of a
+    # second before its first greeting byte -- far longer than the inter-chunk
+    # idle gap. The greeting wait is bounded by HANDSHAKE_TIMEOUT, not the gap,
+    # so a greeting ten times the gap late still connects.
+    delay = 0.3
+    assert delay > IDLE
+    assert delay < HANDSHAKE_TIMEOUT
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(greeting_delay=delay) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                outcome = await session.handshake([PROTOCOL_MIDI3_STREAM], 0.03)
+                return outcome, loop.time() - started
+            finally:
+                await session.close()
+
+    outcome, elapsed = asyncio.run(scenario())
+    assert outcome.offered == [PROTOCOL_RESERVED, PROTOCOL_MIDI3_STREAM]
+    assert outcome.selected == PROTOCOL_MIDI3_STREAM
+    assert outcome.accepted
+    assert elapsed >= delay
+
+
+def test_handshake_without_a_greeting_times_out():
+    # A device that never greets fails the connect with the greeting timeout,
+    # which reports the wait actually made. The timeout is shortened so the test
+    # does not sit out the full HANDSHAKE_TIMEOUT.
+    timeout = 0.2
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(greet=False) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                with pytest.raises(TimeoutErrorLibKP) as excinfo:
+                    await session.handshake([PROTOCOL_MIDI3_STREAM], IDLE, timeout=timeout)
+                return excinfo.value, loop.time() - started
+            finally:
+                await session.close()
+
+    error, elapsed = asyncio.run(scenario())
+    assert error.phase == "greeting"
+    assert error.seconds == timeout
+    assert f"{timeout * 1000:.0f} ms" in str(error)
+    assert elapsed >= timeout
+    assert elapsed < HANDSHAKE_TIMEOUT
 
 
 def test_response_tail_carries_the_first_stream_burst():

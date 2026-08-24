@@ -23,6 +23,7 @@ from libkp.errors import (
     RequestDisconnectedError,
     RequestTimeoutError,
     RequestUnreadableError,
+    RigLoadRequiresNavigatorError,
     SessionError,
     UnknownSlotError,
 )
@@ -45,6 +46,9 @@ from libkp.state import (
     ConnectionChanged,
     Disconnected,
     EffectChanged,
+    NavDrop,
+    NavigationDropped,
+    NavigationSettled,
     RequestTimedOut,
     Status,
     SyncCompleted,
@@ -764,47 +768,23 @@ def test_actions_emit_control_changes():
             model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
             try:
                 await model.tap_tempo()
-                await model.select_rig(3)
-                await model.rig_up()
-                await model.rig_down()
                 await model.bank(4)
                 await model.tuner_mode(True)
                 await model.freeze(False)
-                await wait_for(lambda: len(device.received) >= 7)
+                await model.send_raw(bytes([0xB0, 30, 1]))
+                await wait_for(lambda: len(device.received) >= 5)
             finally:
                 await model.close()
             return device.received
 
     received = run(scenario())
-    assert received[:7] == [
+    assert received[:5] == [
         bytes([0xB0, 30, 1]),
-        # select_rig / rig_up / rig_down are momentary: press then release.
-        bytes([0xB0, 52, 1, 0xB0, 52, 0]),
-        bytes([0xB0, 48, 1, 0xB0, 48, 0]),
-        bytes([0xB0, 49, 1, 0xB0, 49, 0]),
+        # The bank preselect loads nothing, so it is not the Navigator's.
         bytes([0xB0, 47, 3]),
         bytes([0xB0, 31, 1]),
         bytes([0xB0, 35, 0]),
-    ]
-
-
-def test_select_rig_index_sends_absolute_bank_then_slot():
-    """Index 123 is bank 25 slot 4: CC47 value 24, then CC53 press/release."""
-
-    async def scenario():
-        async with FakeDevice() as device:
-            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
-            try:
-                await model.select_rig_index(123)
-                await wait_for(lambda: len(device.received) >= 2)
-            finally:
-                await model.close()
-            return device.received
-
-    received = run(scenario())
-    assert received[:2] == [
-        bytes([0xB0, 47, 24]),
-        bytes([0xB0, 53, 1, 0xB0, 53, 0]),
+        bytes([0xB0, 30, 1]),
     ]
 
 
@@ -830,6 +810,280 @@ def test_commands_after_close_are_rejected():
                 await model.tap_tempo()
 
     run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# The Navigator
+# ---------------------------------------------------------------------------
+
+#: The device landing on bank 2, slot 4: flat index 14.
+POSITION_14 = [ext_param(gen.CURRENT_BANK_ADDRESS, 2), ext_param(gen.CURRENT_RIG_SLOT_ADDRESS, 4)]
+
+
+def rig_load(index: int) -> list[bytes]:
+    """The pair the Navigator puts on the wire for a flat index: the absolute
+    bank preselect (CC47, its value a 7-bit data byte), then the slot load's
+    press and release."""
+    bank, slot = divmod(index, gen.BANK_SLOTS)
+    return [
+        bytes([0xB0, 47, bank & 0x7F]),
+        bytes([0xB0, 50 + slot, 1, 0xB0, 50 + slot, 0]),
+    ]
+
+
+def test_navigate_to_sends_absolute_bank_then_slot():
+    """Index 123 is bank 25 slot 4: CC47 value 24, then CC53 press/release."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            try:
+                model.navigate_to(123)
+                await wait_for(lambda: len(device.received) >= 2)
+                return device.received, model.state()
+            finally:
+                await model.close()
+
+    received, state = run(scenario())
+    assert received[:2] == rig_load(123)
+    assert state.navigation.aim == 123
+    assert state.navigation.in_flight is True
+    assert state.aimed_rig_index == 123
+
+
+def test_a_burst_of_aims_costs_exactly_two_loads_a_settle_apart():
+    """Three taps before the first move settles: the first goes out at once,
+    the last when the settle elapses, and the one in between never."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            snapshots = model.subscribe()
+            await drain(snapshots)
+            try:
+                model.navigate_to(14)
+                model.navigate_to(15)
+                model.navigate_to(16)
+                await wait_for(lambda: len(device.received) >= 2)
+                first_at = loop.time()
+                aimed = model.state()
+                await wait_for(lambda: len(device.received) >= 4)
+                second_at = loop.time()
+                # Nothing more follows: the aim in between was never sent.
+                await asyncio.sleep(0.2)
+                return device.received, second_at - first_at, aimed, await drain(snapshots)
+            finally:
+                await model.close()
+
+    received, spacing, aimed, snapshots = run(scenario())
+    assert received == rig_load(14) + rig_load(16)
+    assert spacing >= gen.RIG_LOAD_SETTLE_MS / 1000.0 - 0.02
+    # The aim moved freely while the first move was in flight.
+    assert aimed.navigation.aim == 16
+    assert aimed.navigation.in_flight is True
+    assert aimed.aimed_rig_index == 16
+    # The navigation is part of the snapshot: aiming and settling are slow changes.
+    assert [(s.navigation.aim, s.navigation.in_flight) for s in snapshots][:1] == [(14, True)]
+    assert any(s.navigation.aim == 16 and s.navigation.in_flight for s in snapshots)
+
+
+def test_a_matching_position_settles_the_aim():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            events = model.events()
+            try:
+                model.navigate_to(14)
+                await wait_for(lambda: len(device.received) >= 2)
+                for message in POSITION_14:
+                    await device.push(message)
+                settled = await next_event(events, NavigationSettled)
+                return settled, model.state()
+            finally:
+                await model.close()
+
+    settled, state = run(scenario())
+    assert settled == NavigationSettled(14)
+    assert state.navigation.aim is None
+    assert state.current_rig_index == 14
+    assert state.aimed_rig_index == 14
+
+
+def test_a_mismatched_position_keeps_the_aim():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            seen = []
+            model.add_event_listener(seen.append)
+            try:
+                model.navigate_to(999)
+                await wait_for(lambda: len(device.received) >= 2)
+                for message in POSITION_14:
+                    await device.push(message)
+                await wait_for(lambda: model.state().current_rig_index == 14)
+                return model.state(), seen
+            finally:
+                await model.close()
+
+    state, seen = run(scenario())
+    assert state.navigation.aim == 999
+    assert state.aimed_rig_index == 999
+    assert not any(isinstance(e, NavigationSettled | NavigationDropped) for e in seen)
+
+
+def test_an_aim_the_device_never_confirms_is_dropped_after_the_window():
+    """Past the last rig the device stays put; the aim outlives the settle by
+    the pending window, then goes, and the same index is sendable again."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            events = model.events()
+            try:
+                model.navigate_to(999)
+                started = loop.time()
+                await wait_for(lambda: len(device.received) >= 2)
+                dropped = await next_event(events, NavigationDropped)
+                elapsed = loop.time() - started
+                state = model.state()
+                model.navigate_to(999)
+                await wait_for(lambda: len(device.received) >= 4)
+                return dropped, elapsed, state, device.received
+            finally:
+                await model.close()
+
+    dropped, elapsed, state, received = run(scenario())
+    assert dropped == NavigationDropped(999, NavDrop.UNCONFIRMED)
+    assert elapsed >= (gen.RIG_LOAD_SETTLE_MS + gen.PENDING_WINDOW_MS) / 1000.0 - 0.02
+    assert state.navigation.aim is None
+    assert state.navigation.in_flight is False
+    assert received == rig_load(999) + rig_load(999)
+
+
+def test_an_aim_sent_once_is_not_sent_again_while_it_stands():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            try:
+                model.navigate_to(14)
+                model.navigate_to(14)
+                await wait_for(lambda: len(device.received) >= 2)
+                await asyncio.sleep(gen.RIG_LOAD_SETTLE_MS / 1000.0 + 0.1)
+                model.navigate_to(14)
+                await asyncio.sleep(0.1)
+                return device.received
+            finally:
+                await model.close()
+
+    assert run(scenario()) == rig_load(14)
+
+
+def test_steps_and_slots_aim_from_the_aimed_position():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            try:
+                # Nothing is known yet, so there is nothing to step from.
+                model.step_rig(1)
+                model.step_bank(True)
+                model.select_slot(2)
+                await asyncio.sleep(0.05)
+                assert device.received == []
+                for message in POSITION_14:
+                    await device.push(message)
+                await wait_for(lambda: model.state().current_rig_index == 14)
+                model.step_rig(0)  # lands where the aim is: nothing to send
+                await asyncio.sleep(0.05)
+                assert device.received == []
+                model.step_rig(1)  # 15: sent at once
+                model.step_rig(1)  # 16: in flight, so only the aim moves
+                model.step_bank(True)  # 21
+                model.select_slot(2)  # slot 2 of bank 4: 16
+                model.select_slot(6)  # out of range: ignored
+                model.step_bank(False)  # 11
+                model.step_rig(-100)  # floored at 0
+                await wait_for(lambda: len(device.received) >= 2)
+                aimed = model.state().aimed_rig_index
+                await wait_for(lambda: len(device.received) >= 4)
+                return device.received, aimed
+            finally:
+                await model.close()
+
+    received, aimed = run(scenario())
+    assert aimed == 0
+    assert received == rig_load(15) + rig_load(0)
+
+
+def test_rig_loads_are_refused_outside_the_navigator():
+    """Every door but the Navigator refuses a load before a byte is written."""
+    from libkp import control
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            try:
+                refused = [
+                    control.LoadSlot(3),
+                    control.Up(),
+                    control.Down(),
+                    control.ProgramChange(5),
+                    control.BankSelect(0, 1),
+                ]
+                for item in refused:
+                    with pytest.raises(RigLoadRequiresNavigatorError):
+                        await model.send_control(item)
+                for raw in (
+                    bytes([0xC0, 5]),
+                    bytes([0xC3, 0]),
+                    bytes([0xB0, 50, 1, 0xB0, 50, 0]),
+                    bytes([0xB0, 48, 1]),
+                    bytes([0xB0, 30, 1, 0xB0, 54, 1]),
+                ):
+                    with pytest.raises(RigLoadRequiresNavigatorError):
+                        await model.send_raw(raw)
+                await asyncio.sleep(0.05)
+                return device.received
+            finally:
+                await model.close()
+
+    assert run(scenario()) == []
+
+
+def test_an_aim_while_disconnected_is_dropped_at_once():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            seen = []
+            model.add_event_listener(seen.append)
+            await model.close()
+            model.navigate_to(3)
+            return seen, model.state()
+
+    seen, state = run(scenario())
+    assert NavigationDropped(3, NavDrop.UNCONFIRMED) in seen
+    assert state.navigation.aim is None
+
+
+def test_close_cancels_the_navigator_and_clears_the_aim_without_an_event():
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            seen = []
+            model.add_event_listener(seen.append)
+            model.navigate_to(14)
+            await wait_for(lambda: len(device.received) >= 2)
+            await model.close()
+            cleared = model.state()
+            # Past the settle and the window: the cancelled timers stay quiet.
+            await asyncio.sleep(0.1)
+            return cleared, seen
+
+    cleared, seen = run(scenario())
+    assert cleared.navigation.aim is None
+    assert cleared.navigation.in_flight is False
+    assert not any(isinstance(e, NavigationSettled | NavigationDropped) for e in seen)
 
 
 # ---------------------------------------------------------------------------

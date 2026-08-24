@@ -20,6 +20,7 @@ use tokio::time::Instant;
 use super::core::Core;
 use super::lane::{self, RequestLane};
 use super::links;
+use super::nav::Navigator;
 use super::{ChannelError, CommandError, ConnectOptions, ControlPolicy, SyncStrategy};
 use crate::error::SessionError;
 use crate::generated;
@@ -29,6 +30,8 @@ use crate::state::{ChannelState, Connection};
 pub(crate) struct Shared {
     pub(crate) core: Core,
     pub(crate) lane: RequestLane,
+    /// The one way a rig is loaded: the aim, the pacing, the two timers.
+    pub(crate) nav: Navigator,
     pub(crate) ip: Ipv4Addr,
     pub(crate) opts: ConnectOptions,
     life: Mutex<Life>,
@@ -75,6 +78,7 @@ impl Shared {
         Shared {
             core: Core::new(opts.control),
             lane: RequestLane::new(),
+            nav: Navigator::new(),
             ip,
             opts,
             life: Mutex::new(Life::default()),
@@ -107,6 +111,23 @@ impl Shared {
             .map_err(|_| CommandError::Disconnected)
     }
 
+    /// Put raw MIDI bytes on the current life's command queue without
+    /// waiting: what a caller that must return at once — the Navigator's
+    /// tap — uses. A full queue is refused as [`CommandError::Disconnected`]
+    /// rather than waited out; sixty-four unwritten commands mean the wire is
+    /// not draining, and a rig load queued behind them would land who knows
+    /// when.
+    pub(crate) fn try_enqueue(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
+        let sender = self
+            .life()
+            .commands
+            .clone()
+            .ok_or(CommandError::Disconnected)?;
+        sender
+            .try_send(bytes)
+            .map_err(|_| CommandError::Disconnected)
+    }
+
     /// Close everything: cancel every task, drop both sockets with them, and
     /// let the core say [`Connection::Disconnected`]. Idempotent — the flag
     /// makes the second call a no-op before it touches anything.
@@ -122,6 +143,7 @@ impl Shared {
             life.abort_links();
         }
         self.core.bump_epoch();
+        self.nav.clear();
         self.core.closed();
     }
 
@@ -204,6 +226,7 @@ async fn start_life(
                 // session — and the socket — is closed before this returns.
                 let _ = stream.await;
                 shared.core.bump_epoch();
+                shared.nav.clear();
                 shared.core.stream_lost(on_failure);
                 return Err(e);
             }
@@ -236,10 +259,12 @@ async fn supervise(shared: Arc<Shared>, mut stream: JoinHandle<()>) {
         if shared.is_closed() {
             return;
         }
-        // The old life is over: nothing of it may write again, and both
-        // sockets go together.
+        // The old life is over: nothing of it may write again, both sockets
+        // go together, and an aim with no wire to confirm it on is forgotten
+        // without a word.
         shared.core.bump_epoch();
         shared.life().abort_links();
+        shared.nav.clear();
 
         let Some(backoff) = shared.opts.reconnect.stream else {
             shared.core.stream_lost(Connection::Disconnected);

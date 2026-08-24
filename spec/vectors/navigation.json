@@ -1,0 +1,796 @@
+{
+  "description": "The Navigator's pure state machine {aim, sent, in_flight, awaiting}, started fresh (all None/false) and driven by ordered steps: navigate:n (aim = n; pump unless in flight), settle:true (the RIG_LOAD_SETTLE_MS timer fired: in_flight = false; if the aim is the sent index and still unconfirmed, start_window and awaiting = true; then pump), window:true (the PENDING_WINDOW_MS timer fired: while awaiting, drop the aim and forget the sent index), position:n (a position report from either wire: only a report equal to the aim retires it, clearing aim, sent and awaiting). pump sends the aim when nothing is in flight and the aim is not the index already sent: sent = aim, in_flight = true, awaiting = false -> send:n, start_settle. expect.sent is every send's index in order (the wire log), expect.actions the exact ordered actions across all steps (send:n, start_settle, start_window, settled:n, dropped:n), and aim / in_flight / awaiting the final state. A stale timer is harmless: settle with nothing aimed and window while not awaiting do nothing, so the model never needs to cancel one.",
+  "cases": [
+    {
+      "name": "a tap burst sends the first tap and moves the aim",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "navigate": 16
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle"
+        ],
+        "aim": 16,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a tap burst costs two loads: the settle sends the final aim",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "navigate": 16
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          16
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "send:16",
+          "start_settle"
+        ],
+        "aim": 16,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "the burst lands: the position retires the final aim and the last settle sends nothing",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 16
+        },
+        {
+          "settle": true
+        },
+        {
+          "position": 16
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          16
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "send:16",
+          "start_settle",
+          "settled:16"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "navigate while in flight only moves the aim",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 15
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "re-navigating to the sent index while in flight sends nothing more on settle",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window"
+        ],
+        "aim": 14,
+        "in_flight": false,
+        "awaiting": true
+      }
+    },
+    {
+      "name": "an aim that returns to the sent index in flight is not re-sent",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window"
+        ],
+        "aim": 14,
+        "in_flight": false,
+        "awaiting": true
+      }
+    },
+    {
+      "name": "re-navigating to the sent index during the window does not re-send and leaves the window running",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "navigate": 14
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window"
+        ],
+        "aim": 14,
+        "in_flight": false,
+        "awaiting": true
+      }
+    },
+    {
+      "name": "a re-tapped aim the device never confirms is still dropped",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "navigate": 14
+        },
+        {
+          "window": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window",
+          "dropped:14"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "settle with a still-unconfirmed aim starts the window",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window"
+        ],
+        "aim": 14,
+        "in_flight": false,
+        "awaiting": true
+      }
+    },
+    {
+      "name": "aim past the end: a position that is not the aim keeps it during the window",
+      "steps": [
+        {
+          "navigate": 999
+        },
+        {
+          "settle": true
+        },
+        {
+          "position": 13
+        }
+      ],
+      "expect": {
+        "sent": [
+          999
+        ],
+        "actions": [
+          "send:999",
+          "start_settle",
+          "start_window"
+        ],
+        "aim": 999,
+        "in_flight": false,
+        "awaiting": true
+      }
+    },
+    {
+      "name": "aim past the end expires after the window",
+      "steps": [
+        {
+          "navigate": 999
+        },
+        {
+          "settle": true
+        },
+        {
+          "position": 13
+        },
+        {
+          "window": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          999
+        ],
+        "actions": [
+          "send:999",
+          "start_settle",
+          "start_window",
+          "dropped:999"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a drop forgets the sent index, so the same index is sent again",
+      "steps": [
+        {
+          "navigate": 999
+        },
+        {
+          "settle": true
+        },
+        {
+          "window": true
+        },
+        {
+          "navigate": 999
+        }
+      ],
+      "expect": {
+        "sent": [
+          999,
+          999
+        ],
+        "actions": [
+          "send:999",
+          "start_settle",
+          "start_window",
+          "dropped:999",
+          "send:999",
+          "start_settle"
+        ],
+        "aim": 999,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a new aim after a drop is sent at once",
+      "steps": [
+        {
+          "navigate": 999
+        },
+        {
+          "settle": true
+        },
+        {
+          "window": true
+        },
+        {
+          "navigate": 14
+        }
+      ],
+      "expect": {
+        "sent": [
+          999,
+          14
+        ],
+        "actions": [
+          "send:999",
+          "start_settle",
+          "start_window",
+          "dropped:999",
+          "send:14",
+          "start_settle"
+        ],
+        "aim": 14,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a matching position retires the aim while the move is still in flight",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "position": 14
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "settled:14"
+        ],
+        "aim": null,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a matching position retires the aim and a later settle sends nothing",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "position": 14
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "settled:14"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a matching position during the window retires the aim",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "position": 14
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window",
+          "settled:14"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "the window after a confirmed aim drops nothing",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "position": 14
+        },
+        {
+          "window": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window",
+          "settled:14"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a mismatched position keeps the aim",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "position": 13
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle"
+        ],
+        "aim": 14,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "the sent move landing does not confirm an aim that has moved on",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "position": 14
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "the sent move landing does not confirm an aim that has moved on, and the settle sends it",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "position": 14
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          15
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "send:15",
+          "start_settle"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "an early confirmation does not shorten the settle: the next aim waits for it",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "position": 14
+        },
+        {
+          "navigate": 15
+        }
+      ],
+      "expect": {
+        "sent": [
+          14
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "settled:14"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "an early confirmation does not shorten the settle: the settle then sends the next aim",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "position": 14
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "settle": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          15
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "settled:14",
+          "send:15",
+          "start_settle"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "index 0 is a real aim",
+      "steps": [
+        {
+          "navigate": 0
+        },
+        {
+          "position": 0
+        }
+      ],
+      "expect": {
+        "sent": [
+          0
+        ],
+        "actions": [
+          "send:0",
+          "start_settle",
+          "settled:0"
+        ],
+        "aim": null,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "navigate while awaiting cancels the window and pumps at once",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "navigate": 15
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          15
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window",
+          "send:15",
+          "start_settle"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "the cancelled window's timer firing late drops nothing",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "window": true
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          15
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window",
+          "send:15",
+          "start_settle"
+        ],
+        "aim": 15,
+        "in_flight": true,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a second navigate during the window opens its own window on settle, and the position closes it",
+      "steps": [
+        {
+          "navigate": 14
+        },
+        {
+          "settle": true
+        },
+        {
+          "navigate": 15
+        },
+        {
+          "settle": true
+        },
+        {
+          "position": 15
+        }
+      ],
+      "expect": {
+        "sent": [
+          14,
+          15
+        ],
+        "actions": [
+          "send:14",
+          "start_settle",
+          "start_window",
+          "send:15",
+          "start_settle",
+          "start_window",
+          "settled:15"
+        ],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "a position with no aim is ignored",
+      "steps": [
+        {
+          "position": 3
+        }
+      ],
+      "expect": {
+        "sent": [],
+        "actions": [],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    },
+    {
+      "name": "stale timers with nothing pending do nothing",
+      "steps": [
+        {
+          "settle": true
+        },
+        {
+          "window": true
+        }
+      ],
+      "expect": {
+        "sent": [],
+        "actions": [],
+        "aim": null,
+        "in_flight": false,
+        "awaiting": false
+      }
+    }
+  ]
+}

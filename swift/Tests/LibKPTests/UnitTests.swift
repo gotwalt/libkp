@@ -433,6 +433,35 @@ final class ControlTests: XCTestCase {
         XCTAssertEqual(Control.programChange(200).message(), [0xC0, 72])
         XCTAssertEqual(Control.bankSelect(msb: 130, lsb: 129).message(), [0xB0, 0, 2, 0xB0, 32, 1])
     }
+
+    /// What `sendRaw` refuses: a Program Change on any channel, and a Control
+    /// Change on one of the rig-load controllers, anywhere in the bytes. The
+    /// bank preselect (CC47) loads nothing and passes, as does everything
+    /// else the app might send raw.
+    func testRawRigLoadsAreRecognised() {
+        XCTAssertTrue(DeviceModel.loadsARig([0xC0, 5]))
+        XCTAssertTrue(DeviceModel.loadsARig([0xCF, 0]))
+        XCTAssertTrue(DeviceModel.loadsARig(Control.loadSlot(3).message()))
+        XCTAssertTrue(DeviceModel.loadsARig(Control.up.message(channel: 4)))
+        XCTAssertTrue(DeviceModel.loadsARig(Control.down.message()))
+        XCTAssertTrue(
+            DeviceModel.loadsARig(
+                Control.bankPreselect(2).message() + Control.loadSlot(1).message()),
+            "a load anywhere in a raw batch is refused")
+        for controller in Generated.rigLoadControllers {
+            XCTAssertTrue(DeviceModel.loadsARig([0xB0, controller, 1]), "CC\(controller)")
+        }
+        XCTAssertFalse(DeviceModel.loadsARig(Control.bankPreselect(2).message()))
+        XCTAssertFalse(DeviceModel.loadsARig(Control.tapTempo.message()))
+        XCTAssertFalse(DeviceModel.loadsARig(Control.morphPedal(127).message()))
+        XCTAssertFalse(DeviceModel.loadsARig(Control.bankSelect(msb: 0, lsb: 1).message()))
+        XCTAssertFalse(
+            DeviceModel.loadsARig(
+                Nrpn.requestSingle(product: 0, device: 0x7F, page: 0x0A, number: 4)),
+            "SysEx data bytes never look like a status")
+        XCTAssertFalse(DeviceModel.loadsARig([]))
+        XCTAssertFalse(DeviceModel.loadsARig([0xB0]), "a truncated CC is not a load")
+    }
 }
 
 // MARK: - Name lookups
@@ -602,9 +631,26 @@ final class StateTests: XCTestCase {
         return message
     }
 
+    /// The aim stands in for the position while there is one; the flat index
+    /// is what navigation steps from.
+    func testAimedRigIndexPrefersTheAim() {
+        var state = DeviceState()
+        XCTAssertNil(state.aimedRigIndex)
+        XCTAssertEqual(state.navigation, Navigation())
+        state.currentBank = 3
+        state.currentRigSlot = 1
+        XCTAssertEqual(state.aimedRigIndex, 16)
+        state.navigation = Navigation(aim: 21, inFlight: true)
+        XCTAssertEqual(state.aimedRigIndex, 21)
+        XCTAssertEqual(state.currentRigIndex, 16, "the device's own position is untouched")
+        state.navigation = Navigation()
+        XCTAssertEqual(state.aimedRigIndex, 16)
+    }
+
     func testNewStateSeedsEightSlotsInOrder() {
         let state = DeviceState()
         XCTAssertEqual(state.connection, .disconnected)
+        XCTAssertEqual(state.navigation, Navigation())
         XCTAssertEqual(state.effects.count, 8)
         XCTAssertEqual(state.effects[0].slot, "A")
         XCTAssertEqual(state.effects[0].page, 0x32)

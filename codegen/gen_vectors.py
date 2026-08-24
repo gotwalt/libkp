@@ -600,6 +600,28 @@ def build():
         "extract_snapshot": _cbor_snapshot_cases(),
     })
 
+    # navigation: the pure rig-load serializer, driven one input at a time.
+    w("navigation.json", {
+        "description": "The Navigator's pure state machine {aim, sent, in_flight, awaiting}, "
+                       "started fresh (all None/false) and driven by ordered steps: "
+                       "navigate:n (aim = n; pump unless in flight), settle:true (the "
+                       "RIG_LOAD_SETTLE_MS timer fired: in_flight = false; if the aim is the "
+                       "sent index and still unconfirmed, start_window and awaiting = true; "
+                       "then pump), window:true (the PENDING_WINDOW_MS timer fired: while "
+                       "awaiting, drop the aim and forget the sent index), position:n (a "
+                       "position report from either wire: only a report equal to the aim "
+                       "retires it, clearing aim, sent and awaiting). pump sends the aim when "
+                       "nothing is in flight and the aim is not the index already sent: "
+                       "sent = aim, in_flight = true, awaiting = false -> send:n, start_settle. "
+                       "expect.sent is every send's index in order (the wire log), "
+                       "expect.actions the exact ordered actions across all steps "
+                       "(send:n, start_settle, start_window, settled:n, dropped:n), and "
+                       "aim / in_flight / awaiting the final state. A stale timer is "
+                       "harmless: settle with nothing aimed and window while not awaiting do "
+                       "nothing, so the model never needs to cancel one.",
+        "cases": _navigation_cases(),
+    })
+
 
 def _hdr(msg: bytes):
     h = parse_header(msg)
@@ -1019,6 +1041,229 @@ def _cbor_snapshot_cases():
              cbor_param_write(CURRENT_BANK_ADDRESS, 1) + cbor_param_write(CURRENT_RIG_SLOT_ADDRESS, 2)
              + cbor_param_write(MORPH_ADDRESS, 16383),
              1, 2, 16383, []),
+    ]
+
+
+# --------------------------------------------------------------------------
+# Navigation: the rig-load serializer as a pure state machine. Overlapping rig
+# loads wedge the device on a delayed fuse, so the model funnels every load
+# through this machine; the vectors pin its every transition so the three
+# ports cannot drift by one action.
+#
+# The rules, from the contract:
+#   navigate(t):      aim = t; if not in_flight: pump()
+#   settle_elapsed(): in_flight = false; if aim is the sent index (the settled
+#                     move's own target, still unconfirmed): start_window,
+#                     awaiting = true; then pump()
+#   window_elapsed(): if awaiting and aim is some a: aim = sent = None,
+#                     awaiting = false -> dropped(a)
+#   position(i):      if aim == i: aim = sent = None, awaiting = false
+#                     -> settled(i); otherwise nothing
+#   pump():           if not in_flight and aim is some a and sent != a:
+#                     sent = a, in_flight = true, awaiting = false
+#                     -> send(a), start_settle
+#
+# Two readings the contract leaves open are fixed here, and the cases below
+# pin them. First, settle starts the window only when the aim *is* the index
+# that was sent: an aim that moved on during the flight has no settled move to
+# wait on, it is simply pumped, so a burst never arms a window it immediately
+# abandons. Second, navigate clears `awaiting` only through the pump: a
+# re-navigate to the very index already sent, while its window is running,
+# leaves the window running — otherwise a re-tapped aim the device can never
+# confirm would stick forever, since the machine has no action to cancel a
+# timer, only to ignore a stale one.
+#
+# Every expectation below was derived by hand from those rules; the reference
+# replay in `_nav_replay` is a cross-check that fails loudly on a slip, never
+# the source of a value.
+
+_NAV_STEP_KINDS = frozenset({"navigate", "settle", "window", "position"})
+
+
+def nav(index: int) -> dict:
+    return {"navigate": index}
+
+
+def pos(index: int) -> dict:
+    return {"position": index}
+
+
+NAV_SETTLE = {"settle": True}
+NAV_WINDOW = {"window": True}
+
+
+def _nav_replay(steps: list[dict]) -> tuple[list[int], list[str], int | None, bool, bool]:
+    """Replay the rules above over a fresh machine; return what a case pins."""
+    aim = sent = None
+    in_flight = awaiting = False
+    sends: list[int] = []
+    actions: list[str] = []
+
+    def pump():
+        nonlocal sent, in_flight, awaiting
+        if not in_flight and aim is not None and sent != aim:
+            sent, in_flight, awaiting = aim, True, False
+            sends.append(aim)
+            actions.extend([f"send:{aim}", "start_settle"])
+
+    for step in steps:
+        kind, value = next(iter(step.items()))
+        if kind == "navigate":
+            aim = value
+            if not in_flight:
+                pump()
+        elif kind == "settle":
+            in_flight = False
+            if aim is not None and sent == aim:
+                awaiting = True
+                actions.append("start_window")
+            pump()
+        elif kind == "window":
+            if awaiting and aim is not None:
+                actions.append(f"dropped:{aim}")
+                aim = sent = None
+                awaiting = False
+        elif kind == "position":
+            if aim == value:
+                actions.append(f"settled:{value}")
+                aim = sent = None
+                awaiting = False
+    return sends, actions, aim, in_flight, awaiting
+
+
+def _nav_case(name: str, steps: list[dict], sent: list[int], actions: list[str],
+              aim: int | None, in_flight: bool, awaiting: bool) -> dict:
+    """One navigation case: the hand-derived expectation, cross-checked by replay."""
+    for s in steps:
+        assert len(s) == 1 and next(iter(s)) in _NAV_STEP_KINDS, s
+    for a in actions:
+        head, _, arg = a.partition(":")
+        assert head in ("send", "start_settle", "start_window", "settled", "dropped"), a
+        assert (arg == "") == (head in ("start_settle", "start_window")), a
+    assert sent == [int(a[5:]) for a in actions if a.startswith("send:")], name
+    expected = (sent, actions, aim, in_flight, awaiting)
+    replayed = _nav_replay(steps)
+    assert replayed == expected, f"{name}: hand derivation {expected} != replay {replayed}"
+    return {"name": name, "steps": steps,
+            "expect": {"sent": sent, "actions": actions, "aim": aim,
+                       "in_flight": in_flight, "awaiting": awaiting}}
+
+
+def _navigation_cases():
+    return [
+        # --- A burst of taps costs two loads however long it is: the first
+        #     tap sends, the aim moves freely while that move is in flight,
+        #     and the settle pumps the final aim once.
+        _nav_case("a tap burst sends the first tap and moves the aim",
+                  [nav(14), nav(15), nav(16)],
+                  [14], ["send:14", "start_settle"], 16, True, False),
+        _nav_case("a tap burst costs two loads: the settle sends the final aim",
+                  [nav(14), nav(15), nav(16), NAV_SETTLE],
+                  [14, 16], ["send:14", "start_settle", "send:16", "start_settle"],
+                  16, True, False),
+        _nav_case("the burst lands: the position retires the final aim and the last settle sends nothing",
+                  [nav(14), nav(16), NAV_SETTLE, pos(16), NAV_SETTLE],
+                  [14, 16], ["send:14", "start_settle", "send:16", "start_settle", "settled:16"],
+                  None, False, False),
+        _nav_case("navigate while in flight only moves the aim",
+                  [nav(14), nav(15)],
+                  [14], ["send:14", "start_settle"], 15, True, False),
+        # --- An index already sent is never re-sent, whether the aim comes
+        #     back to it in flight or is tapped again during its window.
+        _nav_case("re-navigating to the sent index while in flight sends nothing more on settle",
+                  [nav(14), nav(14), NAV_SETTLE],
+                  [14], ["send:14", "start_settle", "start_window"], 14, False, True),
+        _nav_case("an aim that returns to the sent index in flight is not re-sent",
+                  [nav(14), nav(15), nav(14), NAV_SETTLE],
+                  [14], ["send:14", "start_settle", "start_window"], 14, False, True),
+        _nav_case("re-navigating to the sent index during the window does not re-send and leaves the window running",
+                  [nav(14), NAV_SETTLE, nav(14)],
+                  [14], ["send:14", "start_settle", "start_window"], 14, False, True),
+        _nav_case("a re-tapped aim the device never confirms is still dropped",
+                  [nav(14), NAV_SETTLE, nav(14), NAV_WINDOW],
+                  [14], ["send:14", "start_settle", "start_window", "dropped:14"],
+                  None, False, False),
+        # --- Settle with a still-unconfirmed aim starts the window; the aim
+        #     past the end of the device's rigs is the case that needs it,
+        #     because the device stays put and reports where it is.
+        _nav_case("settle with a still-unconfirmed aim starts the window",
+                  [nav(14), NAV_SETTLE],
+                  [14], ["send:14", "start_settle", "start_window"], 14, False, True),
+        _nav_case("aim past the end: a position that is not the aim keeps it during the window",
+                  [nav(999), NAV_SETTLE, pos(13)],
+                  [999], ["send:999", "start_settle", "start_window"], 999, False, True),
+        _nav_case("aim past the end expires after the window",
+                  [nav(999), NAV_SETTLE, pos(13), NAV_WINDOW],
+                  [999], ["send:999", "start_settle", "start_window", "dropped:999"],
+                  None, False, False),
+        _nav_case("a drop forgets the sent index, so the same index is sent again",
+                  [nav(999), NAV_SETTLE, NAV_WINDOW, nav(999)],
+                  [999, 999],
+                  ["send:999", "start_settle", "start_window", "dropped:999", "send:999", "start_settle"],
+                  999, True, False),
+        _nav_case("a new aim after a drop is sent at once",
+                  [nav(999), NAV_SETTLE, NAV_WINDOW, nav(14)],
+                  [999, 14],
+                  ["send:999", "start_settle", "start_window", "dropped:999", "send:14", "start_settle"],
+                  14, True, False),
+        # --- A matching position retires the aim; a mismatch is ignored.
+        _nav_case("a matching position retires the aim while the move is still in flight",
+                  [nav(14), pos(14)],
+                  [14], ["send:14", "start_settle", "settled:14"], None, True, False),
+        _nav_case("a matching position retires the aim and a later settle sends nothing",
+                  [nav(14), pos(14), NAV_SETTLE],
+                  [14], ["send:14", "start_settle", "settled:14"], None, False, False),
+        _nav_case("a matching position during the window retires the aim",
+                  [nav(14), NAV_SETTLE, pos(14)],
+                  [14], ["send:14", "start_settle", "start_window", "settled:14"],
+                  None, False, False),
+        _nav_case("the window after a confirmed aim drops nothing",
+                  [nav(14), NAV_SETTLE, pos(14), NAV_WINDOW],
+                  [14], ["send:14", "start_settle", "start_window", "settled:14"],
+                  None, False, False),
+        _nav_case("a mismatched position keeps the aim",
+                  [nav(14), pos(13)],
+                  [14], ["send:14", "start_settle"], 14, True, False),
+        _nav_case("the sent move landing does not confirm an aim that has moved on",
+                  [nav(14), nav(15), pos(14)],
+                  [14], ["send:14", "start_settle"], 15, True, False),
+        _nav_case("the sent move landing does not confirm an aim that has moved on, and the settle sends it",
+                  [nav(14), nav(15), pos(14), NAV_SETTLE],
+                  [14, 15], ["send:14", "start_settle", "send:15", "start_settle"],
+                  15, True, False),
+        _nav_case("an early confirmation does not shorten the settle: the next aim waits for it",
+                  [nav(14), pos(14), nav(15)],
+                  [14], ["send:14", "start_settle", "settled:14"], 15, True, False),
+        _nav_case("an early confirmation does not shorten the settle: the settle then sends the next aim",
+                  [nav(14), pos(14), nav(15), NAV_SETTLE],
+                  [14, 15], ["send:14", "start_settle", "settled:14", "send:15", "start_settle"],
+                  15, True, False),
+        _nav_case("index 0 is a real aim",
+                  [nav(0), pos(0)],
+                  [0], ["send:0", "start_settle", "settled:0"], None, True, False),
+        # --- A navigate while awaiting cancels the window and pumps at once:
+        #     nothing is in flight, so the new index goes straight out.
+        _nav_case("navigate while awaiting cancels the window and pumps at once",
+                  [nav(14), NAV_SETTLE, nav(15)],
+                  [14, 15], ["send:14", "start_settle", "start_window", "send:15", "start_settle"],
+                  15, True, False),
+        _nav_case("the cancelled window's timer firing late drops nothing",
+                  [nav(14), NAV_SETTLE, nav(15), NAV_WINDOW],
+                  [14, 15], ["send:14", "start_settle", "start_window", "send:15", "start_settle"],
+                  15, True, False),
+        _nav_case("a second navigate during the window opens its own window on settle, and the position closes it",
+                  [nav(14), NAV_SETTLE, nav(15), NAV_SETTLE, pos(15)],
+                  [14, 15],
+                  ["send:14", "start_settle", "start_window", "send:15", "start_settle", "start_window", "settled:15"],
+                  None, False, False),
+        # --- Nothing pending: a position report with no aim, or a stale
+        #     timer, changes nothing.
+        _nav_case("a position with no aim is ignored",
+                  [pos(3)],
+                  [], [], None, False, False),
+        _nav_case("stale timers with nothing pending do nothing",
+                  [NAV_SETTLE, NAV_WINDOW],
+                  [], [], None, False, False),
     ]
 
 

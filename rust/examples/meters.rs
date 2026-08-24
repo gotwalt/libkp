@@ -116,6 +116,10 @@ async fn run(cli: Cli) -> Result<(), BoxErr> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('a') => view.all = !view.all,
+                    // Rig loads go through the Navigator: each tap moves the
+                    // aim, and the model sends one load at a time.
+                    KeyCode::Left => model.step_rig(-1),
+                    KeyCode::Right => model.step_rig(1),
                     _ => {}
                 },
                 Event::Resize(_, _) => {}
@@ -309,6 +313,12 @@ impl View {
             }
             DeviceEvent::RenderedString { text, .. } => {
                 self.last_param = Some(format!("rendered \"{text}\""))
+            }
+            DeviceEvent::NavigationSettled { index } => {
+                self.last_param = Some(format!("rig {index} loaded"))
+            }
+            DeviceEvent::NavigationDropped { index, .. } => {
+                self.last_param = Some(format!("rig {index} not reached"))
             }
             _ => {}
         }
@@ -714,7 +724,7 @@ impl View {
         ]);
 
         let help = Line::from(Span::styled(
-            "q / Ctrl-C quit    a toggle raw fields    play into the device to see meters move",
+            "q / Ctrl-C quit    a toggle raw fields    ←/→ previous/next rig    play into the device to see meters move",
             Style::default().dim(),
         ));
 

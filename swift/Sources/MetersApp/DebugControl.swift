@@ -7,7 +7,7 @@ import Network
 // can be reproduced and inspected without a pair of hands on the trackpad.
 
 /// A line-oriented TCP server on loopback that exposes the rig navigator and the
-/// store's position state.
+/// store's position, connection and navigation state.
 ///
 /// Off unless `KP_DEBUG_PORT` names a port, so a normal launch opens nothing.
 /// It binds `127.0.0.1` only, and every command it accepts is one the UI already
@@ -16,7 +16,7 @@ import Network
 /// One command per line, one reply line per command:
 ///
 /// ```
-/// state              the store's position, as JSON
+/// state              the store's position and connection, as JSON
 /// bank up|down       step one bank, keeping the slot
 /// rig up|down        step one rig
 /// slot <1-5>         load a slot in the loaded bank
@@ -153,24 +153,38 @@ final class DebugControl {
         return "ok"
     }
 
-    /// The store's position, as one line of JSON. Deliberately raw: the numbers
-    /// the navigator actually reads, not a rendering of them.
+    /// The store's position, connection and navigation, as one line of JSON.
+    /// Deliberately raw: the numbers the Navigator actually reads, not a
+    /// rendering of them.
     private func state() -> String {
+        let state = store.state
         let fields: [(String, String)] = [
             ("phase", quoted(store.phase.label)),
+            ("connection", quoted("\(state.connection)")),
+            (
+                "channels",
+                "{\"stream\":\(quoted("\(state.channels.stream)")),"
+                    + "\"control\":\(quoted("\(state.channels.control)"))}"
+            ),
+            (
+                "navigation",
+                "{\"aim\":\(number(state.navigation.aim.map(Int.init))),"
+                    + "\"in_flight\":\(state.navigation.inFlight ? "true" : "false")}"
+            ),
             ("bank", number(store.bank)),
             ("slot", number(store.slot)),
             ("rig_index", number(store.rigIndex.map(Int.init))),
-            ("selected_slot", number(store.selectedSlot)),
+            ("aimed_rig_index", number(state.aimedRigIndex.map(Int.init))),
+            ("aimed_slot", number(store.aimedSlot)),
             ("device_slot", number(store.deviceSlot)),
             ("highlighted_slot", number(store.highlightedSlot)),
-            ("rig_name", quoted(store.state.rig.name?.trimmed ?? "")),
-            ("morph", number(store.state.morph.map(Int.init))),
+            ("rig_name", quoted(state.rig.name?.trimmed ?? "")),
+            ("morph", number(state.morph.map(Int.init))),
             ("is_morphed", store.isMorphed.map { $0 ? "true" : "false" } ?? "null"),
             (
                 "bank_preview",
                 "["
-                    + store.state.bank.slots
+                    + state.bank.slots
                     .map { quoted($0.rigName?.trimmed ?? "") }
                     .joined(separator: ",") + "]"
             ),

@@ -23,8 +23,13 @@ enum SettingsKeys {
 
 // MARK: - Connection phase
 
-/// Where the app is in its connect / retry cycle. Everything except
-/// ``connected`` renders as a placeholder instead of the dashboard.
+/// Where the app is in its connect cycle. Everything except ``connected``
+/// renders as a placeholder instead of the dashboard.
+///
+/// Once a session is up the phase follows the model's own
+/// ``LibKP/Connection``: the app opts into the library's reconnect policy, so
+/// a lost stream is ``reconnecting(host:attempt:)`` until the model has it
+/// back, and the dashboard returns on its own.
 enum Phase: Equatable {
     /// Nothing started yet.
     case idle
@@ -34,6 +39,9 @@ enum Phase: Equatable {
     case connecting(host: String)
     /// A session is live; `name` is the device's advertised discovery name.
     case connected(host: String, name: String?)
+    /// The device closed the stream and the model is dialling `host` again;
+    /// `attempt` counts from 1.
+    case reconnecting(host: String, attempt: UInt32)
     /// The last attempt failed; `message` is shown to the user.
     case failed(message: String)
 }
@@ -102,9 +110,16 @@ struct MeterFrame: Equatable {
 
 // MARK: - The store
 
-/// The app's single source of truth: it owns the ``DeviceModel``, drives the
-/// connect / retry cycle, and turns the two library streams into published
-/// state the views bind to.
+/// The app's single source of truth: it owns the ``DeviceModel``, finds the
+/// device and opens the session, and turns the two library streams into
+/// published state the views bind to.
+///
+/// Everything that used to be this store's own — the retry loop, the rig
+/// navigator's serializer and its pending aim — is the model's now. The store
+/// connects with ``LibKP/ReconnectPolicy/stream`` set, so a dropped stream is
+/// dialled again by the library, and forwards every navigation tap to the
+/// model's Navigator, which is the only thing that loads a rig. What the
+/// buttons highlight is read straight back out of the snapshot.
 ///
 /// The high-rate lane is deliberately *not* published. Status events fold into
 /// a private ``MeterFrame``; a 33 ms render tick decays the peak-hold markers,
@@ -113,36 +128,35 @@ struct MeterFrame: Equatable {
 /// published as it arrives.
 ///
 /// Every restart bumps an epoch counter. Tasks captured the epoch they were
-/// started under and bail the moment it no longer matches, so a connection
-/// that is still unwinding can never write into the state of its successor.
+/// started under and bail the moment it no longer matches, so a session that
+/// is still unwinding can never write into the state of its successor.
 @MainActor
 final class DeviceStore: ObservableObject {
-    /// Where the app is in its connect / retry cycle.
+    /// Where the app is in its connect cycle.
     @Published private(set) var phase: Phase = .idle {
         didSet {
             guard phase != oldValue else { return }
             Log.conn("phase \(oldValue.label) -> \(phase.label)")
         }
     }
-    /// The latest SLOW snapshot: rig, amp, cabinet, effects, tuner, output.
-    @Published private(set) var state = DeviceState()
-    /// The latest rendered FAST frame.
-    @Published private(set) var meters = MeterFrame()
-    /// The slot (1–5) this app selected last, for immediate feedback on a tap —
-    /// the device's own report follows a beat later. App-local; it clears when
-    /// the rig changes from anywhere else (front panel, another controller) so
-    /// the device's report takes over.
-    @Published private(set) var selectedSlot: Int? {
+    /// The latest SLOW snapshot: rig, amp, cabinet, effects, tuner, output,
+    /// connection, and the Navigator's outstanding aim.
+    @Published private(set) var state = DeviceState() {
         didSet {
-            guard selectedSlot != oldValue else { return }
-            Log.ui("selectedSlot \(Log.opt(oldValue)) -> \(Log.opt(selectedSlot))")
+            guard state.navigation != oldValue.navigation else { return }
+            Log.ui(
+                "navigation aim \(Log.opt(state.navigation.aim)) "
+                    + (state.navigation.inFlight ? "in flight" : "idle"))
         }
     }
+    /// The latest rendered FAST frame.
+    @Published private(set) var meters = MeterFrame()
+
     /// The bank the device is on, 1-based, or `nil` before the first position
-    /// report. Read straight from the state tree: asked for at connect
-    /// (``LibKP/DeviceModel/refreshPosition()``) and kept live by the `$06` the
-    /// device pushes on every rig change — including changes made at the front
-    /// panel. Never stepped or inferred by this app.
+    /// report. Read straight from the state tree: asked for at connect by the
+    /// sync burst and kept live by the `$06` the device pushes on every rig
+    /// change — including changes made at the front panel. Never stepped or
+    /// inferred by this app.
     var bank: Int? { state.currentBank.map { Int($0) + 1 } }
 
     /// The slot the device has loaded, 1-based, from the same live report.
@@ -151,6 +165,12 @@ final class DeviceStore: ObservableObject {
     /// The device's flat rig index — its own numbering, and the address every
     /// navigation is computed in.
     var rigIndex: UInt16? { state.currentRigIndex }
+
+    /// The slot this app is aiming at, 1-based, while the model's Navigator
+    /// has an aim the device has not yet confirmed — the optimistic highlight
+    /// for a tap, gone the moment the device reports it landed (or the
+    /// Navigator gives up on it).
+    var aimedSlot: Int? { state.navigation.aim.map { Int($0 % UInt16(Params.bankSlots)) + 1 } }
 
     /// The bank slot the device has loaded, *inferred* by matching the loaded
     /// rig name against the bank preview's five rig names. This is the live
@@ -167,33 +187,16 @@ final class DeviceStore: ObservableObject {
         return nil
     }
 
-    /// Which slot the rig navigator highlights: this app's optimistic last tap
-    /// until the device reports where it actually landed, then the device's own
-    /// slot, then the name-matched inference.
-    var highlightedSlot: Int? { selectedSlot ?? slot ?? deviceSlot }
-
-    /// The flat rig index navigation steps *from*: this app's own un-confirmed
-    /// aim while it is fresh, otherwise the device's reported position.
-    ///
-    /// The device takes a moment to report a move, so two taps inside that
-    /// window would both step from the same stale index and the second would
-    /// re-send the first one's target — a second press of Bank Up that does
-    /// nothing. Stepping from the aim instead makes them compose.
-    ///
-    /// The aim expires rather than being trusted indefinitely: aim past the last
-    /// rig and the device stays put and reports nothing, so there is no
-    /// confirmation to wait for. After ``pendingWindow`` the device's own
-    /// position is the truth again.
-    private var navigationIndex: UInt16? {
-        if let pending, Date().timeIntervalSince(pending.at) < DeviceStore.pendingWindow {
-            return pending.index
-        }
-        return rigIndex
-    }
+    /// Which slot the rig navigator highlights: the Navigator's outstanding
+    /// aim until the device reports where it actually landed, then the
+    /// device's own slot, then the name-matched inference.
+    var highlightedSlot: Int? { aimedSlot ?? slot ?? deviceSlot }
 
     private var model: DeviceModel?
     private var tasks: [Task<Void, Never>] = []
     private var epoch = 0
+    /// The host of the current session, for the phase the reconnect shows.
+    private var host: String?
     /// The UDP discovery port, taken on first use and held for as long as this
     /// store lives — deliberately not released between connect attempts. See
     /// ``heldDiscoveryPort()``.
@@ -205,41 +208,18 @@ final class DeviceStore: ObservableObject {
     private var lastDecay = Date()
     private var lastPulse: (at: Date, on: Bool)?
     private var phaseHistory: [(at: Date, phase: UInt16)] = []
-    /// When this app last navigated rigs, so a rig change arriving well after
-    /// it can be recognized as externally driven.
-    private var lastNavigation = Date.distantPast
-    /// Where this app last aimed, and when. Cleared by the device's next
-    /// position report — see ``navigationIndex``.
-    private var pending: (index: UInt16, at: Date)?
-    /// The move currently on the wire, if any.
-    private var navigationTask: Task<Void, Never>?
-    /// Whether a move is on the wire and not yet settled. While it is, taps only
-    /// move the aim — see ``navigate(to:why:)``.
-    private var moveInFlight = false
-    /// The last aim actually sent, so a settled aim is not sent twice.
-    private var sentIndex: UInt16?
 
-    /// How long a rig load is left alone before the read-back follows it. The
-    /// device reports its new position about 200 ms in; this is comfortably past
-    /// that. See ``navigate(to:why:)``.
-    private static let loadSettle: TimeInterval = 0.5
-    /// How long the read-back's replies are left to drain before another move
-    /// may be sent.
-    private static let readBackSettle: TimeInterval = 0.5
-
-    /// How long an un-confirmed aim stands in for the device's own position.
-    /// Comfortably longer than the ~150 ms the device takes to report a move,
-    /// short enough that an aim past the last rig — which is never confirmed,
-    /// because nothing moved — stops mattering quickly.
-    private static let pendingWindow: TimeInterval = 1.5
-    /// How long to wait before another attempt after a failure.
-    private static let retryDelay: TimeInterval = 4
     /// The render tick — about 30 frames a second.
     private static let tickInterval: TimeInterval = 0.033
     /// The trailing window the message rate is averaged over.
     private static let rateWindow: TimeInterval = 2
     /// How long discovery listens for replies.
     private static let discoveryWindow: TimeInterval = 3
+
+    /// How the model is connected: the library's own stream backoff, so a
+    /// dropped session is dialled again without this app keeping a loop.
+    private static let options = ConnectOptions(
+        reconnect: ReconnectPolicy(stream: .defaultStream()))
 
     // MARK: - Lifecycle
 
@@ -250,8 +230,8 @@ final class DeviceStore: ObservableObject {
         restart()
     }
 
-    /// Tear down whatever is running and begin a fresh connect cycle. Also the
-    /// hook behind the Reconnect button and every Settings change.
+    /// Close whatever is running and connect afresh. Also the hook behind the
+    /// Reconnect button and every Settings change.
     func restart() {
         epoch += 1
         let epoch = self.epoch
@@ -259,115 +239,99 @@ final class DeviceStore: ObservableObject {
 
         for task in tasks { task.cancel() }
         tasks.removeAll()
-        navigationTask?.cancel()
-        navigationTask = nil
-        moveInFlight = false
-        sentIndex = nil
-        pending = nil
-        selectedSlot = nil
-        // Hand the outgoing model to the connect loop so it is closed *before*
+        // Hand the outgoing model to the connect task so it is closed *before*
         // the next connection is dialled; the library's connection ledger then
         // spaces the dial from that close.
         let closing = model
         model = nil
+        host = nil
 
         frame = MeterFrame()
         meters = frame
         state = DeviceState()
-        selectedSlot = nil
         recent.removeAll()
         lastDecay = Date()
         lastPulse = nil
         phaseHistory.removeAll()
 
-        tasks.append(Task { await self.runConnectLoop(epoch: epoch, closing: closing) })
+        tasks.append(Task { await self.connect(epoch: epoch, closing: closing) })
     }
 
-    /// Resolve an address, connect, and attach the streams — retrying on a
-    /// timer until it works or the epoch moves on.
+    /// Resolve an address, connect once, and attach the streams.
     ///
     /// `closing` is the previous model, if any. The device refuses a new
     /// session that follows a close too closely; the library's connection
-    /// ledger waits that out inside the next connect, so the close only has to
-    /// come first.
-    private func runConnectLoop(epoch: Int, closing: DeviceModel?) async {
+    /// ledger waits that out inside the next connect, so the close only has
+    /// to come first. A failure here stays on screen with a Try Again button:
+    /// once a session is up, losing it is the model's reconnect policy's to
+    /// handle, not this app's.
+    private func connect(epoch: Int, closing: DeviceModel?) async {
         if let closing {
             await closing.close()
         }
-        while !Task.isCancelled && epoch == self.epoch {
-            let defaults = UserDefaults.standard
-            let mode =
-                ConnectionMode(rawValue: defaults.string(forKey: SettingsKeys.mode) ?? "")
-                ?? .automatic
-            var host = (defaults.string(forKey: SettingsKeys.manualHost) ?? "").trimmed
-            var name: String?
+        guard epoch == self.epoch else { return }
+        let defaults = UserDefaults.standard
+        let mode =
+            ConnectionMode(rawValue: defaults.string(forKey: SettingsKeys.mode) ?? "")
+            ?? .automatic
+        var host = (defaults.string(forKey: SettingsKeys.manualHost) ?? "").trimmed
+        var name: String?
 
-            if mode == .manual {
-                // Retrying would poll an address that does not exist, so stop
-                // and wait for the user to fill one in.
-                guard !host.isEmpty else {
-                    phase = .failed(message: "No device address set. Choose one in Settings.")
-                    return
-                }
-            } else {
-                phase = .discovering
-                do {
-                    var options = DiscoveryOptions()
-                    options.listenFor = DeviceStore.discoveryWindow
-                    let reply = try await heldDiscoveryPort().poll(options).first
-                    guard epoch == self.epoch else { return }
-                    guard let reply else {
-                        phase = .failed(message: "No Profiler found on the network.")
-                        await waitBeforeRetry()
-                        continue
-                    }
-                    host = reply.host
-                    name = reply.name
-                    Log.conn("discovered \(reply.host) \(Log.opt(reply.name))")
-                } catch let error as DiscoverError {
-                    guard epoch == self.epoch else { return }
-                    // `DiscoverError` states the remedy itself — in particular
-                    // ``DiscoverError/portUnavailable(port:)`` names the conflict
-                    // rather than leaving it to look like an absent device.
-                    Log.conn("discovery failed: \(error)")
-                    phase = .failed(message: "\(error)")
-                    await waitBeforeRetry()
-                    continue
-                } catch {
-                    guard epoch == self.epoch else { return }
-                    phase = .failed(message: "Discovery failed: \(error)")
-                    await waitBeforeRetry()
-                    continue
-                }
+        if mode == .manual {
+            guard !host.isEmpty else {
+                phase = .failed(message: "No device address set. Choose one in Settings.")
+                return
             }
-
-            phase = .connecting(host: host)
-
+        } else {
+            phase = .discovering
             do {
-                let model = try await DeviceModel.connect(host: host)
-                guard epoch == self.epoch else {
-                    await model.close()
+                var options = DiscoveryOptions()
+                options.listenFor = DeviceStore.discoveryWindow
+                let reply = try await heldDiscoveryPort().poll(options).first
+                guard epoch == self.epoch else { return }
+                guard let reply else {
+                    phase = .failed(message: "No Profiler found on the network.")
                     return
                 }
-                self.model = model
-                phase = .connected(host: host, name: name)
-
-                // `DeviceModel.connect` already queued the read-only sync burst
-                // — every header value included — and is opening the control
-                // link that carries the morph position in the background.
-                attachStreams(to: model, epoch: epoch)
-
-                // The burst asked the device where it is; the `$06` replies
-                // land on the stream we just subscribed to. Ask again, so a
-                // reply that beat the subscription is not the only one.
-                try? await model.refreshPosition()
+                host = reply.host
+                name = reply.name
+                Log.conn("discovered \(reply.host) \(Log.opt(reply.name))")
+            } catch let error as DiscoverError {
+                guard epoch == self.epoch else { return }
+                // `DiscoverError` states the remedy itself — in particular
+                // ``DiscoverError/portUnavailable(port:)`` names the conflict
+                // rather than leaving it to look like an absent device.
+                Log.conn("discovery failed: \(error)")
+                phase = .failed(message: "\(error)")
                 return
             } catch {
                 guard epoch == self.epoch else { return }
-                Log.conn("connect to \(host) threw: \(error)")
-                phase = .failed(message: "Could not connect to \(host): \(error)")
-                await waitBeforeRetry()
+                phase = .failed(message: "Discovery failed: \(error)")
+                return
             }
+        }
+
+        phase = .connecting(host: host)
+        self.host = host
+
+        do {
+            let model = try await DeviceModel.connect(host: host, options: DeviceStore.options)
+            guard epoch == self.epoch else {
+                await model.close()
+                return
+            }
+            self.model = model
+            phase = .connected(host: host, name: name)
+            // `DeviceModel.connect` already queued the read-only sync burst —
+            // the position included — and is opening the control link that
+            // carries the morph in the background. The snapshot stream yields
+            // the current state first, so nothing that landed before this
+            // subscription is missed.
+            attachStreams(to: model, name: name, epoch: epoch)
+        } catch {
+            guard epoch == self.epoch else { return }
+            Log.conn("connect to \(host) threw: \(error)")
+            phase = .failed(message: "Could not connect to \(host): \(error)")
         }
     }
 
@@ -391,23 +355,14 @@ final class DeviceStore: ObservableObject {
         return port
     }
 
-    /// Sleep out the retry delay.
-    private func waitBeforeRetry() async {
-        try? await Task.sleep(nanoseconds: UInt64(DeviceStore.retryDelay * 1_000_000_000))
-    }
-
     /// Drain the granular event stream, the coalesced snapshot stream, and run
     /// the render tick — one task each, all inheriting the main actor.
-    private func attachStreams(to model: DeviceModel, epoch: Int) {
+    private func attachStreams(to model: DeviceModel, name: String?, epoch: Int) {
         tasks.append(
             Task {
                 for await event in await model.events() {
                     guard epoch == self.epoch else { return }
-                    self.handle(event)
-                    // The model does not dial again on its own (this app keeps
-                    // its own retry loop for now), so this is the device
-                    // hanging up; the stream itself finishes only on close.
-                    if case .disconnected = event { self.handleStreamEnd(epoch: epoch) }
+                    self.handle(event, name: name)
                 }
             })
 
@@ -430,17 +385,21 @@ final class DeviceStore: ObservableObject {
             })
     }
 
-    /// The device closed the connection: say so, then start over.
-    private func handleStreamEnd(epoch: Int) {
-        guard epoch == self.epoch else { return }
-        Log.conn("the device closed the connection")
-        phase = .failed(message: "The device closed the connection. Retrying…")
-        tasks.append(
-            Task {
-                await self.waitBeforeRetry()
-                guard epoch == self.epoch else { return }
-                self.restart()
-            })
+    /// Map the model's connection onto this app's phase. The model dials again
+    /// on its own after a loss, so ``Phase/reconnecting(host:attempt:)`` is a
+    /// wait, not a failure; `.disconnected` only ever follows this app's own
+    /// `close()`, which the next phase already covers.
+    private func apply(_ connection: Connection, name: String?) {
+        guard let host else { return }
+        switch connection {
+        case .connected, .degraded:
+            phase = .connected(host: host, name: name)
+        case let .reconnecting(attempt):
+            Log.conn("the device closed the connection; reconnecting (attempt \(attempt))")
+            phase = .reconnecting(host: host, attempt: attempt)
+        case .disconnected:
+            break
+        }
     }
 
     // MARK: - Commands
@@ -484,210 +443,74 @@ final class DeviceStore: ObservableObject {
     func toggleEffect(_ slot: String) {
         guard let model, let effect = state.effect(slot), !effect.isEmpty, let on = effect.on
         else { return }
-        // Fire and forget: a failed write means the session is going down, and
-        // the connect loop surfaces that on its own.
         Log.cmd("toggleEffect \(slot): \(on ? "on -> off" : "off -> on")")
         Task {
             do {
                 try await model.setEffectEnabled(slot, !on)
-                _ = try await model.requestParam(page: effect.page, number: Params.effectParamState)
+                // The reply folds into the snapshot on its way here; the value
+                // is logged so a card that did not flip can be told apart from
+                // a request that timed out.
+                let value = try await model.requestParam(
+                    page: effect.page, number: Params.effectParamState)
+                Log.cmd("toggleEffect \(slot): device reports \(value == 0 ? "off" : "on")")
             } catch {
                 Log.cmd("toggleEffect \(slot) failed: \(error)")
             }
         }
     }
 
-    /// Load slot 1–5 of the bank the device is on.
-    ///
-    /// Addressed as a flat index like every other move, so the bank preselect
-    /// (CC47) is re-armed immediately before the slot load: the device's
-    /// preselect does not persist across the gap between a bank tap and a later
-    /// slot tap, so a bare slot load would drop into whatever bank is still
-    /// loaded. Re-arming the already-current bank is harmless. Before the first
-    /// position report there is no bank to name, so the slot load goes on its
-    /// own.
+    /// Load slot 1–5 of the bank this app is aiming at — the model's
+    /// outstanding aim, else the bank the device is on. The Navigator
+    /// re-arms the bank preselect with every slot load, so a slot tapped
+    /// right after Bank Up lands in the new bank, not the one the device has
+    /// yet to leave.
     func selectSlot(_ slot: Int) {
         guard let model, (1...Params.bankSlots).contains(slot) else { return }
-        // The bank this app is aiming at, which is the device's own only once a
-        // bank step has settled. Reading `state.currentBank` here instead would
-        // address the slot to the bank the device has *left*, silently undoing a
-        // Bank Up tapped a moment earlier — the stale-index bug that
-        // ``navigationIndex`` exists to prevent.
-        guard let bank = navigationIndex.map({ $0 / UInt16(Params.bankSlots) }) else {
-            // No position yet, so there is no bank to name and the slot load
-            // goes bare. Still takes the in-flight gate: a rig load that lands
-            // on top of another is what kills the device.
-            guard !moveInFlight else {
-                Log.cmd("selectSlot \(slot) dropped — a move is in flight and there is no bank yet")
-                return
-            }
-            selectedSlot = slot
-            lastNavigation = Date()
-            moveInFlight = true
-            Log.cmd("selectSlot \(slot) (CC\(49 + slot)) — no bank reported yet, sending bare")
-            navigationTask = Task { [weak self] in
-                defer {
-                    self?.moveInFlight = false
-                    self?.pump()
-                }
-                do {
-                    try await model.selectRig(UInt8(slot))
-                    await self?.sleep(DeviceStore.loadSettle)
-                    try await model.refreshRig()
-                    await self?.sleep(DeviceStore.readBackSettle)
-                } catch {
-                    Log.cmd("selectSlot \(slot) failed: \(error)")
-                }
-            }
-            return
-        }
-        navigate(to: bank * UInt16(Params.bankSlots) + UInt16(slot - 1), why: "selectSlot \(slot)")
+        Log.cmd("selectSlot \(slot) from \(Log.opt(state.aimedRigIndex))")
+        Task { await model.selectSlot(UInt8(slot)) }
     }
 
-    /// Step `delta` rigs from where the device says it is, and load the result.
+    /// Step `delta` rigs from where this app is aiming, and load the result.
     ///
     /// Everything navigational goes through the flat rig index, because it is
     /// the only address that crosses a bank boundary: ±1 is the next or previous
     /// rig, ±``Params/bankSlots`` is the next or previous bank at the same slot.
-    /// The move is a no-op until the device has reported a position, since there
-    /// is nothing to step *from* — better to do nothing than to guess and jump
-    /// somewhere arbitrary.
-    ///
-    /// The lower bound is 0; there is no upper bound, because how many rigs a
-    /// device holds varies and nothing here knows it. Aiming past the end leaves
-    /// the device where it is, and its position report says so.
+    /// The Navigator ignores the tap until the device has reported a position,
+    /// since there is nothing to step *from*, and floors the result at 0; there
+    /// is no upper bound, because how many rigs a device holds varies and
+    /// nothing here knows it.
     func stepRig(by delta: Int) {
-        guard let current = navigationIndex else {
-            Log.cmd("stepRig \(delta) ignored — no position reported yet")
-            return
-        }
-        let target = UInt16(max(Int(current) + delta, 0))
-        guard target != current else { return }
-        navigate(to: target, why: "stepRig \(delta > 0 ? "+" : "")\(delta) from \(current)")
-    }
-
-    /// Aim at a flat rig index, and load it — one move at a time, never
-    /// overlapping the last one.
-    ///
-    /// The aim lands immediately, so the buttons and the readout answer every
-    /// tap; only the *sending* is rationed. A tap while the device is idle goes
-    /// out at once. A tap while a move is still in flight just moves the aim,
-    /// and ``pump()`` sends wherever the aim ended up once the previous move has
-    /// settled — so a burst of taps costs two rig loads however long it is.
-    ///
-    /// This is not tidiness. A rig load makes the device replay its whole
-    /// parameter tree, and each one here is followed by a read-back of a couple
-    /// of dozen requests. Two of those issued 8 ms apart is enough to kill the
-    /// device: it answers the first normally, then closes the session about
-    /// twenty seconds later and stops accepting connections until it is power
-    /// cycled. The fuse is delayed, so nothing about the reply to a burst says
-    /// it did any harm.
-    private func navigate(to target: UInt16, why: String) {
-        guard model != nil else { return }
-        let slots = UInt16(Params.bankSlots)
-        let now = Date()
-        selectedSlot = Int(target % slots) + 1
-        lastNavigation = now
-        pending = (target, now)
-        Log.cmd(
-            "\(why): aim index \(target) (bank \(target / slots + 1), slot \(target % slots + 1))"
-                + (moveInFlight ? " — holding, a move is in flight" : ""))
-        pump()
-    }
-
-    /// Send the current aim, if the device is idle and is not already there.
-    private func pump() {
-        guard !moveInFlight, model != nil, let pending else { return }
-        // Nothing to send if the device is already there, or if this same aim
-        // has been sent and the device did not move — which is what aiming past
-        // the last rig looks like, and re-sending it would loop forever.
-        guard pending.index != rigIndex, pending.index != sentIndex else { return }
-        moveInFlight = true
-        sentIndex = pending.index
-        navigationTask = Task { [weak self] in
-            await self?.performMove(pending.index)
-        }
-    }
-
-    /// One move, start to finish: the absolute bank preselect plus slot load,
-    /// a pause for the device to land it and say so, then the read-back that
-    /// refreshes the header, amp, cabinet and effects — and another pause before
-    /// anything else is allowed on the wire.
-    ///
-    /// The pauses are what keep the load and the read-back from arriving on top
-    /// of each other. They are generous on purpose: the failure they avoid costs
-    /// a power cycle, and the cost of being wrong the other way is a burst of
-    /// taps taking an extra second to land.
-    private func performMove(_ target: UInt16) async {
-        defer {
-            moveInFlight = false
-            pump()
-        }
         guard let model else { return }
-        do {
-            try await model.selectRigIndex(target)
-            Log.cmd("navigate to \(target) sent")
-        } catch {
-            Log.cmd("navigate to \(target) failed: \(error)")
-            return
-        }
-        await sleep(DeviceStore.loadSettle)
-        guard !Task.isCancelled else { return }
-        // The device does not volunteer the landing rig's amp, cabinet or effect
-        // state, so read them back — now that the load itself has gone quiet.
-        try? await model.refreshRig()
-        Log.cmd("navigate to \(target): rig read-back requested")
-        await sleep(DeviceStore.readBackSettle)
-    }
-
-    private func sleep(_ seconds: TimeInterval) async {
-        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        Log.cmd("stepRig \(delta > 0 ? "+" : "")\(delta) from \(Log.opt(state.aimedRigIndex))")
+        Task { await model.stepRig(by: delta) }
     }
 
     /// Step one bank, keeping the slot — ``Params/bankSlots`` rigs at a time.
     func stepBank(forward: Bool) {
-        stepRig(by: forward ? Params.bankSlots : -Params.bankSlots)
+        guard let model else { return }
+        Log.cmd("stepBank \(forward ? "up" : "down") from \(Log.opt(state.aimedRigIndex))")
+        Task { await model.stepBank(forward: forward) }
     }
 
     // MARK: - Ingest
 
-    /// Fold one granular event into the fast lane. Slow changes arrive through
-    /// the snapshot stream instead, so everything else is ignored here.
-    private func handle(_ event: DeviceEvent) {
+    /// Fold one granular event into the fast lane, and the connection ones
+    /// into the phase. Slow changes arrive through the snapshot stream
+    /// instead, so everything else is ignored here.
+    private func handle(_ event: DeviceEvent, name: String?) {
         if let line = Log.describe(event) { Log.evt(line) }
         switch event {
         case let .status(status):
             ingest(status)
         case let .beatPulse(on):
             lastPulse = (Date(), on)
+        case let .connectionChanged(connection):
+            apply(connection, name: name)
         case .rigChanged:
-            // A rig change well after our own navigation came from somewhere
-            // else (front panel, another controller) — the hint is stale.
-            let sinceNavigation = Date().timeIntervalSince(lastNavigation)
-            Log.evt(String(format: "rigChanged %.2fs after our last navigation", sinceNavigation))
-            if sinceNavigation > 3 {
-                selectedSlot = nil
-            }
-        case .currentPosition:
-            // The device has said where it is. That retires this app's guesses —
-            // but only once it agrees with them: mid-burst the device is still
-            // reporting the moves before the last one, and treating those as the
-            // truth would make every tap after the first step from a stale
-            // index. An aim the device never confirms (one past the last rig, so
-            // nothing moved and nothing is reported) expires instead — see
-            // ``navigationIndex``.
-            if let pending, pending.index == state.currentRigIndex {
-                self.pending = nil
-            }
-            if let slot, slot == selectedSlot {
-                selectedSlot = nil
-            }
-            // The send-once guard exists to stop an aim the device *ignored*
-            // from being re-sent forever (aiming past the last rig moves nothing
-            // and reports nothing). A report means the device did move, so the
-            // guard has done its job — holding it would refuse a later, genuine
-            // move back to the same index, say after a front-panel change.
-            sentIndex = nil
+            // With an aim outstanding this is our own move landing; without
+            // one it came from somewhere else (front panel, another
+            // controller).
+            Log.evt("rigChanged (aim \(Log.opt(state.navigation.aim)))")
         default:
             break
         }

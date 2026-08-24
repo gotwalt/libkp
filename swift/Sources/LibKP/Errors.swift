@@ -94,6 +94,13 @@ public enum CommandError: Error, Equatable, Sendable {
     case disconnected
     /// An effect-slot name did not match A/B/C/D/X/MOD/DLY/REV.
     case unknownSlot(String)
+    /// The command would load a rig — a slot load, rig up/down, a Program
+    /// Change or Bank Select, or raw bytes carrying one — and was refused
+    /// before any byte was written. Two loads that overlap wedge the device,
+    /// so loads go only through the Navigator: ``DeviceModel/navigateTo(_:)``,
+    /// ``DeviceModel/stepRig(by:)``, ``DeviceModel/stepBank(forward:)``,
+    /// ``DeviceModel/selectSlot(_:)``.
+    case rigLoadRequiresNavigator
 }
 
 extension CommandError: CustomStringConvertible {
@@ -102,6 +109,8 @@ extension CommandError: CustomStringConvertible {
         case .disconnected: return "device model is disconnected; the stream link is closed"
         case let .unknownSlot(name):
             return "unknown effect slot \"\(name)\"; use A B C D X MOD DLY REV"
+        case .rigLoadRequiresNavigator:
+            return "rig loads go through the Navigator (navigateTo, stepRig, stepBank, selectSlot)"
         }
     }
 }

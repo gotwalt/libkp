@@ -86,20 +86,40 @@
 //! - **Actions** (verbs) — momentary presses and live expression that carry no
 //!   stored value. They go out as 7-bit Control Change messages via the
 //!   [`crate::control`] vocabulary and are *not* reflected in state:
-//!   [`select_rig`](DeviceModel::select_rig),
-//!   [`rig_up`](DeviceModel::rig_up), [`rig_down`](DeviceModel::rig_down),
-//!   [`bank`](DeviceModel::bank), [`tap_tempo`](DeviceModel::tap_tempo),
+//!   [`bank`](DeviceModel::bank) (the preselect alone, which loads nothing),
+//!   [`tap_tempo`](DeviceModel::tap_tempo),
 //!   [`tuner_mode`](DeviceModel::tuner_mode), the buttons and pedals, and the
 //!   escape hatch [`send_control`](DeviceModel::send_control).
+//! - **Navigation** — the one action with a consequence the device must be
+//!   protected from. A rig load is never sent directly: it is *aimed* through
+//!   the Navigator ([`navigate_to`](DeviceModel::navigate_to),
+//!   [`step_rig`](DeviceModel::step_rig), [`step_bank`](DeviceModel::step_bank),
+//!   [`select_slot`](DeviceModel::select_slot)), which sends one load at a
+//!   time — the next only [`generated::RIG_LOAD_SETTLE_MS`] after the last —
+//!   so a burst of taps costs two loads however long it is, and two loads can
+//!   never overlap, which is what wedges the device on a delayed fuse. The
+//!   aim shows in [`DeviceState::navigation`] at once; the device's
+//!   confirmation is [`DeviceEvent::NavigationSettled`], and an aim it never
+//!   confirms (one past the end of its rigs) is
+//!   [`DeviceEvent::NavigationDropped`] after [`generated::PENDING_WINDOW_MS`].
+//!   Every other road to a rig load is closed:
+//!   [`send_control`](DeviceModel::send_control) and
+//!   [`send_raw`](DeviceModel::send_raw) refuse the load controllers
+//!   ([`generated::RIG_LOAD_CONTROLLERS`]), Program Change and Bank Select
+//!   with [`CommandError::RigLoadRequiresNavigator`], before a byte goes out.
+//!   The state machine itself is [`nav::NavigatorState`], pinned by the
+//!   `navigation.json` vectors so every language runs the same one.
 //!
 //! Power users reach the full raw vocabulary through
 //! [`send_control`](DeviceModel::send_control) and the [`crate::control`]
 //! module; any address at all through [`set_param`](DeviceModel::set_param);
-//! and any MIDI bytes at all through [`send_raw`](DeviceModel::send_raw).
+//! and any MIDI bytes at all through [`send_raw`](DeviceModel::send_raw) —
+//! all but the rig loads, which belong to the Navigator.
 
 mod core;
 mod lane;
 mod links;
+pub mod nav;
 mod supervisor;
 
 use std::net::Ipv4Addr;
@@ -116,10 +136,14 @@ use crate::nrpn::{
     request_string, set_single,
 };
 use crate::params::{self, EFFECT_PARAM_MIX, EFFECT_PARAM_STATE};
-use crate::state::{Channel, ChannelState, Connection, Decoded, DeviceState, Phase, Update};
+use crate::state::{
+    Channel, ChannelState, Connection, Decoded, DeviceState, NavDrop, Phase, Update,
+};
 
 use self::core::{PendingKey, Reply};
 use self::supervisor::Shared;
+
+pub use self::nav::{NavAction, NavigatorState};
 
 /// Rig Settings page (holds Tempo bpm at number 0, Rig Volume at number 1).
 const PAGE_RIG_SETTINGS: u8 = generated::PAGE_RIG_SETTINGS;
@@ -317,6 +341,23 @@ pub enum DeviceEvent {
         /// address).
         address: u32,
     },
+    /// The device reported the rig index the Navigator was aiming at: the
+    /// move landed. [`DeviceState::navigation`]`.aim` is `None` again, and
+    /// the position rows say where the device is.
+    NavigationSettled {
+        /// The flat rig index that was aimed at and reached.
+        index: u16,
+    },
+    /// The Navigator gave up on an aim without the device reporting it —
+    /// the index is past the end of the device's rigs and it stayed put, or
+    /// the stream was not there to send the load on. The aim is `None`
+    /// again; the device is wherever its position rows say.
+    NavigationDropped {
+        /// The flat rig index that was aimed at.
+        index: u16,
+        /// Why.
+        reason: NavDrop,
+    },
 }
 
 /// The result of applying one update to a [`DeviceState`] — one MIDI message,
@@ -374,6 +415,13 @@ pub enum CommandError {
     /// An effect-slot name did not match A/B/C/D/X/MOD/DLY/REV.
     #[error("unknown effect slot {0:?}; use A B C D X MOD DLY REV")]
     UnknownSlot(String),
+    /// The command would load a rig — a load-slot, up or down controller
+    /// ([`generated::RIG_LOAD_CONTROLLERS`]), a Program Change, or a Bank
+    /// Select — and nothing was sent. Rig loads go through the Navigator
+    /// ([`DeviceModel::navigate_to`] and its conveniences), which is the
+    /// only thing that can space them so that two never overlap.
+    #[error("rig loads go through the Navigator (navigate_to / step_rig / select_slot)")]
+    RigLoadRequiresNavigator,
 }
 
 /// Why a request did not come back with a value.
@@ -901,47 +949,104 @@ impl DeviceModel {
 
     /// Send an arbitrary [`Control`] on the command channel (MIDI channel 1).
     /// The generic entry point behind every action convenience method below.
+    ///
+    /// Refused with [`CommandError::RigLoadRequiresNavigator`], before a
+    /// byte goes out, for anything that loads a rig — [`Control::LoadSlot`],
+    /// [`Control::Up`], [`Control::Down`], [`Control::ProgramChange`] and
+    /// [`Control::BankSelect`]: those go through
+    /// [`navigate_to`](Self::navigate_to) and its conveniences, so that two
+    /// loads can never overlap. [`Control::BankPreselect`] alone is allowed;
+    /// it loads nothing.
     pub async fn send_control(&self, c: control::Control) -> Result<(), CommandError> {
+        if matches!(
+            c,
+            Control::LoadSlot(_)
+                | Control::Up
+                | Control::Down
+                | Control::ProgramChange(_)
+                | Control::BankSelect { .. }
+        ) {
+            return Err(CommandError::RigLoadRequiresNavigator);
+        }
         self.enqueue(c.message(CC_CHANNEL)).await
     }
 
-    /// Select rig slot 1–5 in the current bank (CC50–54). Changes the rig.
-    pub async fn select_rig(&self, rig: u8) -> Result<(), CommandError> {
-        self.send_control(Control::LoadSlot(rig)).await
+    // ------------------------------------------------------------------
+    // Navigation — rig loads, one at a time, through the Navigator.
+    // ------------------------------------------------------------------
+
+    /// Aim at a rig by its flat, 0-based index — the device's own numbering,
+    /// and the only address that reaches a rig outside the current bank.
+    /// Returns at once; nothing here waits for the device.
+    ///
+    /// The aim lands immediately in [`DeviceState::navigation`], so a slot
+    /// highlight or a position readout answers every tap; only the sending
+    /// is rationed. If no load is in flight the pair goes out now — the bank
+    /// preselect (CC47) for `index / BANK_SLOTS`, then the slot load
+    /// (CC50–54) that commits it. If one is, the aim simply moves, and once
+    /// that load has settled ([`generated::RIG_LOAD_SETTLE_MS`]) wherever
+    /// the aim ended up is sent — so a burst of taps costs two loads however
+    /// long it is, and two loads never overlap.
+    ///
+    /// Nothing here assumes how many rigs a device has. Aim past the end and
+    /// it stays where it is and says so in its position push; the aim is
+    /// kept for [`generated::PENDING_WINDOW_MS`] after the move settled and
+    /// then dropped with [`DeviceEvent::NavigationDropped`]. A matching
+    /// position report, from either wire, retires the aim with
+    /// [`DeviceEvent::NavigationSettled`]. With the stream down the aim is
+    /// dropped at once, with the same event.
+    pub fn navigate_to(&self, index: u16) {
+        nav::navigate(&self.handle.shared, index);
     }
 
-    /// Step to the next rig (CC48). Changes the rig.
-    pub async fn rig_up(&self) -> Result<(), CommandError> {
-        self.send_control(Control::Up).await
+    /// Aim `delta` rigs from [`DeviceState::aimed_rig_index`] — the aim if
+    /// there is one, else where the device says it is — floored at 0. ±1 is
+    /// the next or previous rig, ±[`generated::BANK_SLOTS`] the same slot a
+    /// bank over. Ignored while no position is known: there is nothing to
+    /// step *from*, and doing nothing beats a guess. A step that lands where
+    /// the aim already is sends nothing.
+    pub fn step_rig(&self, delta: i32) {
+        let Some(current) = self.state().aimed_rig_index() else {
+            return;
+        };
+        let target = (i32::from(current) + delta).clamp(0, i32::from(u16::MAX)) as u16;
+        if target != current {
+            self.navigate_to(target);
+        }
     }
 
-    /// Step to the previous rig (CC49). Changes the rig.
-    pub async fn rig_down(&self) -> Result<(), CommandError> {
-        self.send_control(Control::Down).await
+    /// Aim one bank up or down, keeping the slot:
+    /// [`step_rig`](Self::step_rig) by ±[`generated::BANK_SLOTS`].
+    pub fn step_bank(&self, forward: bool) {
+        let slots = generated::BANK_SLOTS as i32;
+        self.step_rig(if forward { slots } else { -slots });
     }
 
-    /// Preselect bank `n` (1-based; CC47). Takes effect with the next rig.
+    /// Aim at slot `slot` (1..=[`generated::BANK_SLOTS`]) of the bank the
+    /// model is aiming at — the aim's bank if there is one, else the
+    /// device's own. That is the bank a Bank Up tapped a moment ago is
+    /// heading for, which the device's own position would not yet show.
+    /// Ignored for a slot out of range, and while no position is known —
+    /// there is no bank to name.
+    pub fn select_slot(&self, slot: u8) {
+        let slots = generated::BANK_SLOTS as u16;
+        if slot == 0 || u16::from(slot) > slots {
+            return;
+        }
+        let Some(current) = self.state().aimed_rig_index() else {
+            return;
+        };
+        self.navigate_to(current / slots * slots + u16::from(slot) - 1);
+    }
+
+    /// Preselect bank `n` (1-based; CC47). Loads nothing: the preselect is
+    /// armed on the device and takes effect with the next slot load, which
+    /// only the Navigator sends — and which sends its own preselect. Kept as
+    /// the raw action for callers that drive the device's front panel from
+    /// afar.
     pub async fn bank(&self, n: u16) -> Result<(), CommandError> {
         self.send_control(Control::BankPreselect(n.saturating_sub(1) as u8))
             .await
-    }
-
-    /// Load a rig by its flat, 0-based index — the device's own numbering, and
-    /// the only address that reaches a rig outside the current bank.
-    ///
-    /// Sent as the documented pair: the absolute bank preselect (CC47) followed
-    /// by the slot load (CC50–54) that commits it. The index divides by
-    /// [`generated::BANK_SLOTS`], so index 123 is bank 25, slot 4.
-    ///
-    /// Nothing here assumes how many banks a device has. Aim past the end and
-    /// the device simply stays where it is — and says so in the `$06` position
-    /// push that follows, so
-    /// [`DeviceState::current_rig_index`](crate::state::DeviceState::current_rig_index)
-    /// always reflects where it actually landed, not where this aimed.
-    pub async fn select_rig_index(&self, index: u16) -> Result<(), CommandError> {
-        let slots = generated::BANK_SLOTS as u16;
-        self.bank(index / slots + 1).await?;
-        self.select_rig((index % slots) as u8 + 1).await
     }
 
     /// Tap the tempo (CC30). Mutating — advances the tap-tempo clock.
@@ -1013,8 +1118,17 @@ impl DeviceModel {
     /// Write raw, pre-framing MIDI bytes to the stream — any message at all,
     /// framed by the writer like everything else. The escape hatch beneath
     /// [`send_control`](Self::send_control) and [`set_param`](Self::set_param);
-    /// nothing is checked and nothing is tracked.
+    /// nothing is tracked, and only one thing is checked: bytes that would
+    /// load a rig — a Program Change (status `0xC0..=0xCF`), or a Control
+    /// Change whose controller is one of
+    /// [`generated::RIG_LOAD_CONTROLLERS`] — are refused with
+    /// [`CommandError::RigLoadRequiresNavigator`] before anything is
+    /// written. Every status byte in the buffer is looked at, so a load
+    /// cannot ride in behind another message.
     pub async fn send_raw(&self, midi: &[u8]) -> Result<(), CommandError> {
+        if loads_a_rig(midi) {
+            return Err(CommandError::RigLoadRequiresNavigator);
+        }
         self.enqueue(midi.to_vec()).await
     }
 
@@ -1053,7 +1167,8 @@ impl DeviceModel {
             return;
         };
         let shared = &self.handle.shared;
-        shared.core.apply_updates(
+        links::fold_updates(
+            shared,
             shared.core.epoch(),
             &[Update {
                 source: Channel::Control,
@@ -1073,4 +1188,39 @@ impl DeviceModel {
 /// The flat address of a page/number pair.
 fn flat(page: u8, number: u8) -> u32 {
     u32::from(page) * 128 + u32::from(number)
+}
+
+/// Whether raw MIDI bytes would load a rig: a Program Change status, or a
+/// Control Change on one of [`generated::RIG_LOAD_CONTROLLERS`]. Every
+/// status byte is examined, wherever it sits in the buffer; the data bytes
+/// between them are all below `0x80` and cannot be mistaken for one.
+fn loads_a_rig(midi: &[u8]) -> bool {
+    midi.iter().enumerate().any(|(i, &b)| match b & 0xF0 {
+        generated::PROGRAM_CHANGE_STATUS => true,
+        generated::CONTROL_CHANGE_STATUS => midi
+            .get(i + 1)
+            .is_some_and(|c| generated::RIG_LOAD_CONTROLLERS.contains(c)),
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_bytes_that_load_a_rig_are_recognised() {
+        assert!(loads_a_rig(&[0xC0, 5]));
+        assert!(loads_a_rig(&[0xCF, 0]));
+        for controller in generated::RIG_LOAD_CONTROLLERS {
+            assert!(loads_a_rig(&[0xB0, controller, 1]));
+        }
+        // A load riding in behind a harmless message is still a load.
+        assert!(loads_a_rig(&[0xB0, 0x1E, 1, 0xB0, 0x32, 1]));
+        // The preselect loads nothing, and neither does anything else.
+        assert!(!loads_a_rig(&Control::BankPreselect(2).message(0)));
+        assert!(!loads_a_rig(&Control::TapTempo.message(0)));
+        assert!(!loads_a_rig(&nrpn::set_single(0, 0x7F, 0x0A, 4, 100)));
+        assert!(!loads_a_rig(&[]));
+    }
 }
