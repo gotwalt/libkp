@@ -355,7 +355,7 @@ def build():
         "description": "DSCV discovery poll request bytes for a given client MAC.",
         "poll_request": [
             {"mac": "00:00:00:00:00:00", "hex": hx(poll("00:00:00:00:00:00"))},
-            {"mac": "D4:4F:80:00:9E:52", "hex": hx(poll("D4:4F:80:00:9E:52"))},
+            {"mac": "DE:AD:BE:EF:CA:FE", "hex": hx(poll("DE:AD:BE:EF:CA:FE"))},
         ],
         "poll_request_len": 34,
     })

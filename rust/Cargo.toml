@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Kemper Profiler network protocol: discovery, session, MIDI3/SysEx, control, and an observable device model."
 license = "MIT"
-repository = "https://github.com/agotwalt/libkp"
+repository = "https://github.com/gotwalt/libkp"
 keywords = ["kemper", "midi", "profiler", "protocol"]
 categories = ["network-programming", "multimedia::audio"]
 

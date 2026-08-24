@@ -15,8 +15,8 @@ def test_poll_request_is_exactly_34_bytes():
 
 
 def test_poll_request_carries_the_supplied_mac():
-    built = build_poll_request("D4:4F:80:00:9E:52")
-    assert b"MAC#D4:4F:80:00:9E:52" in built
+    built = build_poll_request("DE:AD:BE:EF:CA:FE")
+    assert b"MAC#DE:AD:BE:EF:CA:FE" in built
     assert len(built) == 34
 
 
