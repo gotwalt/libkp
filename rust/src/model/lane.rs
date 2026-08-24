@@ -240,5 +240,17 @@ mod tests {
             functions[slot] += 1;
         }
         assert_eq!(functions, [6, 16 + 7, 15, 2]);
+        // The targeted-refresh groups are spec data: the rig strings and the
+        // sixteen effect rows, the fifteen preview names, the two halves.
+        let group = |g| STATE_ROUTES.iter().filter(|r| r.refresh == Some(g)).count();
+        use crate::generated::Refresh;
+        assert_eq!(
+            (
+                group(Refresh::Rig),
+                group(Refresh::Bank),
+                group(Refresh::Position)
+            ),
+            (6 + 16, 15, 2)
+        );
     }
 }

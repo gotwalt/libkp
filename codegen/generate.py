@@ -72,14 +72,16 @@ ROUTE_EVENTS = (
     "current_position",
 )
 ROUTE_ADDRESS_FORMS = ("address", "page", "effect_param", "bank_preview")
+ROUTE_REFRESH = ("rig", "bank", "position")
 
 
 def state_routes(d: dict) -> list[dict]:
     """Expand spec/state.toml into the flat, address-sorted table each language emits.
 
     Every row comes out as ``{address, name, slot, kind, lane, wire, dedupe,
-    request, event}`` with ``slot`` ``None`` unless the row was expanded per
-    slot. Addresses are resolved through ``[well_known]`` (and
+    request, refresh, event}`` with ``slot`` ``None`` unless the row was
+    expanded per slot and ``refresh`` ``None`` unless the row belongs to a
+    targeted-refresh group. Addresses are resolved through ``[well_known]`` (and
     ``[effect_param_numbers]`` / ``effect_slots``) so parameters.toml stays the
     single home for them; a malformed row is a hard error rather than a silent
     hole in the table.
@@ -112,10 +114,20 @@ def state_routes(d: dict) -> list[dict]:
         for col in ("dedupe", "request"):
             if not isinstance(row.get(col), bool):
                 raise SystemExit(f"state.toml: route {name!r}: {col} must be true or false")
+        refresh = row.get("refresh")
+        if refresh is not None:
+            if refresh not in ROUTE_REFRESH:
+                raise SystemExit(
+                    f"state.toml: route {name!r}: refresh must be one of {ROUTE_REFRESH}")
+            if not row["request"]:
+                raise SystemExit(
+                    f"state.toml: route {name!r}: refresh names a re-request group, "
+                    "so request must be true")
         forms = [f for f in ROUTE_ADDRESS_FORMS if f in row]
         if len(forms) != 1:
             raise SystemExit(f"state.toml: route {name!r}: exactly one of {ROUTE_ADDRESS_FORMS}")
         common = {k: row[k] for k in ("name", "kind", "lane", "wire", "dedupe", "request", "event")}
+        common["refresh"] = refresh
         form = forms[0]
         if form == "address":
             if "span" in row or "number" in row:
@@ -447,6 +459,14 @@ def emit_rust(d: dict) -> str:
         w(f"    {pascal(k)},")
     w("}")
     w("")
+    w("/// The targeted-refresh group a `request = true` row belongs to, if any:")
+    w("/// the subset `refresh_rig` / `refresh_bank` / `refresh_position` re-asks.")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]")
+    w("pub enum Refresh {")
+    for k in ROUTE_REFRESH:
+        w(f"    {pascal(k)},")
+    w("}")
+    w("")
     w("/// One row of the state routing table: a flat address and how the tree folds it.")
     w("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
     w("pub struct Route {")
@@ -460,6 +480,7 @@ def emit_rust(d: dict) -> str:
     w("    pub wire: Wire,")
     w("    pub dedupe: bool,")
     w("    pub request: bool,")
+    w("    pub refresh: Option<Refresh>,")
     w("}")
     w("")
     rows = ",\n".join(
@@ -467,7 +488,8 @@ def emit_rust(d: dict) -> str:
         f"slot: {'None' if r['slot'] is None else f'Some({r['slot']})'}, "
         f"kind: Kind::{pascal(r['kind'])}, lane: Lane::{pascal(r['lane'])}, "
         f"wire: Wire::{pascal(r['wire'])}, dedupe: {str(r['dedupe']).lower()}, "
-        f"request: {str(r['request']).lower()} }}"
+        f"request: {str(r['request']).lower()}, "
+        f"refresh: {'None' if r['refresh'] is None else f'Some(Refresh::{pascal(r['refresh'])})'} }}"
         for r in routes)
     w("/// The state routing table, sorted by address (spec/state.toml).")
     w(f"pub static STATE_ROUTES: &[Route] = &[\n{rows},\n];")
@@ -706,6 +728,14 @@ def emit_python(d: dict) -> str:
         w(f"    {k.upper()} = {q(k)}")
     w("")
     w("")
+    w("class Refresh(Enum):")
+    w('    """The targeted-refresh group a ``request = true`` row belongs to, if any:')
+    w('    the subset ``refresh_rig`` / ``refresh_bank`` / ``refresh_position`` re-asks."""')
+    w("")
+    for k in ROUTE_REFRESH:
+        w(f"    {k.upper()} = {q(k)}")
+    w("")
+    w("")
     w("class Route(NamedTuple):")
     w('    """One row of the state routing table: a flat address and how the tree folds it."""')
     w("")
@@ -719,11 +749,13 @@ def emit_python(d: dict) -> str:
     w("    wire: Wire")
     w("    dedupe: bool")
     w("    request: bool")
+    w("    refresh: Refresh | None")
     w("")
     w("")
     rows = ",\n    ".join(
         f"Route({r['address']}, Field.{r['name'].upper()}, {r['slot']}, Kind.{r['kind'].upper()}, "
-        f"Lane.{r['lane'].upper()}, Wire.{r['wire'].upper()}, {r['dedupe']}, {r['request']})"
+        f"Lane.{r['lane'].upper()}, Wire.{r['wire'].upper()}, {r['dedupe']}, {r['request']}, "
+        f"{'None' if r['refresh'] is None else f'Refresh.{r['refresh'].upper()}'})"
         for r in routes)
     w(f"#: The state routing table, sorted by address (spec/state.toml).\n"
       f"STATE_ROUTES: tuple[Route, ...] = (\n    {rows},\n)")
@@ -924,7 +956,8 @@ def emit_swift(d: dict) -> str:
         f"Route(address: {r['address']}, field: .{camel(r['name'])}, "
         f"slot: {'nil' if r['slot'] is None else r['slot']}, kind: .{r['kind']}, "
         f"lane: .{r['lane']}, wire: .{r['wire']}, dedupe: {str(r['dedupe']).lower()}, "
-        f"request: {str(r['request']).lower()})"
+        f"request: {str(r['request']).lower()}, "
+        f"refresh: {'nil' if r['refresh'] is None else f'.{r['refresh']}'})"
         for r in routes)
     w("    /// The state routing table, sorted by address (spec/state.toml).")
     w(f"    public static let stateRoutes: [Route] = [\n        {rows},\n    ]")
@@ -977,6 +1010,13 @@ def emit_swift(d: dict) -> str:
         w(f"        case {k} = {q(k)}")
     w("    }")
     w("")
+    w("    /// The targeted-refresh group a `request = true` row belongs to, if any:")
+    w("    /// the subset `refreshRig()` / `refreshBank()` / `refreshPosition()` re-asks.")
+    w("    public enum Refresh: String, CaseIterable, Hashable, Sendable {")
+    for k in ROUTE_REFRESH:
+        w(f"        case {k} = {q(k)}")
+    w("    }")
+    w("")
     w("    public let address: UInt32")
     w("    public let field: Field")
     w("    /// The per-slot index for expanded rows: effect slot, bank-preview slot, or")
@@ -987,12 +1027,14 @@ def emit_swift(d: dict) -> str:
     w("    public let wire: Wire")
     w("    public let dedupe: Bool")
     w("    public let request: Bool")
+    w("    public let refresh: Refresh?")
     w("    public init(")
     w("        address: UInt32, field: Field, slot: UInt8?, kind: Kind, lane: Lane, wire: Wire,")
-    w("        dedupe: Bool, request: Bool")
+    w("        dedupe: Bool, request: Bool, refresh: Refresh? = nil")
     w("    ) {")
     w("        self.address = address; self.field = field; self.slot = slot; self.kind = kind")
     w("        self.lane = lane; self.wire = wire; self.dedupe = dedupe; self.request = request")
+    w("        self.refresh = refresh")
     w("    }")
     w("}")
     w("")

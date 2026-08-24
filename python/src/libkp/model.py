@@ -616,9 +616,10 @@ class DeviceModel:
 
     async def refresh_rig(self) -> None:
         """Re-request the rig strings and every effect slot's Type/On-Off: the
-        subset of :meth:`refresh` that describes the loaded rig."""
+        subset of :meth:`refresh` that describes the loaded rig -- the rows
+        ``spec/state.toml`` marks ``refresh = "rig"``."""
         await self._request_rows(
-            route for route in gen.STATE_ROUTES if route.request and route.field in _RIG_FIELDS
+            route for route in gen.STATE_ROUTES if route.refresh is gen.Refresh.RIG
         )
 
     async def refresh_bank(self) -> None:
@@ -630,9 +631,7 @@ class DeviceModel:
         controller need only call this once at connect.
         """
         await self._request_rows(
-            route
-            for route in gen.STATE_ROUTES
-            if route.request and route.field in _BANK_PREVIEW_FIELDS
+            route for route in gen.STATE_ROUTES if route.refresh is gen.Refresh.BANK
         )
 
     async def refresh_position(self) -> None:
@@ -646,7 +645,7 @@ class DeviceModel:
         caused it.
         """
         await self._request_rows(
-            route for route in gen.STATE_ROUTES if route.request and route.field in _POSITION_FIELDS
+            route for route in gen.STATE_ROUTES if route.refresh is gen.Refresh.POSITION
         )
 
     def apply_cbor(self, address: int, value: int) -> None:
@@ -1425,26 +1424,6 @@ class DeviceModel:
         else:
             message = nrpn.request_extended_param(PRODUCT, DEVICE, address)
         return await self._request_num(address, message)
-
-
-#: The rows :meth:`DeviceModel.refresh_rig` asks for: the page-0 tags and each
-#: slot's type and state.
-_RIG_FIELDS = frozenset(
-    {
-        gen.Field.RIG_NAME,
-        gen.Field.RIG_AUTHOR,
-        gen.Field.RIG_DATE,
-        gen.Field.RIG_COMMENT,
-        gen.Field.AMP_NAME,
-        gen.Field.CABINET_NAME,
-        gen.Field.EFFECT_TYPE,
-        gen.Field.EFFECT_ON,
-    }
-)
-_BANK_PREVIEW_FIELDS = frozenset(
-    {gen.Field.BANK_RIG_NAME, gen.Field.BANK_AMP_NAME, gen.Field.BANK_CABINET_NAME}
-)
-_POSITION_FIELDS = frozenset({gen.Field.CURRENT_BANK, gen.Field.CURRENT_RIG_SLOT})
 
 
 def _now() -> float:

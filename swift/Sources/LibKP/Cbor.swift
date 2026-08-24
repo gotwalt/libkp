@@ -449,21 +449,9 @@ public enum Cbor {
     /// snapshot lists every string the dump carried rather than only the ones
     /// the tree tracks; a sensitive one is redacted before it is kept.
     public static func extractSnapshot(_ items: [CBORValue]) -> StateSnapshot {
-        var state = DeviceState()
-        var strings: [SnapshotString] = []
-        for entry in items.compactMap(controlItem).flatMap(\.entries) {
-            switch entry {
-            case let .num(address, value):
-                state.applyCbor(address: address, value: value)
-            case let .text(address, text):
-                state.applyCborText(address: address, text: text)
-                let value = isSensitive(address) ? Generated.redactedPlaceholder : text
-                strings.append(SnapshotString(address: address, text: value))
-            }
-        }
-        return StateSnapshot(
-            currentBank: state.currentBank, currentRigSlot: state.currentRigSlot,
-            morph: state.morph, strings: strings)
+        var folder = SnapshotFolder()
+        folder.fold(items)
+        return folder.snapshot
     }
 
     /// Every numeric address/value pair the items carry, in document order.
@@ -521,6 +509,40 @@ public enum Cbor {
             return ControlItem(base: base, entries: [.text(address: base, text: text)])
         }
         return nil
+    }
+}
+
+/// The incremental form of ``Cbor/extractSnapshot(_:)``: fold each chunk as
+/// it arrives and read the snapshot off at the end.
+/// ``StateSnapshot/fetch(host:port:timeout:)`` polls for completeness after
+/// every read, and re-walking everything received so far on each poll would
+/// make the read quadratic in the dump.
+struct SnapshotFolder {
+    private var state = DeviceState()
+    private var strings: [SnapshotString] = []
+
+    mutating func fold(_ items: [CBORValue]) {
+        for entry in items.compactMap(Cbor.controlItem).flatMap(\.entries) {
+            switch entry {
+            case let .num(address, value):
+                state.applyCbor(address: address, value: value)
+            case let .text(address, text):
+                state.applyCborText(address: address, text: text)
+                let value = Cbor.isSensitive(address) ? Generated.redactedPlaceholder : text
+                strings.append(SnapshotString(address: address, text: value))
+            }
+        }
+    }
+
+    /// ``StateSnapshot/isComplete``, without building the snapshot.
+    var isComplete: Bool {
+        state.currentBank != nil && state.currentRigSlot != nil && state.morph != nil
+    }
+
+    var snapshot: StateSnapshot {
+        StateSnapshot(
+            currentBank: state.currentBank, currentRigSlot: state.currentRigSlot,
+            morph: state.morph, strings: strings)
     }
 }
 
@@ -721,19 +743,22 @@ public struct StateSnapshot: Sendable, Equatable {
         let link = try await ControlLink.open(host: host, port: port)
         defer { link.close() }
 
-        var items = link.push(link.tail)
+        // The trigger went out with the open; fold each read as it lands —
+        // never re-walking what came before — until every value the snapshot
+        // wants is known or the deadline passes.
+        var folder = SnapshotFolder()
+        folder.fold(link.push(link.tail))
         let deadline = Date().addingTimeInterval(timeout)
-        while !Cbor.extractSnapshot(items).isComplete {
+        while !folder.isComplete {
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { break }
             do {
-                items.append(
-                    contentsOf: try await link.read(wait: min(ControlLink.readIdle, remaining)))
+                folder.fold(try await link.read(wait: min(ControlLink.readIdle, remaining)))
             } catch SessionError.closed {
                 break
             }
         }
-        return Cbor.extractSnapshot(items)
+        return folder.snapshot
     }
 }
 

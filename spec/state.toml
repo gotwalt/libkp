@@ -79,6 +79,13 @@
 #             by a position push that changes nothing.
 #
 #   request   true when the connect-time sync asks the device for this row.
+#
+#   refresh   Optional: the targeted-refresh group the row belongs to — "rig"
+#             (the loaded rig's strings and each slot's Type/On-Off), "bank"
+#             (the five-slot name preview), "position" (the two position
+#             halves) — the subsets refresh_rig / refresh_bank /
+#             refresh_position re-ask. Only meaningful on a request = true
+#             row; the generator refuses it elsewhere.
 
 # ---------------------------------------------------------------------------
 # Page 0: the rig / amp / cabinet string tags ($03 / $43, and $07 on the dump).
@@ -94,6 +101,7 @@ event = "string_tag"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "rig_author"
@@ -105,6 +113,7 @@ event = "string_tag"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "rig_date"
@@ -116,6 +125,7 @@ event = "string_tag"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "rig_comment"
@@ -127,6 +137,7 @@ event = "string_tag"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "amp_name"
@@ -138,6 +149,7 @@ event = "string_tag"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "cabinet_name"
@@ -149,6 +161,7 @@ event = "string_tag"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 # ---------------------------------------------------------------------------
 # Page 0 numerics: the morph. The button is a momentary the device reports on
@@ -254,6 +267,7 @@ event = "effect_changed"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "effect_on"
@@ -264,6 +278,7 @@ event = "effect_changed"
 wire = "both"
 dedupe = true
 request = true
+refresh = "rig"
 
 [[route]]
 name = "effect_mix"
@@ -376,6 +391,7 @@ event = "bank_preview"
 wire = "both"
 dedupe = true
 request = true
+refresh = "bank"
 
 [[route]]
 name = "bank_amp_name"
@@ -386,6 +402,7 @@ event = "bank_preview"
 wire = "both"
 dedupe = true
 request = true
+refresh = "bank"
 
 [[route]]
 name = "bank_cabinet_name"
@@ -396,6 +413,7 @@ event = "bank_preview"
 wire = "both"
 dedupe = true
 request = true
+refresh = "bank"
 
 # ---------------------------------------------------------------------------
 # The device's position: two extended addresses, both 0-based.
@@ -410,6 +428,7 @@ event = "current_position"
 wire = "both"
 dedupe = true
 request = true
+refresh = "position"
 
 [[route]]
 name = "current_rig_slot"
@@ -420,3 +439,4 @@ event = "current_position"
 wire = "both"
 dedupe = true
 request = true
+refresh = "position"
