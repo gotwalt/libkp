@@ -319,21 +319,28 @@ param_ranges = [
   { page = 0x96, start = 10, end = 14, name = "Bank Cabinet Name" },
 ]
 
-# Page-0 string tags (function $03 / $43), Appendix C.
+# Page-0 string tags (function $03 / $43), Appendix C — with the amplifier
+# block where the device actually keeps it. The published list places the amp
+# tags from 10; a Profiler Player on firmware 14.2.1 answers none of those and
+# carries the same fields, in the same order, from 16 (name 16, author 17,
+# creation date 18, time 19, location 20, manufacturer 21, comment 22, model
+# 24, channel 25, pickup 26), which is also where the state dump lists them.
+# The cabinet block is where the list says.
 string_tags = [
   { number = 1,  name = "Rig Name" },
   { number = 2,  name = "Rig Author" },
   { number = 3,  name = "Rig Creation Date" },
   { number = 4,  name = "Rig Comment" },
-  { number = 10, name = "Amp Name" },
-  { number = 11, name = "Amp Author" },
-  { number = 14, name = "Amp Location" },
-  { number = 15, name = "Amp Manufacturer" },
-  { number = 16, name = "Amp Comment" },
-  { number = 18, name = "Amp Model" },
-  { number = 19, name = "Amp Channel" },
-  { number = 20, name = "Pickup Type" },
-  { number = 21, name = "Year of Production" },
+  { number = 16, name = "Amp Name" },
+  { number = 17, name = "Amp Author" },
+  { number = 18, name = "Amp Creation Date" },
+  { number = 20, name = "Amp Location" },
+  { number = 21, name = "Amp Manufacturer" },
+  { number = 22, name = "Amp Comment" },
+  { number = 24, name = "Amp Model" },
+  { number = 25, name = "Amp Channel" },
+  { number = 26, name = "Pickup Type" },
+  { number = 27, name = "Year of Production" },
   { number = 32, name = "Cabinet Name" },
   { number = 33, name = "Cabinet Author" },
   { number = 36, name = "Cabinet Location" },

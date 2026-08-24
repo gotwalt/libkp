@@ -80,23 +80,32 @@ except in the `channelChanged` event.
 ```swift
 import LibKP
 
+// A bare connect is the whole session: the stream, its read-only sync burst,
+// and the control link that carries the morph position, opened after it.
 let model = try await DeviceModel.connect(host: "192.168.1.50")
 
 // The store: the current state first, then a fresh snapshot whenever slow
 // state changes. Finishes only on close().
 Task {
     for await state in await model.snapshots() {
-        print(state.rig.name ?? "—", state.morph ?? 0, state.effect("REV")?.on ?? false)
+        print(state.connection,            // .connected, .degraded (no control link), …
+              state.rig.name ?? "—",
+              state.morph ?? 0,            // from the control link; nil until its dump lands
+              state.navigation.aim ?? 0)   // the rig index in flight, until the device confirms it
     }
 }
 
 // The fast lane: poll per animation frame.
 let meters = await model.status().raw
 
-try await model.setEffectEnabled("REV", false)   // a tracked parameter
-let on = try await model.requestParam(page: 0x3D, number: 3)  // a request, answered
+// A tracked parameter, then the read-back that confirms it: the device applies
+// a write silently, and requestParam returns what it now holds.
+try await model.setEffectEnabled("REV", false)
+let on = try await model.requestParam(page: 0x3D, number: 3)  // 0
+
 try await model.tapTempo()                       // a momentary action
 try await model.send(control: .freeze(true))     // any raw control
+await model.stepRig(by: 1)                       // aim at the next rig; the Navigator loads it
 await model.close()                              // both links; the streams finish
 ```
 

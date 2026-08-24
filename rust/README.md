@@ -22,16 +22,28 @@ use libkp::model::DeviceModel;
 let reply = libkp::find_first(std::time::Duration::from_secs(3)).await?;
 let ip = reply.and_then(|r| r.ipv4()).unwrap_or(Ipv4Addr::new(192, 168, 1, 50));
 
-// Connect: opens the stream, runs the read-only sync burst in the background,
-// and opens the control link (the morph position's only source) after it.
+// A bare connect is the whole session: the stream, its read-only sync burst,
+// and the control link that carries the morph position, opened after it.
 let model = DeviceModel::connect(ip).await?;
 
 // The store: a fresh snapshot every time snapshot-visible state changes.
 let mut snapshots = model.subscribe();
+
+// A tracked parameter, then the read-back that confirms it: the device applies
+// a write silently, and `request_param` returns what it now holds.
+model.set_effect_enabled("REV", false).await?;
+let rev_on = model.request_param(0x3D, 3).await?;   // 0
+
+// Aim at the next rig; the Navigator loads it, one load at a time.
+model.step_rig(1);
+
 while let Ok(state) = snapshots.recv().await {
-    println!("rig: {:?}  REV on: {:?}",
+    println!("{:?}  rig: {:?}  morph: {:?}  aim: {:?}  REV on: {}",
+        state.connection,          // Connected, Degraded (no control link), …
         state.rig.name,
-        state.effect("REV").and_then(|e| e.on));
+        state.morph,               // from the control link; None until its dump lands
+        state.navigation.aim,      // the rig index in flight, until the device confirms it
+        rev_on == 1);
 }
 # Ok(())
 # }

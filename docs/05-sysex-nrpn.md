@@ -57,9 +57,10 @@ need five bytes.
 | `$7C` | Request Rendered String | client → device | `<page> <num> <MSB> <LSB>` — reply `$3C` |
 | `$7E` | Beacon / sense | both | see [below](#beacon-and-sense) |
 
-Requests are read-only and cheap. A request for a nonexistent parameter is
-**silently ignored** — there is no error reply, so a client must apply its own
-timeout rather than waiting indefinitely.
+Requests are read-only and cheap. A request for a nonexistent or unreadable
+parameter is **silently ignored** — there is no error reply, so a client must
+apply its own timeout rather than waiting indefinitely. How `libkp` does that is
+[the request lane](#requests-and-replies).
 
 Constants: `[sysex.functions]` in [`../spec/protocol.toml`](../spec/protocol.toml);
 the code → short-name table is in
@@ -132,6 +133,34 @@ reached through `$03`/`$43` and numeric parameters when reached through
 example page 0 / number 1 is the **Rig Name** string, while page 0 / number
 `$77` is the numeric **Morph Position**.
 
+## The string tags
+
+The page-0 string tags come in three blocks of the same shape — the rig's, the
+amplifier's and the cabinet's — each starting with the name and continuing
+through author, date and comment at the same offsets:
+
+| Block | Numbers | Name | Then |
+|---|---|---|---|
+| Rig | `$01`–`$04` | `$01` | author `$02`, creation date `$03`, comment `$04` |
+| Amplifier | `$10`–`$1A` | `$10` | author, date, comment, then manufacturer, model, channel, pickup, year |
+| Cabinet | `$20`–`$2D` | `$20` | author, date, comment, then manufacturer, model, microphone, speaker |
+
+The state tree stores the three names (`string_rig_name`, `string_amp_name`,
+`string_cabinet_name` in `[well_known]`) and the rig's author, date and
+comment; the rest are readable with `$43` and named by the registry.
+
+**`$0A` is not the amp name.** The amplifier block starts at `$10`, not `$0A`:
+established by observed experimentation, a `$43` request for page 0 / number
+`$0A` draws **no reply at all**, while `$10` answers with the amp's name. An
+earlier value of `$0A` survived for a long time precisely because a
+fire-and-forget request cannot notice an answer that never comes; the
+[request lane](#requests-and-replies), which times a request out, is what
+caught it.
+
+On the CBOR channel the same numbers are the same flat addresses — 1 for the
+rig name, 16 for the amp name, 32 for the cabinet name — and land in the same
+fields ([The CBOR channel](06-cbor-channel.md#addressing)).
+
 ## Worked example — request a rig name
 
 The safest first message to any Profiler: a `$43` Request String Parameter for
@@ -200,9 +229,11 @@ parameter request for the same address; the reply is an ordinary `$01` from
 f0 00 20 33 00 00 01 00 3d 03 00 01 f7
 ```
 
-The reply lands roughly a second later, so order state changes before their
-read-backs and give a confirmation poll a couple of seconds before deciding a
-write failed.
+In `libkp` that is `set_effect_enabled("REV", true)` followed by
+`request_param(0x3D, 3)`, which returns the value the reply carries — the
+device answers within tens of milliseconds — and folds it into the snapshot on
+the way. Order the write before its read-back; the writer sends them in the
+order they were queued.
 
 `$01` may carry an **optional trailing 14-bit pair**, the morph "B value" for
 the same address. A parser must therefore accept 2 *or* 4 value bytes and use
@@ -303,6 +334,41 @@ Address 1 is page 0 / number 1 — the Rig Name again, this time via the extende
 form. Rig-load dumps mix both encodings freely, so a decoder that handles only
 `$03` will silently miss metadata.
 
+## Requests and replies
+
+Every request is a question with an answer at the same address, and the reply
+carries no reference to the request that provoked it:
+
+| Request | Reply | In `libkp` |
+|---|---|---|
+| `$41` page/number | `$01` at the same page/number | `request_param(page, number)` → the 14-bit value |
+| `$43` page/number | `$03` at the same page/number | `request_string(page, number)` → the text |
+| `$46` 5-byte address | `$06` at the same address (or `$01` if it fits 14 bits) | `request_ext_param(address)` → the value |
+| `$47` 5-byte address | `$07` at the same address (or `$03`) | `request_ext_string(address)` → the text |
+| `$7C` page/number/value | `$3C` with the same page, number and value | `request_render(page, number, value)` → the display text |
+
+The model's **request lane** rides on that. A `request_*` call queues the
+request, registers what it is waiting for — the flat address, or page, number
+and value for a rendered string — and resolves with the value that next lands
+there. An unsolicited push at the same address is indistinguishable from the
+reply and resolves it too; it is equally current, and it lands in the tree the
+same way. `refresh()` is the same lane run over every row the routing table
+marks `request = true` — 46 requests: the string tags, each effect slot's type
+and state, the bank preview, the position, and the tracked numerics — and is
+the connect-time sync.
+
+The timing is the device's, established by observed experimentation against a
+Profiler Player (firmware 14.2.1): eight `$41` in flight all answered within
+46 ms, fifteen `$47` within 39 ms, three `$43` within 27 ms, and the whole
+46-request burst within 50 ms. So the lane keeps at most **16** requests on the
+wire (`max_in_flight_requests`) and queues the rest, and a request unanswered
+for **300 ms** (`request_timeout_ms`) is not coming: it is dropped, raised as
+`RequestTimedOut`, returned as `Timeout`, and **never retried** — the device
+ignores an address it cannot answer rather than saying so, so asking again asks
+the same silence. One address is refused before it is sent: the morph position
+answers nothing on the stream, and the routing table marks it the control
+link's, so asking for it returns `Unreadable` at once.
+
 ## Rendered strings
 
 `$7C` asks the device to render a parameter's value the way its own display
@@ -397,7 +463,8 @@ The device's current bank and rig slot live at two extended addresses, both
 Together they are a flat rig index, `bank × 5 + slot`, which is the only address
 that names a rig outside the current bank.
 
-Read them with `$46` and the device answers with `$06` in about 20 ms:
+Read them with `$46` (`request_ext_param`, or both at once with
+`refresh_position`) and the device answers with `$06` in about 20 ms:
 
 ```
 -> f0 00 20 33 00 7f 46 00  00 00 06 12 5d  f7          request address 100701
@@ -436,9 +503,13 @@ is part of persistent state and not merely a live event.
 request draws any reply, and it never appears on the MIDI3 stream — unframing a
 45-second capture across nine morph cycles yields no message carrying address
 119 at all. The [CBOR channel](06-cbor-channel.md) is the only route: its state
-dump carries the position (`StateSnapshot`), and a live `CborSession` watches it
-move, at about 40 Hz while a morph ramps. Holding that session alongside a
-`DeviceModel` is what a client does to show both the meters and the morph.
+dump carries the position, and its live pushes move it at about 40 Hz while a
+morph ramps. That is why a `DeviceModel` opens the CBOR channel as its control
+link beside the stream: the dump and the pushes fold into the same tree, and
+`state.morph` is the readout. The routing table marks the address the control
+link's alone, so `request_param(0, 0x77)` returns `Unreadable` without a byte
+on the wire, and a model whose control link is off, unavailable or lost never
+learns the position — `state.connection` reads `Degraded` to say so.
 
 So a MIDI3 client learns *that* a morph happened, from the button at `$50`, and
 hears what it did to the audio parameters — but never where the fader sits. The
