@@ -12,38 +12,55 @@ import Foundation
 /// each with the greeting, the protocol-selection ack (`+` only for a protocol
 /// in ``accepts``, `-` otherwise — the reserved GUID is offered and rejected,
 /// as on the device), the preamble, then the protocol's own traffic. The
-/// greeting and the ack can be held back by ``Config/handshakeDelay``, or
-/// withheld altogether with ``Config/greets``, to stand in for a slow or a
-/// sulking device:
+/// greeting and the ack can be held back by ``Config/handshakeDelay``, the
+/// greeting withheld altogether with ``Config/greets`` and the ack with
+/// ``Config/acks``, to stand in for a slow or a sulking device, and the
+/// socket dropped right after the handshake with
+/// ``Config/closeAfterHandshake``:
 ///
 /// - **MIDI3**: framed MIDI in both directions. Received messages are unframed
 ///   and recorded per connection; while ``answers`` is on, every request form
 ///   is answered from ``values`` / ``strings`` / ``renders`` (or a placeholder)
 ///   unless its address is in ``silent``; ``FakeConnection/push(_:)`` sends
-///   arbitrary messages.
+///   arbitrary messages, ``FakeConnection/pushRaw(_:)`` pre-framed bytes in
+///   one write.
 /// - **CBOR**: decoded items are recorded per connection; the dump trigger is
 ///   answered with ``dumpItems`` in one write, and
 ///   ``FakeConnection/pushItems(_:)`` sends more at any time.
 ///
-/// Either kind of connection, or all of them, can be hung up.
+/// Either kind of connection, or all of them, can be hung up, and the listener
+/// can refuse new connections for a while (``pauseAccepting()``) without
+/// giving up its port.
 ///
 /// A plain BSD socket rather than `NWListener`, for the same reason
 /// `DiscoveryPort` is: `NWListener` fails with `EINVAL` in some sandboxed test
 /// runs. One thread accepts; one thread per connection serves it.
 final class FakeDevice: @unchecked Sendable {
-    /// The dump a CBOR connection serves by default: a rig name, the position
-    /// as one run, the morph, and the run that always ends a real dump.
+    /// The dump a CBOR connection serves by default, in a real dump's
+    /// two-section shape: a system value (the main volume) closed by a run
+    /// based at ``Generated/dumpEndAddress``, then the rig section — the
+    /// position as one run, the rig name, the morph at half — closed by a
+    /// second such run, the one that ends the dump.
     static let defaultDump: [CBORValue] = [
-        .tag(1, .array([.uint(4), .uint(UInt64(Generated.stringRigName)), .text("Dump Rig")])),
+        Cbor.paramWrite(
+            addr: UInt32(Generated.systemPage) * 128 + UInt32(Generated.mainVolumeNumber),
+            value: 8192),
+        dumpEndRun,
         .tag(
             1,
             .array([
                 .uint(2), .uint(UInt64(Generated.currentBankAddress) - 1), .uint(0), .uint(3),
                 .uint(1),
             ])),
+        .tag(1, .array([.uint(4), .uint(UInt64(Generated.stringRigName)), .text("Dump Rig")])),
         Cbor.paramWrite(addr: Generated.morphAddress, value: 8192),
-        .tag(1, .array([.uint(2), .uint(UInt64(Generated.dumpEndAddress)), .uint(0), .uint(0)])),
+        dumpEndRun,
     ]
+
+    /// A run based at ``Generated/dumpEndAddress`` — what closes each of a
+    /// dump's two sections.
+    static let dumpEndRun: CBORValue = .tag(
+        1, .array([.uint(2), .uint(UInt64(Generated.dumpEndAddress)), .uint(0), .uint(0)]))
 
     /// A `$06` Extended Parameter message.
     static func extParam(address: UInt32, value: UInt64) -> [UInt8] {
@@ -82,6 +99,8 @@ final class FakeDevice: @unchecked Sendable {
     private let fd: Int32
     private let lock = NSLock()
     private var accepted: [FakeConnection] = []
+    private var paused = false
+    private var refusedCount = 0
 
     // Configuration. Set before the first connection; read on its thread.
     private var config: Config
@@ -113,6 +132,14 @@ final class FakeDevice: @unchecked Sendable {
         /// the socket open in silence until the client hangs up, as a device
         /// poked inside its cooldown does.
         var greets = true
+        /// Whether a connection answers the protocol selection. Off, it
+        /// greets, reads the selection, and then holds the socket open in
+        /// silence — a verdict that never comes.
+        var acks = true
+        /// Whether a connection hangs up right after the handshake — the ack
+        /// written and the preamble read — as a device that has decided
+        /// against the session does.
+        var closeAfterHandshake = false
 
         init(offerCbor: Bool) {
             offers = [Generated.protocolReserved, Generated.protocolMidi3Stream]
@@ -211,10 +238,43 @@ final class FakeDevice: @unchecked Sendable {
         close(fd)
     }
 
+    /// Refuse every new connection until ``resumeAccepting()``: each is
+    /// accepted by the kernel and closed at once, so a dial fails on its
+    /// handshake rather than hanging. The port stays bound, so it is the same
+    /// one when accepting resumes — a device that is down for a while, not
+    /// one that has gone.
+    func pauseAccepting() {
+        lock.lock()
+        paused = true
+        lock.unlock()
+    }
+
+    /// Accept connections again.
+    func resumeAccepting() {
+        lock.lock()
+        paused = false
+        lock.unlock()
+    }
+
+    /// How many connections were refused while accepting was paused.
+    var refused: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return refusedCount
+    }
+
     private func acceptLoop() {
         while true {
             let client = accept(fd, nil, nil)
             guard client >= 0 else { return }  // the listener was shut down
+            lock.lock()
+            let refuse = paused
+            if refuse { refusedCount += 1 }
+            lock.unlock()
+            if refuse {
+                close(client)
+                continue
+            }
             // A write to a socket the client has closed must not kill the
             // test process.
             var one: Int32 = 1
@@ -324,6 +384,12 @@ final class FakeConnection: @unchecked Sendable {
         write(Midi3.frame(message))
     }
 
+    /// Send pre-framed bytes as they are, in one write, so several framed
+    /// messages land in one read on the other side.
+    func pushRaw(_ bytes: [UInt8]) {
+        write(bytes)
+    }
+
     /// Send CBOR items, encoded back to back in one write.
     func pushItems(_ items: [CBORValue]) {
         write(items.flatMap(Cbor.encode))
@@ -399,6 +465,11 @@ final class FakeConnection: @unchecked Sendable {
         lock.lock()
         selectedName = name
         lock.unlock()
+        guard config.acks else {
+            // The selection was read; the verdict never comes.
+            while readChunk() != nil {}
+            return
+        }
         pauseBeforeSpeaking()
         guard config.accepts.contains(name) else {
             write(
@@ -423,6 +494,8 @@ final class FakeConnection: @unchecked Sendable {
         preambleSeen = buffer[0..<Generated.sessionPreambleLen].allSatisfy { $0 == 0 }
         lock.unlock()
         buffer.removeFirst(Generated.sessionPreambleLen)
+        // A device that hangs up the moment the session is open.
+        if config.closeAfterHandshake { return }
 
         if name == Generated.protocolCborControl {
             serveCbor(initial: buffer)

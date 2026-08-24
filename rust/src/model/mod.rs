@@ -673,8 +673,14 @@ impl DeviceModel {
     /// Nothing else finishes: the receivers handed out by
     /// [`subscribe`](Self::subscribe) and [`events`](Self::events) stay open
     /// and simply see no more items. Idempotent — a second call does nothing.
+    ///
+    /// Awaits the sockets closing before it returns — and with them the
+    /// connection ledger's close stamp — so a `connect_with` issued straight
+    /// after `close()` cannot slip past the ledger before this close is
+    /// recorded. (Dropping the last handle instead tears down the same way but
+    /// synchronously, without waiting.)
     pub async fn close(&self) {
-        self.handle.shared.shutdown();
+        self.handle.shared.close().await;
     }
 
     /// Open the control link again, explicitly, after it failed or was lost.
@@ -869,7 +875,12 @@ impl DeviceModel {
         // A `$01` reply is 14 bits; only a value from another wire could ever
         // be wider, and one that does not fit the stream's word is not the
         // stream's answer.
-        u16::try_from(reply.num()).map_err(|_| RequestError::Unreadable)
+        // A `$01` reply is a 14-bit word; a wider number at this address can
+        // only have come over the control wire, and is not the stream's answer.
+        u16::try_from(reply.num())
+            .ok()
+            .filter(|v| *v <= NRPN_MAX)
+            .ok_or(RequestError::Unreadable)
     }
 
     /// Request one string parameter (function `$43`) and return it — a page-0
@@ -1182,6 +1193,16 @@ impl DeviceModel {
     /// Enqueue raw (pre-framing) MIDI bytes for the stream's writer.
     async fn enqueue(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
         self.handle.shared.enqueue(bytes).await
+    }
+
+    /// Test hook: forget when the control link was last attempted, so
+    /// [`reopen_control`](Self::reopen_control) is not refused as
+    /// [`ChannelError::TooSoon`]. The reopen gap
+    /// ([`generated::CONTROL_REOPEN_MIN_GAP_MS`]) is far longer than any test
+    /// can wait, and there is no other way to reach the success path.
+    #[doc(hidden)]
+    pub fn clear_control_attempt_for_tests(&self) {
+        self.handle.shared.clear_control_attempt();
     }
 }
 

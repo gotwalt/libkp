@@ -11,6 +11,8 @@ Layers, lowest to highest:
 - :mod:`libkp.params` / :mod:`libkp.registry` — offline name and type lookups.
 - :mod:`libkp.cbor` — the native CBOR control channel: codec and control link.
 - :mod:`libkp.state` — the device-state tree and its pure decode routing.
+- :mod:`libkp.nav` — the Navigator's pure state machine, the one way a rig is
+  loaded.
 - :mod:`libkp.model` — :class:`~libkp.model.DeviceModel`, the async store over
   the stream and the control link.
 
@@ -88,6 +90,15 @@ from .model import (
     DeviceModel,
     ReconnectPolicy,
     SyncStrategy,
+)
+from .nav import (
+    Dropped,
+    NavAction,
+    NavigatorState,
+    Send,
+    Settled,
+    StartSettle,
+    StartWindow,
 )
 from .nrpn import (
     NrpnHeader,
@@ -290,6 +301,14 @@ __all__ = [
     "SyncStrategy",
     "ReconnectPolicy",
     "Backoff",
+    # the Navigator's state machine
+    "NavigatorState",
+    "NavAction",
+    "Send",
+    "StartSettle",
+    "StartWindow",
+    "Settled",
+    "Dropped",
     # cbor state-dump snapshot
     "CborSession",
     "StateSnapshot",

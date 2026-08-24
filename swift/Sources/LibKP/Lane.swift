@@ -31,7 +31,10 @@ struct RenderKey: Hashable, Sendable {
 /// free while the request is being written, and the device answers in tens of
 /// milliseconds — so the entry holds either the continuation or the result,
 /// whichever comes first, and joins them when the other arrives.
-final class PendingRequest {
+///
+/// Owned by the actor and touched only on it; `Sendable` is claimed so a
+/// started entry can be handed to the task that waits it out.
+final class PendingRequest: @unchecked Sendable {
     let id: UInt64
     /// Whether a string, rather than a numeric, is what answers this.
     let wantsText: Bool
@@ -71,14 +74,20 @@ extension DeviceModel {
     /// with no value at the address — the request is never resent — and
     /// ``RequestError/unreadable`` at once, sending nothing, for the morph
     /// position: the stream never answers it. An unsolicited push at the
-    /// address counts as the reply; it is no less current.
+    /// address counts as the reply; it is no less current. A reply wider
+    /// than the 14 bits a `$01` carries can only have come over the control
+    /// wire, and is not the stream's answer: that too is
+    /// ``RequestError/unreadable``, after the fact.
     public func requestParam(page: UInt8, number: UInt8) async throws -> UInt16 {
         let address = UInt32(page) * 128 + UInt32(number)
         let reply = try await ask(
             Nrpn.requestSingle(
                 product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
             ), at: address, text: false)
-        return UInt16(clamping: reply.num ?? 0)
+        guard let value = UInt16(exactly: reply.num ?? 0), value <= DeviceModel.nrpnMax else {
+            throw RequestError.unreadable
+        }
+        return value
     }
 
     /// Request one string parameter (function `$43`), e.g. a page-0 string tag,
@@ -119,25 +128,16 @@ extension DeviceModel {
     /// `$7C`) — e.g. `"5.2"`, `"120 BPM"`, `"<0.0>"` instead of a generic
     /// percentage — and return it. The `$3C` reply is also raised as
     /// ``DeviceEvent/renderedString(page:number:value:text:)``; it is never
-    /// stored.
+    /// stored. An address the stream never answers (the morph position) is
+    /// ``RequestError/unreadable`` here as for ``requestParam(page:number:)``:
+    /// a `$7C` for it draws the same silence as a `$41`, so nothing is sent.
     public func requestRender(page: UInt8, number: UInt8, value: UInt16) async throws -> String {
         let key = RenderKey(page: page, number: number, value: value)
         let message = Nrpn.requestRenderedString(
             product: DeviceModel.product, device: DeviceModel.device,
             page: page, number: number, value: value)
-        guard state.channels.stream == .open else { throw RequestError.disconnected }
-        guard await acquireSlot() else { throw RequestError.disconnected }
-        defer { releaseSlot() }
-        let entry = register(wantsText: true, at: .render(key))
-        pendingRenders[key, default: []].append(entry)
-        do {
-            try await write(message)
-        } catch {
-            remove(entry.id, at: .render(key))
-            entry.settle(.failure(.disconnected))
-            throw RequestError.disconnected
-        }
-        return try await wait(for: entry).text ?? ""
+        let entry = try await start(message, at: .render(key), text: true)
+        return try await finish(entry).text ?? ""
     }
 
     // MARK: - Refresh
@@ -146,8 +146,10 @@ extension DeviceModel {
     /// — the connect-time burst — through the lane, and wait for the replies.
     ///
     /// Read-only: it only issues value requests and changes nothing on the
-    /// device. The replies fold into the tree as they land. Returns once every
-    /// one has answered; throws ``RequestError/timeout`` if any did not (the
+    /// device. The rows go out in the table's order — address-sorted, so the
+    /// wire order is the same in every language — paced by the lane's cap.
+    /// The replies fold into the tree as they land. Returns once every one
+    /// has answered; throws ``RequestError/timeout`` if any did not (the
     /// others still landed), or ``RequestError/disconnected`` if the stream
     /// went away underneath it.
     public func refresh() async throws {
@@ -189,14 +191,25 @@ extension DeviceModel {
             rows: Generated.stateRoutes.filter { $0.request && fields.contains($0.field) })
     }
 
-    /// Issue every row's request at once — the lane paces them — and report
-    /// the worst outcome.
+    /// Issue every row's request through the lane, in the order given — the
+    /// routing table is address-sorted, so the wire order is the table order,
+    /// the same in every language — and report the worst outcome.
+    ///
+    /// Each row is *started* in turn: its wire slot taken, its entry filed,
+    /// its bytes written, before the next row is looked at. The lane's cap
+    /// is what paces the loop — once ``Generated/maxInFlightRequests`` are
+    /// out it waits for a slot — and the replies are then awaited together.
     private func request(rows: [Route]) async throws {
         let outcomes = await withTaskGroup(of: RequestError?.self) { group in
-            for row in rows {
-                group.addTask { await self.request(row: row) }
-            }
             var out: [RequestError?] = []
+            for row in rows {
+                switch await start(row: row) {
+                case .success(let entry):
+                    group.addTask { await self.outcome(of: entry) }
+                case .failure(let error):
+                    out.append(error)
+                }
+            }
             for await outcome in group { out.append(outcome) }
             return out
         }
@@ -204,19 +217,43 @@ extension DeviceModel {
         if outcomes.contains(.timeout) { throw RequestError.timeout }
     }
 
-    /// One row's request: a paged address goes as `$41`/`$43`, an extended
-    /// one as `$46`/`$47`, by whether the row stores text.
-    private func request(row: Route) async -> RequestError? {
+    /// Start one row's request: a paged address goes as `$41`/`$43`, an
+    /// extended one as `$46`/`$47`, by whether the row stores text.
+    private func start(row: Route) async -> Result<PendingRequest, RequestError> {
+        let paged = row.address < 16384
+        let page = UInt8(truncatingIfNeeded: row.address / 128)
+        let number = UInt8(truncatingIfNeeded: row.address % 128)
+        let text = row.kind == .text
+        let message: [UInt8]
+        switch (text, paged) {
+        case (true, true):
+            message = Nrpn.requestString(
+                product: DeviceModel.product, device: DeviceModel.device, page: page,
+                number: number)
+        case (true, false):
+            message = Nrpn.requestExtendedString(
+                product: DeviceModel.product, device: DeviceModel.device, address: row.address)
+        case (false, true):
+            message = Nrpn.requestSingle(
+                product: DeviceModel.product, device: DeviceModel.device, page: page,
+                number: number)
+        case (false, false):
+            message = Nrpn.requestExtendedParam(
+                product: DeviceModel.product, device: DeviceModel.device, address: row.address)
+        }
         do {
-            let paged = row.address < 16384
-            let page = UInt8(truncatingIfNeeded: row.address / 128)
-            let number = UInt8(truncatingIfNeeded: row.address % 128)
-            switch (row.kind == .text, paged) {
-            case (true, true): _ = try await requestString(page: page, number: number)
-            case (true, false): _ = try await requestExtString(address: row.address)
-            case (false, true): _ = try await requestParam(page: page, number: number)
-            case (false, false): _ = try await requestExtParam(address: row.address)
-            }
+            return .success(try await start(message, at: .address(row.address), text: text))
+        } catch let error as RequestError {
+            return .failure(error)
+        } catch {
+            return .failure(.disconnected)
+        }
+    }
+
+    /// Wait out a started request and report only how it ended.
+    private func outcome(of entry: PendingRequest) async -> RequestError? {
+        do {
+            _ = try await finish(entry)
             return nil
         } catch let error as RequestError {
             return error
@@ -227,25 +264,51 @@ extension DeviceModel {
 
     // MARK: - The lane
 
-    /// Send one request and wait for a value at `address`.
-    ///
-    /// The pending entry is registered *before* the write goes out: the actor
-    /// is free while the write is in flight, and a reply that beat the entry
-    /// would otherwise wait out the full timeout for nothing.
+    /// Send one request and wait for a value at `address`: ``start`` then
+    /// ``finish``, as one call.
     private func ask(_ message: [UInt8], at address: UInt32, text: Bool) async throws -> Reply {
-        guard Routes.lookup(address)?.wire != .control else { throw RequestError.unreadable }
+        let entry = try await start(message, at: .address(address), text: text)
+        return try await finish(entry)
+    }
+
+    /// Refuse what the stream cannot answer, take a wire slot, file the entry,
+    /// and send the request. What is left is to wait, which ``finish(_:)``
+    /// does; splitting the two lets ``refresh()`` send its rows in order and
+    /// await them together. The entry holds the slot until it is finished.
+    ///
+    /// The refusals come in the order Rust and Python make them: an address
+    /// whose row is the control link's alone (the morph) is
+    /// ``RequestError/unreadable`` whether or not the stream is up — it is a
+    /// property of the address — and only then is a closed stream
+    /// ``RequestError/disconnected``. The pending entry is filed *before* the
+    /// write goes out: the actor is free while the write is in flight, and a
+    /// reply that beat the entry would otherwise wait out the full timeout
+    /// for nothing.
+    private func start(_ message: [UInt8], at slot: Slot, text: Bool) async throws -> PendingRequest
+    {
+        guard Routes.lookup(slot.address)?.wire != .control else { throw RequestError.unreadable }
         guard state.channels.stream == .open else { throw RequestError.disconnected }
         guard await acquireSlot() else { throw RequestError.disconnected }
-        defer { releaseSlot() }
-        let entry = register(wantsText: text, at: .address(address))
-        pending[address, default: []].append(entry)
+        let entry = register(wantsText: text, at: slot)
+        switch slot {
+        case .address(let address): pending[address, default: []].append(entry)
+        case .render(let key): pendingRenders[key, default: []].append(entry)
+        }
         do {
             try await write(message)
         } catch {
-            remove(entry.id, at: .address(address))
+            remove(entry.id, at: slot)
             entry.settle(.failure(.disconnected))
+            releaseSlot()
             throw RequestError.disconnected
         }
+        return entry
+    }
+
+    /// Wait out a started request's reply or its timeout, and free its wire
+    /// slot either way.
+    private func finish(_ entry: PendingRequest) async throws -> Reply {
+        defer { releaseSlot() }
         return try await wait(for: entry)
     }
 

@@ -19,8 +19,9 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -55,10 +56,16 @@ const REQUEST_FUNCTIONS: [u8; 5] = [
 /// What the fake offers and how it answers. Changeable while it runs.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The protocol GUIDs listed in the greeting; only these are accepted.
+    /// The protocol GUIDs listed in the greeting.
     pub offers: Vec<String>,
+    /// The protocol GUIDs the fake answers `+` to. A protocol offered but not
+    /// in this set is met with `-NO`, as the device does with its reserved
+    /// GUID — and as a device that stopped offering the control channel does
+    /// with a selection it once accepted.
+    pub accepts: Vec<String>,
     /// Numeric values by flat address, for `$41` and `$46` requests. An
-    /// address with no entry is not answered.
+    /// address with no entry is not answered — unless [`answer_everything`] is
+    /// set, when a placeholder is.
     pub values: HashMap<u32, u64>,
     /// String values by flat address, for `$43` and `$47` requests.
     pub strings: HashMap<u32, String>,
@@ -66,23 +73,44 @@ pub struct Config {
     pub renders: HashMap<(u8, u8, u16), String>,
     /// The items served, in one write, when the dump trigger arrives.
     pub dump: Vec<Value>,
+    /// Framed MIDI messages appended to the `+<name>` acceptance line for a
+    /// MIDI3 connection, so a burst rides in on the handshake tail.
+    pub tail: Vec<Vec<u8>>,
+    /// Answer every request with a placeholder (`0` / `"X"`), the way a real
+    /// device answers anything asked — except the flat addresses in
+    /// [`silent`], which are left unanswered so a lone timeout can be tested.
+    pub answer_everything: bool,
+    /// Flat addresses to leave unanswered even under [`answer_everything`].
+    pub silent: HashSet<u32>,
 }
 
 impl Default for Config {
-    /// Offers every protocol a device does, answers nothing (no values), and
-    /// serves a short dump: the position, the rig name, the morph, then the
-    /// run at [`generated::DUMP_END_ADDRESS`] that ends every real dump.
+    /// Offers every protocol a device does, accepts all but the reserved GUID,
+    /// answers nothing (no values), and serves a short dump in the real one's
+    /// two-section shape: a system value closed by a run at
+    /// [`generated::DUMP_END_ADDRESS`], then the position, the rig name and the
+    /// morph, closed by a second such run — the one that ends the dump.
     fn default() -> Self {
+        let offers = vec![
+            PROTOCOL_RESERVED.to_string(),
+            PROTOCOL_MIDI3_STREAM.to_string(),
+            PROTOCOL_CBOR_CONTROL.to_string(),
+        ];
+        let accepts = offers
+            .iter()
+            .filter(|p| *p != PROTOCOL_RESERVED)
+            .cloned()
+            .collect();
         Config {
-            offers: vec![
-                PROTOCOL_RESERVED.to_string(),
-                PROTOCOL_MIDI3_STREAM.to_string(),
-                PROTOCOL_CBOR_CONTROL.to_string(),
-            ],
+            offers,
+            accepts,
             values: HashMap::new(),
             strings: HashMap::new(),
             renders: HashMap::new(),
             dump: default_dump(),
+            tail: Vec::new(),
+            answer_everything: false,
+            silent: HashSet::new(),
         }
     }
 }
@@ -92,18 +120,43 @@ impl Config {
     pub fn without_cbor() -> Self {
         let mut cfg = Config::default();
         cfg.offers.retain(|p| p != PROTOCOL_CBOR_CONTROL);
+        cfg.accepts.retain(|p| p != PROTOCOL_CBOR_CONTROL);
         cfg
+    }
+
+    /// A device that offers the CBOR control channel in its greeting but
+    /// refuses the selection with `-NO`, the way one that has stopped
+    /// accepting it does.
+    pub fn offers_but_refuses_cbor() -> Self {
+        let mut cfg = Config::default();
+        cfg.accepts.retain(|p| p != PROTOCOL_CBOR_CONTROL);
+        cfg
+    }
+
+    /// A device that answers every request with a placeholder.
+    pub fn answering() -> Self {
+        Config {
+            answer_everything: true,
+            ..Config::default()
+        }
     }
 }
 
-/// The default dump: bank 3 / slot 1 in one run, the rig name, the morph at
-/// half, and the end marker.
+/// The default dump, in a real dump's two-section shape: a system value closed
+/// by a run based at [`generated::DUMP_END_ADDRESS`], then the rig section —
+/// the position as one run, the rig name, the morph at half — closed by a
+/// second such run, the one that ends the dump.
 pub fn default_dump() -> Vec<Value> {
     vec![
+        cbor::param_write(
+            u32::from(generated::SYSTEM_PAGE) * 128 + u32::from(generated::MAIN_VOLUME_NUMBER),
+            8192,
+        ),
+        multi_item(generated::DUMP_END_ADDRESS, &[0, 0]),
         multi_item(generated::CURRENT_BANK_ADDRESS - 1, &[0, 3, 1]),
         string_item(u32::from(generated::STRING_RIG_NAME), "Fake Rig"),
         cbor::param_write(generated::MORPH_ADDRESS, 8192),
-        multi_item(generated::DUMP_END_ADDRESS, &[0, 0, 0]),
+        multi_item(generated::DUMP_END_ADDRESS, &[0, 0]),
     ]
 }
 
@@ -251,6 +304,10 @@ impl Connection {
 struct Inner {
     config: Mutex<Config>,
     connections: Mutex<Vec<Arc<Connection>>>,
+    /// While set, a freshly accepted socket is dropped at once rather than
+    /// served, so a dial connects and then reads EOF — a refused redial, for a
+    /// reconnect that must try more than once.
+    paused: AtomicBool,
 }
 
 impl Inner {
@@ -285,6 +342,7 @@ impl FakeDevice {
         let inner = Arc::new(Inner {
             config: Mutex::new(config),
             connections: Mutex::new(Vec::new()),
+            paused: AtomicBool::new(false),
         });
         let accept = tokio::spawn(accept_loop(listener, inner.clone()));
         FakeDevice {
@@ -402,6 +460,17 @@ impl FakeDevice {
         self.controls()[n].clone()
     }
 
+    /// Stop admitting fresh connections: a dial from now on connects and then
+    /// reads EOF, a refused redial. Connections already up are untouched.
+    pub fn pause_accepting(&self) {
+        self.inner.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Admit fresh connections again.
+    pub fn resume_accepting(&self) {
+        self.inner.paused.store(false, Ordering::SeqCst);
+    }
+
     /// Hang up every connection.
     pub async fn hang_up_all(&self) {
         for conn in self.connections() {
@@ -438,6 +507,11 @@ pub async fn wait_for(mut predicate: impl FnMut() -> bool, timeout: Duration) ->
 async fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
     let mut next_id = 0usize;
     while let Ok((stream, _)) = listener.accept().await {
+        // Paused: connect, then EOF — a refused redial.
+        if inner.paused.load(Ordering::SeqCst) {
+            drop(stream);
+            continue;
+        }
         let _ = stream.set_nodelay(true);
         let (reader, writer) = stream.into_split();
         let conn = Arc::new(Connection {
@@ -471,13 +545,21 @@ async fn serve(inner: Arc<Inner>, conn: Arc<Connection>, mut reader: OwnedReadHa
         return;
     };
     conn.state().selected = Some(line.clone());
-    if !config.offers.contains(&line) {
+    if !config.accepts.contains(&line) {
         conn.write(b"-NO\r\n").await;
         conn.hang_up().await;
         conn.state().closed = true;
         return;
     }
-    conn.write(format!("+{line}\r\n").as_bytes()).await;
+    // The `+<name>` acceptance line, and — for the stream — whatever framed
+    // messages ride in on its tail, in one write.
+    let mut ack = format!("+{line}\r\n").into_bytes();
+    if line == PROTOCOL_MIDI3_STREAM {
+        for message in &config.tail {
+            ack.extend_from_slice(&midi3::frame(message));
+        }
+    }
+    conn.write(&ack).await;
     conn.state().protocol = Some(line.clone());
 
     let mut preamble = [0u8; generated::SESSION_PREAMBLE_LEN];
@@ -555,13 +637,37 @@ async fn serve_control(inner: Arc<Inner>, conn: Arc<Connection>, mut reader: Own
 fn reply_for(config: &Config, msg: &[u8]) -> Option<Vec<u8>> {
     let (header, vals) = NrpnHeader::parse(msg)?;
     let flat = u32::from(header.page) * 128 + u32::from(header.number);
+    // A configured value wins; otherwise a placeholder if the fake answers
+    // everything and the address is not on the silent list.
+    let placeholder_num = |address: u32| -> Option<u64> {
+        if config.silent.contains(&address) {
+            None
+        } else if let Some(v) = config.values.get(&address) {
+            Some(*v)
+        } else if config.answer_everything {
+            Some(0)
+        } else {
+            None
+        }
+    };
+    let placeholder_text = |address: u32| -> Option<String> {
+        if config.silent.contains(&address) {
+            None
+        } else if let Some(t) = config.strings.get(&address) {
+            Some(t.clone())
+        } else if config.answer_everything {
+            Some("X".to_string())
+        } else {
+            None
+        }
+    };
     match header.function {
         FUNCTION_REQUEST_SINGLE => {
-            let value = *config.values.get(&flat)?;
+            let value = placeholder_num(flat)?;
             Some(set_single(0, 0, header.page, header.number, value as u16))
         }
         FUNCTION_REQUEST_STRING => {
-            let text = config.strings.get(&flat)?;
+            let text = placeholder_text(flat)?;
             let mut payload = text.as_bytes().to_vec();
             payload.push(0);
             Some(sysex(
@@ -575,7 +681,7 @@ fn reply_for(config: &Config, msg: &[u8]) -> Option<Vec<u8>> {
         }
         FUNCTION_REQUEST_EXT_PARAM => {
             let address = nrpn::ext_decode(msg.get(8..13)?) as u32;
-            let value = *config.values.get(&address)?;
+            let value = placeholder_num(address)?;
             let mut reply = vec![0xF0, 0x00, 0x20, 0x33, 0x00, 0x00, FUNCTION_EXT_PARAM, 0x00];
             reply.extend(nrpn::ext_encode(u64::from(address), 5));
             reply.extend(nrpn::ext_encode(value, 5));
@@ -584,7 +690,7 @@ fn reply_for(config: &Config, msg: &[u8]) -> Option<Vec<u8>> {
         }
         FUNCTION_REQUEST_EXT_STRING => {
             let address = nrpn::ext_decode(msg.get(8..13)?) as u32;
-            let text = config.strings.get(&address)?;
+            let text = placeholder_text(address)?;
             let mut reply = vec![
                 0xF0,
                 0x00,

@@ -256,6 +256,13 @@ aim while there is one, else `current_rig_index` — what a rig browser should
 highlight, and what `step_rig` steps from, so a run of taps counts from the
 last tap.
 
+The machine behind all of this is `libkp.nav.NavigatorState`, pure and
+public: four fields (`aim`, `sent`, `in_flight`, `awaiting`) and four inputs
+(`navigate`, `settle_elapsed`, `window_elapsed`, `position`), each returning
+the `NavAction` list the model carries out (`Send`, `StartSettle`,
+`StartWindow`, `Settled`, `Dropped`). `spec/vectors/navigation.json` pins it in
+every language.
+
 ### Requests
 
 `request_param`, `request_string`, `request_ext_param`, `request_ext_string` and
@@ -266,7 +273,11 @@ are dropped — and a request unanswered after `REQUEST_TIMEOUT_MS` (300) raises
 `RequestTimeoutError`, raises a `RequestTimedOut` event, and is never retried:
 the device ignores an address it cannot answer. The morph position is the one
 address the stream cannot read, so asking for it raises
-`RequestUnreadableError` without a byte on the wire.
+`RequestUnreadableError` without a byte on the wire — checked before the
+stream's own state, since it is true of the address whether or not the stream
+is up. `request_param` also raises it after the fact for a reply wider than
+the 14 bits a `$01` carries: only a value from the other wire resolving the
+same address could be, and it is not the stream's answer.
 
 `refresh()` is the whole burst on demand; `refresh_rig()`, `refresh_bank()` and
 `refresh_position()` are its subsets (the rig strings and each slot's
@@ -284,9 +295,13 @@ own. The **morph position** is CBOR-only and never appears on the MIDI3 stream,
 so it comes from the control link: when the link opens it writes the one item
 that asks for the state dump, folds the dump (the morph, the position and a
 great deal else) into the tree, and then folds the live pushes that keep the
-morph moving. A dump is recognised as finished by its last item, the run at
-`DUMP_END_ADDRESS`, with `DUMP_SETTLE_MS` as the fallback; `SyncCompleted` is
-raised for each channel when its sync is done.
+morph moving. A dump has two sections -- the system state, then the loaded rig
+-- and each closes with a run at `DUMP_END_ADDRESS`, so it is recognised as
+finished by the second such run (`DUMP_END_RUNS`), with `DUMP_SETTLE_MS` as
+the fallback; `SyncCompleted` is raised for each channel when its sync is
+done. The control link takes `PROTOCOL_CBOR_CONTROL` or nothing: a greeting
+that does not offer it is a `ProtocolRejectedError` before any selection is
+written, never a link on some other protocol.
 
 `state.connection` summarises both: `CONNECTED` (the stream is up and the
 control link is open, still on its way, or off by policy), `DEGRADED` (the
@@ -299,7 +314,8 @@ stream is up but the control link was asked for and is `UNAVAILABLE` or
 
 A lost control link is never reopened on its own: `reopen_control()` does it on
 request, refused with `ChannelTooSoonError` inside `CONTROL_REOPEN_MIN_GAP_MS`
-of the last control open, and `ReconnectPolicy(control_reopen=seconds)` opts
+of the last control open (a link already open or opening is left alone and the
+call returns at once), and `ReconnectPolicy(control_reopen=seconds)` opts
 into one attempt per gap while the stream is up. A lost **stream** closes both
 links and reports `Disconnected` — unless `ReconnectPolicy(stream=Backoff(...))`
 was given, in which case the model reports `RECONNECTING`, waits out the

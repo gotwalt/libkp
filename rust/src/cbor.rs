@@ -30,8 +30,12 @@
 //! multi-parameter and string items carrying — among much else — the current
 //! bank ([`generated::CURRENT_BANK_ADDRESS`]) and rig slot
 //! ([`generated::CURRENT_RIG_SLOT_ADDRESS`]), both 0-based. The write is
-//! non-mutating. The burst always ends with the run whose base is
-//! [`generated::DUMP_END_ADDRESS`], which is how a reader knows it is over.
+//! non-mutating. The burst comes in two sections — a system section, then the
+//! rig section — each closed by a run whose base is
+//! [`generated::DUMP_END_ADDRESS`]; the [`generated::DUMP_END_RUNS`]-th
+//! (second) such run is how the model knows the dump is over.
+//! [`extract_snapshot`] and the [`StateSnapshot`] tooling read every item
+//! regardless of section, so they need not count runs.
 
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
@@ -43,7 +47,9 @@ use tokio::task::JoinHandle;
 use crate::SessionError;
 use crate::generated;
 use crate::protocol::DISCOVERY_PORT;
-use crate::session::{HandshakeOutcome, PROTOCOL_CBOR_CONTROL, Session, parse_protocol_list};
+use crate::session::{
+    HANDSHAKE_TIMEOUT, HandshakeOutcome, PROTOCOL_CBOR_CONTROL, Session, parse_protocol_list,
+};
 use crate::state::{Channel, Decoded, DeviceState, Phase, Update};
 
 /// A decoded CBOR data item.
@@ -635,12 +641,17 @@ pub(crate) fn updates(items: &[Value], phase: Phase) -> Vec<Update> {
     out
 }
 
-/// The index of the item that always ends a state dump — the run whose base
-/// address is [`generated::DUMP_END_ADDRESS`] — if it is among these.
-pub(crate) fn dump_end_index(items: &[Value]) -> Option<usize> {
+/// Every index at which a run based at [`generated::DUMP_END_ADDRESS`] sits, in
+/// order. A real dump carries [`generated::DUMP_END_RUNS`] of them — one
+/// closing the system section, one closing the rig section — and the phase ends
+/// only at the last, so the model counts these across reads.
+pub(crate) fn dump_end_indices(items: &[Value]) -> Vec<usize> {
     items
         .iter()
-        .position(|item| item_base(item) == Some(generated::DUMP_END_ADDRESS))
+        .enumerate()
+        .filter(|(_, item)| item_base(item) == Some(generated::DUMP_END_ADDRESS))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// The base address of one value-bearing item: the address of a single or a
@@ -719,16 +730,20 @@ impl StateSnapshot {
     /// [`CborSession`]. Returns as soon as every value it reads is known (see
     /// [`is_complete`](Self::is_complete)) or the default timeout elapses.
     pub async fn fetch(ip: Ipv4Addr) -> Result<StateSnapshot, SessionError> {
-        Self::fetch_with(ip, Self::DEFAULT_TIMEOUT).await
+        Self::fetch_with(ip, DISCOVERY_PORT, Self::DEFAULT_TIMEOUT).await
     }
 
-    /// [`fetch`](Self::fetch) with an explicit read timeout.
+    /// [`fetch`](Self::fetch) with an explicit port and read timeout. The port
+    /// exists for fakes and tests — a real device only ever listens on
+    /// [`DISCOVERY_PORT`](crate::protocol::DISCOVERY_PORT), which
+    /// [`fetch`](Self::fetch) fills in.
     pub async fn fetch_with(
         ip: Ipv4Addr,
+        port: u16,
         timeout: Duration,
     ) -> Result<StateSnapshot, SessionError> {
         let idle = Duration::from_millis(30);
-        let mut link = ControlLink::open(ip, DISCOVERY_PORT, idle).await?;
+        let mut link = ControlLink::open(ip, port, idle).await?;
         let mut items = Vec::new();
 
         // The trigger went out with the open; read until every value the
@@ -789,7 +804,14 @@ impl ControlLink {
         idle: Duration,
     ) -> Result<Self, SessionError> {
         let mut session = Session::connect_to(ip, port).await?;
-        let greeting = session.read_available(idle, 256).await?;
+        // The greeting's first byte gets the full handshake budget, not the
+        // short idle gap: a device that has served a few sessions can take most
+        // of a second to begin greeting, and the control link is the second
+        // socket opened — exactly when the device is at its slowest. Only the
+        // gap between the greeting's own chunks is the idle one.
+        let greeting = session
+            .read_available_within(HANDSHAKE_TIMEOUT, idle, 256)
+            .await?;
         let offered = parse_protocol_list(&greeting);
         if !offered.iter().any(|o| o == PROTOCOL_CBOR_CONTROL) {
             return Err(SessionError::ProtocolRejected {
@@ -878,7 +900,15 @@ impl CborSession {
     /// [`subscribe`](Self::subscribe). Subscribe *before* awaiting them, or the
     /// dump's own burst is missed.
     pub async fn connect(ip: Ipv4Addr) -> Result<Self, SessionError> {
-        let link = ControlLink::open(ip, DISCOVERY_PORT, Duration::from_millis(30)).await?;
+        Self::connect_to(ip, DISCOVERY_PORT).await
+    }
+
+    /// [`connect`](Self::connect) with an explicit port. The port exists for
+    /// fakes and tests — a real device only ever listens on
+    /// [`DISCOVERY_PORT`](crate::protocol::DISCOVERY_PORT), which
+    /// [`connect`](Self::connect) fills in.
+    pub async fn connect_to(ip: Ipv4Addr, port: u16) -> Result<Self, SessionError> {
+        let link = ControlLink::open(ip, port, Duration::from_millis(30)).await?;
 
         // Subscribe before spawning: `broadcast::Sender::send` discards when
         // nothing is listening, and the opening burst — the only place several
@@ -966,6 +996,18 @@ mod tests {
             assert_eq!(out, vec![item]);
             assert_eq!(d.pending(), 0);
         }
+    }
+
+    #[test]
+    fn decoder_buffers_a_partial_item_across_chunks() {
+        // A device write can split an item across two TCP reads; the decoder
+        // holds the head until the rest arrives rather than resyncing over it.
+        let full = to_vec(&param_write(102_528, 1));
+        let mut d = Decoder::new();
+        assert!(d.push(&full[..4]).is_empty());
+        assert_eq!(d.pending(), 4);
+        assert_eq!(d.push(&full[4..]), vec![param_write(102_528, 1)]);
+        assert_eq!(d.pending(), 0);
     }
 
     #[test]
@@ -1083,8 +1125,8 @@ mod tests {
                 expect(generated::DUMP_END_ADDRESS + 1, Decoded::Num(8)),
             ]
         );
-        assert_eq!(dump_end_index(&items), Some(3));
-        assert_eq!(dump_end_index(&items[..3]), None);
+        assert_eq!(dump_end_indices(&items), vec![3]);
+        assert_eq!(dump_end_indices(&items[..3]), Vec::<usize>::new());
     }
 
     /// A negative or oversized address is malformed; wrapping it into a

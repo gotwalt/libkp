@@ -32,6 +32,7 @@ from libkp.state import (
     TunerDeviance,
     TunerNote,
     Update,
+    _decode,
 )
 
 FN_STRING = nrpn.FUNCTION_STRING_PARAM
@@ -553,3 +554,35 @@ def test_a_string_at_a_numeric_row_is_untracked():
     out = state.apply_update(Update(Channel.STREAM, Phase.LIVE, 1, Num(5)))
     assert out == ApplyOutcome.fast(ParamChanged(0, 1, 5))
     assert state.rig.name == "x"
+
+
+def test_sensitive_text_is_redacted_before_it_is_stored():
+    """A device secret the dump volunteers in the clear is replaced by the
+    placeholder in the row decoder itself, so no path past it can see it; an
+    ordinary string comes through as it is."""
+    secret = Text("hunter2")
+    assert _decode(gen.Kind.TEXT, secret, gen.SENSITIVE_ADDRESSES[0]) == gen.REDACTED_PLACEHOLDER
+    assert _decode(gen.Kind.TEXT, secret, gen.STRING_RIG_NAME) == "hunter2"
+
+
+def test_wire_authority_refuses_only_the_control_copy():
+    """Rule 3 as a table: a ``stream`` row drops the control channel's copy and
+    nothing else is refused -- a ``control`` row takes the stream's value, and
+    a ``both`` row takes either wire's."""
+    beat = gen.PAGE_REALTIME * 128 + gen.BEAT_PULSE_NUMBER
+    tempo = gen.PAGE_RIG_SETTINGS * 128 + gen.TEMPO_NUMBER
+    assert _routes.lookup(beat).wire is gen.Wire.STREAM
+    assert _routes.lookup(gen.MORPH_ADDRESS).wire is gen.Wire.CONTROL
+    assert _routes.lookup(tempo).wire is gen.Wire.BOTH
+    cases = [
+        (beat, Channel.CONTROL, True),
+        (beat, Channel.STREAM, False),
+        (gen.MORPH_ADDRESS, Channel.STREAM, False),
+        (gen.MORPH_ADDRESS, Channel.CONTROL, False),
+        (tempo, Channel.STREAM, False),
+        (tempo, Channel.CONTROL, False),
+    ]
+    for address, source, refused in cases:
+        state = DeviceState()
+        out = state.apply_update(Update(source, Phase.LIVE, address, Num(1)))
+        assert (out == ApplyOutcome.empty()) is refused, (address, source)

@@ -163,6 +163,56 @@ def test_handshake_without_a_greeting_times_out():
     assert elapsed < HANDSHAKE_TIMEOUT
 
 
+def test_handshake_without_a_selection_reply_times_out():
+    # A device that greets, reads the selection and then says nothing has not
+    # opened a session: an absent verdict is a failed handshake, reported for
+    # the selection phase with the wait actually made.
+    timeout = 0.2
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(ack=False) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                with pytest.raises(TimeoutErrorLibKP) as excinfo:
+                    await session.handshake([PROTOCOL_MIDI3_STREAM], IDLE, timeout=timeout)
+                return excinfo.value, loop.time() - started, device.selected
+            finally:
+                await session.close()
+
+    error, elapsed, selected = asyncio.run(scenario())
+    assert error.phase == "protocol selection"
+    assert error.seconds == timeout
+    assert selected == PROTOCOL_MIDI3_STREAM, "the selection was written and read"
+    assert elapsed >= timeout
+    assert elapsed < HANDSHAKE_TIMEOUT
+
+
+def test_handshake_waits_out_a_slow_selection_reply():
+    # The answer to the selection is waited for like the greeting: up to
+    # HANDSHAKE_TIMEOUT for its first byte, not the inter-chunk idle gap.
+    delay = 0.3
+    assert delay > IDLE
+    assert delay < HANDSHAKE_TIMEOUT
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(selection_delay=delay) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                outcome = await session.handshake([PROTOCOL_MIDI3_STREAM], 0.03)
+                return outcome, loop.time() - started
+            finally:
+                await session.close()
+
+    outcome, elapsed = asyncio.run(scenario())
+    assert outcome.selected == PROTOCOL_MIDI3_STREAM
+    assert outcome.accepted
+    assert elapsed >= delay
+
+
 def test_response_tail_carries_the_first_stream_burst():
     burst = bytes.fromhex("f000203300000300000141433330f7")
 
@@ -301,6 +351,46 @@ def test_closing_twice_stamps_the_ledger_once():
 
     waited = asyncio.run(scenario())
     assert CONNECTION_COOLDOWN <= waited < CONNECTION_COOLDOWN + PROMPT
+
+
+def test_a_failed_dial_still_paces_the_retry():
+    # The device saw the attempt whether or not it answered, so a retry
+    # straight after a refused dial waits out the cooldown like any reopen.
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        server.close()
+        await server.wait_closed()
+        with pytest.raises(ConnectError):
+            await Session.connect("127.0.0.1", port, timeout=1.0)
+        failed_at = loop.time()
+        with pytest.raises(ConnectError):
+            await Session.connect("127.0.0.1", port, timeout=1.0)
+        return loop.time() - failed_at
+
+    assert asyncio.run(scenario()) >= CONNECTION_COOLDOWN
+
+
+def test_concurrent_waiters_are_serialised():
+    # Three opens racing for one peer come out a cooldown apart, not together:
+    # each claims the slot as it dials, and the others wait that claim out.
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+
+            async def open_one() -> tuple[float, Session]:
+                session = await Session.connect("127.0.0.1", device.port)
+                return loop.time(), session
+
+            results = await asyncio.gather(*(open_one() for _ in range(3)))
+            for _, session in results:
+                await session.close()
+            return sorted(opened for opened, _ in results)
+
+    first, second, third = asyncio.run(scenario())
+    assert second - first >= CONNECTION_COOLDOWN - 0.01
+    assert third - second >= CONNECTION_COOLDOWN - 0.01
 
 
 def test_the_snapshot_fetch_goes_through_the_ledger():

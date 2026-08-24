@@ -72,6 +72,17 @@ impl Reply {
     }
 }
 
+/// One folded chunk, before it is published: the events it raised, whether a
+/// slow field moved, and the positions it reported for the Navigator. The
+/// caller folds the positions and any dump-end into `events`/`slow` and then
+/// publishes once — the whole point of holding the publish back.
+#[derive(Default)]
+pub(crate) struct Chunk {
+    pub(crate) events: Vec<DeviceEvent>,
+    pub(crate) slow: bool,
+    pub(crate) positions: Vec<u16>,
+}
+
 /// One request waiting for its value.
 struct PendingEntry {
     id: u64,
@@ -157,13 +168,17 @@ impl Core {
 
     // ---- folding ---------------------------------------------------------
 
-    /// Fold one chunk of updates from either link: every update through the
-    /// funnel under one lock, every event broadcast, and — if any slow field
-    /// moved — exactly one snapshot. Then settle whatever requests the chunk
-    /// answered. Returns the positions the chunk reported, for the Navigator.
-    pub(crate) fn apply_updates(&self, epoch: u64, updates: &[Update]) -> Vec<u16> {
+    /// Fold one chunk of updates from either link into the tree — every update
+    /// through the funnel under one lock — and settle whatever requests the
+    /// chunk answered. Returns the events, the slow flag, and the positions the
+    /// chunk reported, but **does not publish**: the caller forwards the
+    /// positions to the Navigator and ends the dump, then publishes the lot
+    /// once with [`publish_chunk`](Self::publish_chunk), so a settled aim and a
+    /// finished dump ride in the chunk's single snapshot rather than each in
+    /// one of their own.
+    pub(crate) fn fold_update_chunk(&self, epoch: u64, updates: &[Update]) -> Chunk {
         if !self.current(epoch) || updates.is_empty() {
-            return Vec::new();
+            return Chunk::default();
         }
         let mut events = Vec::new();
         let mut slow = false;
@@ -175,15 +190,19 @@ impl Core {
                 slow |= outcome.slow_changed;
             }
         }
-        self.publish(&events, slow);
         self.settle_updates(updates);
-        positions(&events)
+        let positions = positions(&events);
+        Chunk {
+            events,
+            slow,
+            positions,
+        }
     }
 
     /// Fold one read chunk of unframed stream messages, the same way.
-    pub(crate) fn apply_messages(&self, epoch: u64, msgs: &[Vec<u8>]) -> Vec<u16> {
+    pub(crate) fn fold_message_chunk(&self, epoch: u64, msgs: &[Vec<u8>]) -> Chunk {
         if !self.current(epoch) || msgs.is_empty() {
-            return Vec::new();
+            return Chunk::default();
         }
         let decoded: Vec<StreamMessage> = msgs.iter().map(|m| decode_stream(m)).collect();
         let mut events = Vec::new();
@@ -214,10 +233,25 @@ impl Core {
                 }
             }
         }
-        self.publish(&events, slow);
         self.settle_updates(&updates);
         self.settle_rendered(&events);
-        positions(&events)
+        let positions = positions(&events);
+        Chunk {
+            events,
+            slow,
+            positions,
+        }
+    }
+
+    /// Publish one chunk's events, then its one snapshot if a slow field moved.
+    /// Epoch-guarded: a chunk folded by a life that has since ended says
+    /// nothing. The caller has already folded the tree and run the Navigator,
+    /// so `slow` reflects the position rows, the settled aim and everything
+    /// else together.
+    pub(crate) fn publish_chunk(&self, epoch: u64, events: &[DeviceEvent], slow: bool) {
+        if self.current(epoch) {
+            self.publish(events, slow);
+        }
     }
 
     /// Broadcast the events of one chunk, then its one snapshot if a slow
@@ -242,7 +276,10 @@ impl Core {
     /// End the dump phase. `completed` says whether it ended by its marker or
     /// its settle time — in which case the sync is reported done — or because
     /// the link ended underneath it, in which case nothing completed and
-    /// nothing is said.
+    /// nothing is said. Used by the settle-timer and loss paths, which are not
+    /// part of a chunk; a dump that ends *inside* a chunk uses
+    /// [`end_dump_report`](Self::end_dump_report) so its
+    /// [`DeviceEvent::SyncCompleted`] rides in that chunk's publish.
     pub(crate) fn end_dump(&self, epoch: u64, completed: bool) {
         if !self.current(epoch) {
             return;
@@ -253,6 +290,20 @@ impl Core {
                 source: Channel::Control,
             });
         }
+    }
+
+    /// End the dump phase as part of a chunk: clear the bookkeeping and return
+    /// the [`DeviceEvent::SyncCompleted`] for the caller to fold into the
+    /// chunk's event list, so it is broadcast *before* the chunk's one
+    /// snapshot rather than after it. An empty vector if the life has moved on.
+    pub(crate) fn end_dump_report(&self, epoch: u64) -> Vec<DeviceEvent> {
+        if !self.current(epoch) {
+            return Vec::new();
+        }
+        self.write().end_dump();
+        vec![DeviceEvent::SyncCompleted {
+            source: Channel::Control,
+        }]
     }
 
     /// The stream's sync burst finished (every reply landed or timed out).
@@ -300,18 +351,21 @@ impl Core {
         let mut events = Vec::new();
         {
             let mut st = self.write();
-            if st.channels.stream != ChannelState::Lost {
-                st.channels.stream = ChannelState::Lost;
-                events.push(DeviceEvent::ChannelChanged {
-                    channel: Channel::Stream,
-                    state: ChannelState::Lost,
-                });
-            }
+            // The control link is closed *because* the stream went, so its
+            // event comes first — the causal order, and the one Python and
+            // Swift raise.
             if st.channels.control != ChannelState::Closed {
                 st.channels.control = ChannelState::Closed;
                 events.push(DeviceEvent::ChannelChanged {
                     channel: Channel::Control,
                     state: ChannelState::Closed,
+                });
+            }
+            if st.channels.stream != ChannelState::Lost {
+                st.channels.stream = ChannelState::Lost;
+                events.push(DeviceEvent::ChannelChanged {
+                    channel: Channel::Stream,
+                    state: ChannelState::Lost,
                 });
             }
             st.end_dump();
@@ -391,7 +445,16 @@ impl Core {
         }
         *slot = state;
         let mut events = vec![DeviceEvent::ChannelChanged { channel, state }];
-        if matches!(st.connection, Connection::Connected | Connection::Degraded) {
+        // A move *to* `Connecting` does not re-derive the connection: a reopen
+        // of a control link that failed or was lost is still a missing link
+        // until it is `Open`, so the connection stays `Degraded` through the
+        // attempt rather than flicking to `Connected` for the seconds a redial
+        // takes and back to `Degraded` if it fails. `Open`, `Unavailable` and
+        // `Lost` all re-derive. (On the first connect the connection is already
+        // `Connected` and the control link's `Connecting` leaves it there.)
+        if state != ChannelState::Connecting
+            && matches!(st.connection, Connection::Connected | Connection::Degraded)
+        {
             let want = self.connected_or_degraded(st);
             events.extend(self.transition(st, want));
         }
@@ -405,7 +468,8 @@ impl Core {
         let mut events = Vec::new();
         {
             let mut st = self.write();
-            for channel in [Channel::Stream, Channel::Control] {
+            // Control before stream, the same order stream loss uses.
+            for channel in [Channel::Control, Channel::Stream] {
                 let slot = match channel {
                     Channel::Stream => &mut st.channels.stream,
                     Channel::Control => &mut st.channels.control,
@@ -452,6 +516,17 @@ impl Core {
         if slow || !events.is_empty() {
             self.publish(&events, slow);
         }
+    }
+
+    /// Mirror the Navigator's `{aim, in_flight}` into the tree without
+    /// publishing, returning whether it moved. Used while folding a chunk: a
+    /// position that settles an aim changes the mirror, and that change must
+    /// ride in the chunk's one snapshot rather than trigger a second one.
+    pub(crate) fn set_navigation_silent(&self, navigation: Navigation) -> bool {
+        let mut st = self.write();
+        let changed = st.navigation != navigation;
+        st.navigation = navigation;
+        changed
     }
 
     /// With the stream open, the connection is [`Connection::Degraded`] when a

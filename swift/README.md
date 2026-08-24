@@ -63,7 +63,10 @@ generated as `Generated.stateRoutes`): which field it writes, how the value
 decodes, which wire may write it, whether a repeat is a no-op, and whether it
 is FAST or SLOW. An address with no row is untracked. Between `beginDump()` and
 `endDump()` — the CBOR state dump — a live push outranks the dump's stale copy
-of the same address.
+of the same address. The dump has two sections, the system state and then the
+loaded rig, each closed by a run based at `Generated.dumpEndAddress`; the model
+ends the dump phase at the `Generated.dumpEndRuns`-th (second) such run, or
+`Generated.dumpSettleMs` after the trigger if it never comes.
 
 `DeviceModel` is the **async handle**: an actor that owns every socket to the
 device and publishes both a coalesced snapshot stream and a granular event
@@ -102,10 +105,11 @@ recommended session, and a bare `connect` is all the examples use:
 
 | Option | Default | Meaning |
 |---|---|---|
+| `port` | `Generated.port` | The TCP port both links dial — the only one a real device listens on; fakes and tests set another. A `port` passed to `connect` itself overrides it. |
 | `control` | `.bestEffort` | Open the control link after the stream, in the background. `.off` never opens it (`connection` is `.connected` on the stream alone, the morph stays `nil`); `.required` fails `connect` if it cannot open. |
 | `sync` | `.streamBurst` | Send the 46-request burst (`refresh()`) as soon as the stream is up: string tags, effect types and states, the bank preview, the position, the header values. `.off` asks for nothing. |
-| `reconnect.stream` | `nil` | With a `Backoff` (`Backoff.defaultStream()` is 4 s doubling to 30 s), a lost stream is dialled again on the same handle — same streams, same tree — through `.reconnecting(attempt:)` until it is `.connected` again or `close()` is called. `nil` reports `.disconnected` and stops. |
-| `reconnect.controlReopen` | `nil` | Reopen a lost control link this long after losing it (never inside `Generated.controlReopenMinGapMs`). `nil` never reopens it; `reopenControl()` is the explicit way, refused with `ChannelError.tooSoon` inside the gap. |
+| `reconnect.stream` | `nil` | With a `Backoff` (`Backoff.defaultStream()` is 4 s doubling to 30 s), a lost stream is dialled again on the same handle — same streams, same tree — through `.reconnecting(attempt:)` until it is `.connected` again or `close()` is called. The attempt count, and the doubling with it, runs on until a life is fully up: under `.required`, a stream that opens but whose control link is refused is the next attempt, not a fresh start. `nil` reports `.disconnected` and stops. |
+| `reconnect.controlReopen` | `nil` | Reopen a lost control link this long after the last attempt at it began (never inside `Generated.controlReopenMinGapMs`). `nil` never reopens it; `reopenControl()` is the explicit way, refused with `ChannelError.tooSoon` inside the gap. |
 
 `state.connection` is `.disconnected`, `.reconnecting(attempt:)`, `.connected`
 or `.degraded` — the last meaning the stream is up but a control link that was
@@ -127,8 +131,12 @@ up to `Session.handshakeTimeout` (`Generated.handshakeTimeoutMs`, 2000) for
 the first byte of the greeting, and again for the first byte of the reply to
 the protocol selection, before reading the rest of each with the short idle
 gap. A device that has served a few sessions can take most of a second to
-greet, and a connect must not fail on that. A device that never greets throws
-`SessionError.timeout` for the `"greeting"` phase, reporting that full wait.
+greet, and a connect must not fail on that. A device that never greets — or
+greets with nothing to choose — throws `SessionError.timeout` for the
+`"greeting"` phase, reporting that full wait; one that reads the selection and
+never answers it, the same for `"protocol selection"`. The control link reads
+its greeting on the same budget. A dial the peer refuses fails at once with
+`SessionError.connect`, not after the connect timeout.
 
 Discovery is a one-liner when the address is unknown:
 
@@ -166,7 +174,10 @@ block, the beat pulse and tuner deviance — high-rate data best polled through
   Single Parameter Changes; the device applies the write silently and does *not*
   echo it back, so follow a set with `requestParam` when the snapshot should
   confirm the new value — the `$41` reply flows through normal ingest, which is
-  what `MetersApp` does when you click an effect block.
+  what `MetersApp` does when you click an effect block. Every command goes
+  through the stream link's command queue — bounded at 64, drained in order
+  by one writer — so a call returns once queued, and waits for room while
+  the queue is full.
 - **Actions** (`tapTempo`, `morphPedal`, `bank`, `send(control:)`, …) are
   momentary presses and live expression. They go out as 7-bit Control Change
   messages and are *not* reflected in state.
@@ -179,8 +190,12 @@ block, the beat pulse and tuner deviance — high-rate data best polled through
   most `Generated.maxInFlightRequests` on the wire, the rest queued — and
   returns the value that lands at its address (folding it into the tree on the
   way), or throws `RequestError.timeout` after `Generated.requestTimeoutMs`
-  with no retry. The morph position is `RequestError.unreadable` without a
-  byte sent: the stream never answers it, the control link carries it.
+  with no retry; `refresh()` sends its rows in the table's address order, so
+  the wire order is the same in every language. The morph position is
+  `RequestError.unreadable` without a byte sent, whichever request form asks
+  for it (`requestRender` included): the stream never answers it, the
+  control link carries it. So is a `requestParam` reply wider than the 14
+  bits a `$01` carries, which only the control wire can put at the address.
 
 ### Loading rigs: the Navigator
 
@@ -197,7 +212,7 @@ preselect (`bank(_:)`, CC47) loads nothing on its own and still passes.
 await model.navigateTo(16)          // a flat 0-based rig index: bank 4, slot 2
 await model.stepRig(by: 1)          // from state.aimedRigIndex, floored at 0
 await model.stepBank(forward: true) // ± Params.bankSlots
-await model.selectSlot(3)           // slot 1…5 of the aimed bank
+await model.selectSlot(3)           // slot 1…5 of the aimed bank; out of range is ignored
 ```
 
 Every call returns at once with the aim recorded in `state.navigation`
@@ -205,7 +220,9 @@ Every call returns at once with the aim recorded in `state.navigation`
 else `currentRigIndex`, and is what the steppers step from — so two taps
 inside the device's reporting delay compose instead of both stepping from the
 same stale index. A load is the documented pair, bank preselect then slot
-load, and is in flight for `Generated.rigLoadSettleMs` (500 ms, the measured
+load, queued on the stream link as one unit — or, if the queue has no room
+for both, or the stream is down, dropped at once with `navigationDropped` —
+and is in flight for `Generated.rigLoadSettleMs` (500 ms, the measured
 edge of the device pushing the landed rig on both wires); taps during the
 flight only move the aim, and the final aim is sent once the flight settles, so
 a burst costs two loads however long it is. The device's position report

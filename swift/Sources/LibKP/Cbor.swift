@@ -525,8 +525,10 @@ public enum Cbor {
 /// One item off the control channel, as the tree consumes it.
 struct ControlItem: Sendable, Equatable {
     /// The address the item names: a single's or a string's own, or a run's
-    /// base. The state dump always ends with the run based at
-    /// ``Generated/dumpEndAddress``, so this is what closes the dump phase.
+    /// base. The state dump comes in two sections — the system state, then
+    /// the loaded rig — and each closes with a run based at
+    /// ``Generated/dumpEndAddress``, so the ``Generated/dumpEndRuns``-th such
+    /// base is what closes the dump phase.
     let base: UInt32
     /// The values, one per address the item covers.
     let entries: [Entry]
@@ -570,17 +572,28 @@ final class ControlLink: @unchecked Sendable {
     /// for the state dump.
     ///
     /// The dial passes the ``ConnectionLedger``, so a link opened beside a
-    /// stream is spaced from it without the caller sleeping. The CBOR protocol
-    /// is required, not preferred: a greeting that does not offer it, or a
-    /// rejection of it, fails the open — there is no other protocol this link
-    /// could usefully speak. A failed trigger write fails the open too; a
-    /// control link that never asked for the dump would leave the morph
-    /// unknown for as long as it stayed up. On any failure the socket is
-    /// closed before the error propagates.
+    /// stream is spaced from it without the caller sleeping. The greeting's
+    /// first byte is given ``Session/handshakeTimeout``, as every greeting
+    /// is, and only the gap between its chunks is the idle one: this is the
+    /// second socket a model opens, right when a device that has served a
+    /// few sessions is at its slowest to greet, and a device that says
+    /// nothing at all in that budget fails with
+    /// ``SessionError/timeout(phase:ms:)`` for phase `"greeting"`. The CBOR
+    /// protocol is required, not preferred: a greeting that does not offer
+    /// it, or a rejection of it, fails the open — there is no other protocol
+    /// this link could usefully speak. A failed trigger write fails the open
+    /// too; a control link that never asked for the dump would leave the
+    /// morph unknown for as long as it stayed up. On any failure the socket
+    /// is closed before the error propagates.
     static func open(host: String, port: UInt16) async throws -> ControlLink {
         let session = try await Session.connect(host: host, port: port)
         do {
-            let greeting = try await session.readAvailable(idle: readIdle, max: 256)
+            let greeting = try await session.readAvailable(
+                first: Session.handshakeTimeout, idle: readIdle, max: 256)
+            guard !greeting.isEmpty else {
+                throw SessionError.timeout(
+                    phase: "greeting", ms: UInt64((Session.handshakeTimeout * 1000).rounded()))
+            }
             let offered = Session.parseProtocolList(greeting)
             guard offered.contains(Generated.protocolCborControl) else {
                 throw SessionError.protocolRejected(

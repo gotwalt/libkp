@@ -85,6 +85,26 @@ func controlStates(_ snapshots: [DeviceState]) -> [ChannelState] {
 
 private let host = "127.0.0.1"
 private let gainAddress = UInt32(Generated.ampPage) * 128 + UInt32(Generated.gainNumber)
+private let tempoAddress = UInt32(Generated.pageRigSettings) * 128 + UInt32(Generated.tempoNumber)
+private let rigNameAddress = UInt32(Generated.pageStrings) * 128 + UInt32(Generated.stringRigName)
+
+/// A `$01` Single Parameter Change as the device pushes one (product 0,
+/// device 0).
+private func pushed(page: UInt8, number: UInt8, value: UInt16) -> [UInt8] {
+    Nrpn.setSingle(product: 0, device: 0, page: page, number: number, value: value)
+}
+
+/// A `$01` as the model writes one (product 0, device omni).
+private func written(page: UInt8, number: UInt8, value: UInt16) -> [UInt8] {
+    Nrpn.setSingle(
+        product: DeviceModel.product, device: DeviceModel.device, page: page, number: number,
+        value: value)
+}
+
+/// The tempo at 120 BPM, as a live push on the stream.
+private let tempo120 = pushed(
+    page: Generated.pageRigSettings, number: Generated.tempoNumber,
+    value: 120 * Generated.tempoBpmScale)
 
 // MARK: - The control link
 
@@ -256,6 +276,228 @@ final class ControlLinkTests: XCTestCase {
         XCTAssertEqual(device.connections.count, 2)
         await model.close()
     }
+
+    /// The fake's default dump is a real dump's two-section shape: two runs
+    /// based at the end address, and the second is what ends the dump. One
+    /// run alone ends nothing.
+    func testTheDumpHasTwoEndRunsTheSecondOfWhichEndsIt() async throws {
+        XCTAssertEqual(
+            FakeDevice.defaultDump.filter { $0 == FakeDevice.dumpEndRun }.count,
+            Generated.dumpEndRuns)
+        XCTAssertEqual(FakeDevice.defaultDump.last, FakeDevice.dumpEndRun)
+
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        device.configure { $0.dumpItems = [] }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.channelChanged(channel: .control, state: .open)) }
+        guard let control = await device.connection(selecting: Generated.protocolCborControl) else {
+            return XCTFail("no control connection")
+        }
+        // The first run closes the system section; the dump is still open.
+        control.pushItems([
+            Cbor.paramWrite(addr: Generated.morphAddress, value: 100), FakeDevice.dumpEndRun,
+        ])
+        let seen = await events.wait(within: .milliseconds(300)) {
+            $0.contains(.syncCompleted(source: .control))
+        }
+        XCTAssertTrue(seen.contains(.morphChanged(100)), "the item before the run folded")
+        XCTAssertFalse(seen.contains(.syncCompleted(source: .control)), "one run ends nothing")
+        // The second closes the rig section, and the dump with it.
+        control.pushItems([FakeDevice.dumpEndRun])
+        let done = await events.wait { $0.contains(.syncCompleted(source: .control)) }
+        XCTAssertTrue(done.contains(.syncCompleted(source: .control)))
+        await model.close()
+    }
+
+    /// A value pushed live on the stream while the dump streams outranks the
+    /// dump's stale copy of that address: the dump is a copy taken when it
+    /// was asked for, and the push is newer.
+    func testALivePushDuringTheDumpOutranksTheDump() async throws {
+        // The fake serves nothing on the trigger, so the dump phase stays open
+        // and the test drives it.
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        device.configure { $0.dumpItems = [] }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.channelChanged(channel: .control, state: .open)) }
+        guard let stream = await device.connection(selecting: Generated.protocolMidi3Stream),
+            let control = await device.connection(selecting: Generated.protocolCborControl)
+        else { return XCTFail("missing a connection") }
+
+        stream.push(tempo120)
+        await events.wait { $0.contains(.tempoBpm(120)) }
+        // The dump's stale copy of the same address, then the two runs that
+        // close the phase.
+        control.pushItems([
+            Cbor.paramWrite(addr: tempoAddress, value: Int64(100 * Generated.tempoBpmScale)),
+            FakeDevice.dumpEndRun, FakeDevice.dumpEndRun,
+        ])
+        let seen = await events.wait { $0.contains(.syncCompleted(source: .control)) }
+        XCTAssertTrue(seen.contains(.syncCompleted(source: .control)))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.rig.tempoBpm, 120, "the live tempo held; the dump's copy was refused")
+        await model.close()
+    }
+
+    /// A dump that never sends its end run still ends, at the settle time,
+    /// with everything it did send in the tree.
+    func testADumpWithoutItsEndMarkerSettles() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        device.configure {
+            $0.dumpItems = [Cbor.paramWrite(addr: Generated.morphAddress, value: 100)]
+        }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.channelChanged(channel: .control, state: .open)) }
+        let opened = ContinuousClock.Instant.now
+        let seen = await events.wait(within: .seconds(3)) {
+            $0.contains(.syncCompleted(source: .control))
+        }
+        let elapsed = opened.duration(to: .now)
+        XCTAssertTrue(seen.contains(.syncCompleted(source: .control)))
+        XCTAssertGreaterThanOrEqual(
+            elapsed, .milliseconds(Generated.dumpSettleMs) - .milliseconds(50))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.morph, 100)
+        await model.close()
+    }
+
+    /// `reopenControl()` opening the link and returning the connection to
+    /// `connected` — the success path the refusal tests do not cover.
+    func testReopenControlRecoversADegradedConnection() async throws {
+        // The greeting offers CBOR, but the device refuses the selection at
+        // first, so the connection degrades.
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        device.configure { $0.accepts = [Generated.protocolMidi3Stream] }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.connectionChanged(.degraded)) }
+
+        // The device starts accepting the control protocol. The reopen gap is
+        // thirty seconds by spec; forget the last attempt so the reopen is
+        // allowed now (the ledger still spaces the socket).
+        device.configure { $0.accepts.insert(Generated.protocolCborControl) }
+        await model.clearControlAttemptForTests()
+        try await model.reopenControl()
+        let seen = await events.wait { $0.contains(.syncCompleted(source: .control)) }
+        XCTAssertTrue(seen.contains(.syncCompleted(source: .control)))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .connected)
+        XCTAssertEqual(state.channels, Channels(stream: .open, control: .open))
+        XCTAssertEqual(state.morph, 8192, "the dump folded")
+        XCTAssertEqual(device.connections.count, 3)
+        await model.close()
+    }
+
+    /// `close()` while the default-policy control open is still parked in the
+    /// ledger returns promptly and leaves no control socket behind.
+    func testCloseCancelsAControlLinkStillWaitingItsTurn() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        // The control open is queued in the ledger, a cooldown behind the
+        // stream.
+        let started = ContinuousClock.Instant.now
+        await model.close()
+        let cooldown = Duration.seconds(Session.connectionCooldown)
+        XCTAssertLessThan(
+            started.duration(to: .now), cooldown / 4, "close waited on the parked open")
+        // Well past when the control open would have landed: it never did.
+        try? await Task.sleep(for: cooldown + .milliseconds(300))
+        XCTAssertEqual(device.connections.count, 1)
+    }
+
+    /// A message that rode in on the handshake acceptance tail is folded
+    /// before the first read of the stream.
+    func testTheHandshakeTailIsDecodedBeforeTheFirstRead() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure {
+            $0.tailMessages = [
+                Nrpn.sysex(
+                    product: 0, device: 0, function: Generated.fnStringParam,
+                    page: Generated.pageStrings, number: Generated.stringRigName,
+                    values: Array("Tail Rig".utf8) + [0])
+            ]
+        }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(control: .off, sync: .off))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.rig.name, "Tail Rig", "folded by the time connect returned")
+        await model.close()
+    }
+
+    /// A stream loss with the control link open closes the control link too:
+    /// to `closed`, not `lost`, and both sockets drop together.
+    func testAStreamLossClosesTheControlLinkToo() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.channelChanged(channel: .control, state: .open)) }
+        guard let stream = await device.connection(selecting: Generated.protocolMidi3Stream),
+            let control = await device.connection(selecting: Generated.protocolCborControl)
+        else { return XCTFail("missing a connection") }
+
+        stream.hangUp()
+        let seen = await events.wait { $0.contains(.disconnected) }
+        XCTAssertTrue(seen.contains(.channelChanged(channel: .control, state: .closed)))
+        XCTAssertFalse(seen.contains(.channelChanged(channel: .control, state: .lost)))
+        XCTAssertTrue(seen.contains(.channelChanged(channel: .stream, state: .lost)))
+        // The control link goes first: it is closed because the stream went.
+        XCTAssertLessThan(
+            seen.firstIndex(of: .channelChanged(channel: .control, state: .closed)) ?? .max,
+            seen.firstIndex(of: .channelChanged(channel: .stream, state: .lost)) ?? 0)
+        let state = await model.snapshot()
+        XCTAssertEqual(state.channels, Channels(stream: .lost, control: .closed))
+        let closed = await control.wait { $0.isClosed }
+        XCTAssertTrue(closed, "the control socket really dropped")
+        await model.close()
+    }
+
+    /// The deprecated `applyCbor` shim folds through the same funnel as the
+    /// control link: a request waiting at the address is answered, a position
+    /// reaches the Navigator, and the tree moves.
+    func testApplyCborShimStillFolds() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.silent = [gainAddress] }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(control: .off, sync: .off))
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        let request = Task {
+            try await model.requestParam(page: Generated.ampPage, number: Generated.gainNumber)
+        }
+        _ = await stream.received(atLeast: 1)
+        await model.navigateTo(14)
+        _ = await stream.received(atLeast: 3)
+        await model.applyCbor(address: gainAddress, value: 42)
+        await model.applyCbor(address: Generated.currentBankAddress, value: 2)
+        await model.applyCbor(address: Generated.currentRigSlotAddress, value: 4)
+        let gain = try await request.value
+        XCTAssertEqual(gain, 42, "the shim answered the pending request")
+        let seen = await events.wait { $0.contains(.navigationSettled(index: 14)) }
+        XCTAssertTrue(
+            seen.contains(.navigationSettled(index: 14)),
+            "the shim's position reached the Navigator")
+        let state = await model.snapshot()
+        XCTAssertEqual(state.amp.gain, 42)
+        XCTAssertEqual(state.currentRigIndex, 14)
+        await model.close()
+    }
 }
 
 // MARK: - The request lane
@@ -343,10 +585,270 @@ final class RequestLaneTests: XCTestCase {
         } catch let error as RequestError {
             XCTAssertEqual(error, .unreadable)
         }
+        // A rendered string of it is refused the same way: a `$7C` for the
+        // morph draws the same silence as a `$41`.
+        do {
+            _ = try await model.requestRender(
+                page: Generated.pageMorph, number: Generated.morphNumber, value: 0)
+            XCTFail("a render of the morph must be refused")
+        } catch let error as RequestError {
+            XCTAssertEqual(error, .unreadable)
+        }
         try? await Task.sleep(for: .milliseconds(100))
         let stream = await device.connections(atLeast: 1)[0]
         XCTAssertEqual(stream.received, [])
         await model.close()
+    }
+
+    /// A reply wider than the 14 bits a `$01` carries — only the control wire
+    /// can put one at the address — is not the stream's answer.
+    func testAReplyWiderThanFourteenBitsIsUnreadable() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.silent = [gainAddress] }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        let request = Task {
+            try await model.requestParam(page: Generated.ampPage, number: Generated.gainNumber)
+        }
+        _ = await stream.received(atLeast: 1)
+        await model.applyCbor(address: gainAddress, value: 20000)
+        do {
+            _ = try await request.value
+            XCTFail("a reply past 14 bits must be refused")
+        } catch let error as RequestError {
+            XCTAssertEqual(error, .unreadable)
+        }
+        await model.close()
+    }
+
+    /// An unsolicited push at the requested address is the reply: the value
+    /// is no less current for not having been asked for.
+    func testAnUnsolicitedPushAtTheAddressResolvesARequest() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.silent = [gainAddress] }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        let request = Task {
+            try await model.requestParam(page: Generated.ampPage, number: Generated.gainNumber)
+        }
+        let received = await stream.received(atLeast: 1)
+        XCTAssertEqual(received.count, 1)
+        stream.push(pushed(page: Generated.ampPage, number: Generated.gainNumber, value: 42))
+        let gain = try await request.value
+        XCTAssertEqual(gain, 42)
+        await model.close()
+    }
+
+    /// Three slow changes in one write are one read, and one snapshot.
+    func testAStreamReadChunkRepublishesTheSnapshotOnce() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connectWithoutControl(device)
+        let (events, snapshots) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        var burst: [UInt8] = []
+        burst += Midi3.frame(
+            pushed(page: Generated.ampPage, number: Generated.gainNumber, value: 1))
+        burst += Midi3.frame(tempo120)
+        burst += Midi3.frame(pushed(page: 0x3D, number: 0, value: 179))
+        stream.pushRaw(burst)
+        await events.wait { $0.contains(.effectChanged(slot: 7)) }
+        try? await Task.sleep(for: .milliseconds(100))
+        // The current state at subscription, then the one the chunk raised.
+        let published = snapshots.all
+        XCTAssertEqual(published.count, 2)
+        XCTAssertEqual(published.last?.amp.gain, 1)
+        XCTAssertEqual(published.last?.rig.tempoBpm, 120)
+        XCTAssertEqual(published.last?.effects[7].kind, 179)
+        await model.close()
+    }
+
+    /// The connect-time burst against a device that answers nothing: every
+    /// one of the 46 times out, and then the burst reports itself done —
+    /// `syncCompleted` last.
+    func testTheBurstCompletesEvenWhenNothingAnswers() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.answers = false }
+        let model = try await connectWithoutControl(device, sync: .streamBurst)
+        let (events, _) = await attach(model)
+        let seen = await events.wait { $0.contains(.syncCompleted(source: .stream)) }
+        let timedOut = seen.filter { if case .requestTimedOut = $0 { true } else { false } }
+        XCTAssertEqual(timedOut.count, 46)
+        XCTAssertEqual(seen.last, .syncCompleted(source: .stream))
+        await model.close()
+    }
+
+    /// `refresh()` with one row unanswered: `timeout`, while every answered
+    /// row still folded into the tree.
+    func testRefreshReportsATimeoutAfterTheRestLanded() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.silent = [rigNameAddress] }
+        let model = try await connectWithoutControl(device)
+        do {
+            try await model.refresh()
+            XCTFail("a silent row must time the refresh out")
+        } catch let error as RequestError {
+            XCTAssertEqual(error, .timeout)
+        }
+        let state = await model.snapshot()
+        XCTAssertNil(state.rig.name, "the one silent row never landed")
+        XCTAssertEqual(state.amp.name, "X", "the rest did")
+        XCTAssertEqual(state.effects[7].on, false)
+        await model.close()
+    }
+
+    /// Requests are refused once the stream is gone, and one still waiting
+    /// when the model closes fails the same way.
+    func testRequestsAreRefusedOnceDisconnected() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.closeAfterHandshake = true }
+        let model = try await connectWithoutControl(device)
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.disconnected) }
+        do {
+            _ = try await model.requestParam(page: Generated.ampPage, number: Generated.gainNumber)
+            XCTFail("a request on a lost stream must be refused")
+        } catch let error as RequestError {
+            XCTAssertEqual(error, .disconnected)
+        }
+        await model.close()
+    }
+
+    func testCloseFailsAPendingRequest() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.silent = [gainAddress] }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        let request = Task {
+            try await model.requestParam(page: Generated.ampPage, number: Generated.gainNumber)
+        }
+        _ = await stream.received(atLeast: 1)
+        await model.close()
+        do {
+            _ = try await request.value
+            XCTFail("a request pending at close must fail")
+        } catch let error as RequestError {
+            XCTAssertEqual(error, .disconnected)
+        }
+    }
+
+    /// The snapshot stream yields the current state before anything fresh.
+    func testSnapshotsYieldTheCurrentStateFirst() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connectWithoutControl(device)
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+        stream.push(tempo120)
+        await events.wait { $0.contains(.tempoBpm(120)) }
+        var iterator = await model.snapshots().makeAsyncIterator()
+        let first = await iterator.next()
+        let current = await model.snapshot()
+        XCTAssertEqual(first, current)
+        XCTAssertEqual(first?.rig.tempoBpm, 120)
+        await model.close()
+    }
+
+    /// The parameter setters put the exact Single Parameter Changes on the
+    /// wire, in the order called.
+    func testParameterSettersEmitSingleParameterChanges() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        try await model.setGain(8192)
+        try await model.setEffectEnabled("rev", true)
+        try await model.setEffectMix("DLY", 4096)
+        try await model.setTempoBpm(120)
+        try await model.setMainVolume(9000)
+        try await model.setMonitorVolume(3000)
+        try await model.setRigVolume(4096)
+        let received = await stream.received(atLeast: 7)
+        XCTAssertEqual(
+            received,
+            [
+                written(page: Generated.ampPage, number: Generated.gainNumber, value: 8192),
+                written(page: 0x3D, number: 3, value: 1),
+                written(page: 0x3C, number: 4, value: 4096),
+                written(page: Generated.pageRigSettings, number: 0, value: 7680),
+                written(page: Generated.systemPage, number: 0, value: 9000),
+                written(page: Generated.systemPage, number: 2, value: 3000),
+                written(page: Generated.pageRigSettings, number: 1, value: 4096),
+            ])
+        await model.close()
+    }
+
+    func testSetTempoClampsToTheFourteenBitMaximum() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        try await model.setTempoBpm(9999)
+        let received = await stream.received(atLeast: 1)
+        XCTAssertEqual(
+            received,
+            [written(page: Generated.pageRigSettings, number: 0, value: Generated.fullScale)])
+        await model.close()
+    }
+
+    func testActionsEmitControlChanges() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        try await model.tapTempo()
+        try await model.bank(4)
+        try await model.tunerMode(true)
+        try await model.freeze(false)
+        try await model.sendRaw([0xB0, 30, 1])
+        let received = await stream.received(atLeast: 5)
+        XCTAssertEqual(
+            received,
+            [
+                Control.tapTempo.message(), Control.bankPreselect(3).message(),
+                Control.tunerMode(true).message(), Control.freeze(false).message(), [0xB0, 30, 1],
+            ])
+        await model.close()
+    }
+
+    func testUnknownEffectSlotIsRejected() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connectWithoutControl(device)
+        let stream = await device.connections(atLeast: 1)[0]
+        do {
+            try await model.setEffectEnabled("nope", true)
+            XCTFail("an unknown slot must be refused")
+        } catch let error as CommandError {
+            XCTAssertEqual(error, .unknownSlot("nope"))
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(stream.received, [])
+        await model.close()
+    }
+
+    /// The stream link's command queue holds sixty-four commands and no
+    /// more; the Navigator's pair is queued as one unit or not at all.
+    func testTheCommandQueueIsBounded() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        let link = StreamLink(session: session)
+        defer { link.close() }
+        for _ in 0..<(StreamLink.commandQueueDepth - 1) {
+            XCTAssertTrue(link.enqueue(Control.tapTempo.message()))
+        }
+        XCTAssertFalse(link.enqueue(pair: ([1], [2])), "no room for two")
+        XCTAssertTrue(link.enqueue(Control.tapTempo.message()), "room for one")
+        XCTAssertFalse(link.enqueue(Control.tapTempo.message()), "full")
+        XCTAssertEqual(link.commands.count, StreamLink.commandQueueDepth)
     }
 
     /// The lane never puts more than the cap on the wire; the rest wait for a
@@ -383,8 +885,8 @@ final class RequestLaneTests: XCTestCase {
         await model.close()
     }
 
-    /// `refresh()` is every `request = true` row, and the connect-time burst
-    /// is `refresh()`.
+    /// `refresh()` is every `request = true` row, sent in the table's
+    /// (address-sorted) order, and the connect-time burst is `refresh()`.
     func testRefreshIssuesTheFortySixRequests() async throws {
         let device = try FakeDevice()
         defer { device.stop() }
@@ -393,11 +895,20 @@ final class RequestLaneTests: XCTestCase {
         try await model.refresh()
         let received = stream.received
         XCTAssertEqual(received.count, 46)
-        let functions = Dictionary(grouping: received) { $0[6] }.mapValues(\.count)
-        XCTAssertEqual(functions[Generated.fnRequestSingle], 23)
-        XCTAssertEqual(functions[Generated.fnRequestString], 6)
-        XCTAssertEqual(functions[Generated.fnRequestExtString], 15)
-        XCTAssertEqual(functions[Generated.fnRequestExtParam], 2)
+        // The first request is the Rig Name string tag, then the functions run
+        // in blocks — the wire order is the table order in every language.
+        XCTAssertEqual(
+            received.first,
+            Nrpn.requestString(
+                product: DeviceModel.product, device: DeviceModel.device,
+                page: Generated.pageStrings, number: Generated.stringRigName))
+        let functions = received.map { $0[6] }
+        XCTAssertEqual(
+            functions,
+            Array(repeating: Generated.fnRequestString, count: 6)
+                + Array(repeating: Generated.fnRequestSingle, count: 23)
+                + Array(repeating: Generated.fnRequestExtString, count: 15)
+                + Array(repeating: Generated.fnRequestExtParam, count: 2))
         await model.close()
 
         let second = try FakeDevice()
@@ -492,6 +1003,81 @@ final class SupervisorTests: XCTestCase {
         await model.close()
     }
 
+    /// A reconnect keeps the tree, never says `disconnected`, and counts on
+    /// with a doubling backoff when a redial is refused.
+    func testAReconnectKeepsTheTreeAndRetriesUntilItLands() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let backoff = Backoff(initial: .milliseconds(50), max: .milliseconds(200))
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port,
+            options: options(reconnect: ReconnectPolicy(stream: backoff)))
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        // A value in the tree before the loss; it must survive the reconnect.
+        stream.push(tempo120)
+        await events.wait { $0.contains(.tempoBpm(120)) }
+
+        // Refuse the first redial, then let the next one through.
+        device.pauseAccepting()
+        stream.hangUp()
+        let second = await events.wait(within: .seconds(6)) {
+            $0.contains(.connectionChanged(.reconnecting(attempt: 2)))
+        }
+        XCTAssertTrue(second.contains(.connectionChanged(.reconnecting(attempt: 2))))
+        XCTAssertEqual(device.refused, 1)
+        device.resumeAccepting()
+        let seen = await events.wait(within: .seconds(6)) { $0.contains(.connected) }
+        XCTAssertTrue(seen.contains(.connected))
+        XCTAssertFalse(seen.contains(.disconnected))
+        XCTAssertFalse(seen.contains(.connectionChanged(.disconnected)))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .connected)
+        XCTAssertEqual(state.rig.tempoBpm, 120, "the tree carried across the reconnect")
+        await model.close()
+    }
+
+    /// Under `required`, a redial whose stream opens but whose control link
+    /// is refused is the next failure: the attempt count goes on, and with
+    /// it the backoff, rather than starting over at one for every such life.
+    func testARequiredControlRefusalKeepsCountingAttempts() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        let backoff = Backoff(initial: .milliseconds(50), max: .milliseconds(200))
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port,
+            options: ConnectOptions(
+                control: .required, sync: .off, reconnect: ReconnectPolicy(stream: backoff)))
+        let (events, _) = await attach(model)
+
+        device.configure { $0.accepts = [Generated.protocolMidi3Stream] }
+        device.hangUpAll()
+        let refused = await events.wait(within: .seconds(6)) {
+            $0.contains(.connectionChanged(.reconnecting(attempt: 2)))
+        }
+        XCTAssertTrue(refused.contains(.connectionChanged(.reconnecting(attempt: 1))))
+        XCTAssertTrue(
+            refused.contains(.connectionChanged(.reconnecting(attempt: 2))),
+            "the refused control link counts as an attempt")
+        device.configure { $0.accepts.insert(Generated.protocolCborControl) }
+        // The next life comes up whole: connected after the second attempt,
+        // with a dump of its own.
+        let seen = await events.wait(within: .seconds(6)) {
+            ($0.lastIndex(of: .connected) ?? -1)
+                > ($0.firstIndex(of: .connectionChanged(.reconnecting(attempt: 2))) ?? .max)
+        }
+        XCTAssertFalse(seen.contains(.disconnected))
+        await events.wait {
+            ($0.lastIndex(of: .channelChanged(channel: .control, state: .open)) ?? -1)
+                > ($0.lastIndex(of: .connected) ?? .max)
+        }
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .connected)
+        XCTAssertEqual(state.channels, Channels(stream: .open, control: .open))
+        await model.close()
+    }
+
     func testCloseTwiceIsHarmless() async throws {
         let device = try FakeDevice()
         defer { device.stop() }
@@ -502,6 +1088,15 @@ final class SupervisorTests: XCTestCase {
         await events.wait { _ in events.finished }
         XCTAssertEqual(events.all.filter { $0 == .disconnected }.count, 1)
         XCTAssertEqual(events.all.filter { $0 == .connectionChanged(.disconnected) }.count, 1)
+        // The teardown, in order: the stream closes, then the compatibility
+        // event, then the transition it belongs to. (With the control link
+        // open, its `closed` precedes the stream's.)
+        XCTAssertEqual(
+            Array(events.all.suffix(3)),
+            [
+                .channelChanged(channel: .stream, state: .closed), .disconnected,
+                .connectionChanged(.disconnected),
+            ])
         XCTAssertTrue(snapshots.finished)
         let state = await model.snapshot()
         XCTAssertEqual(state.connection, .disconnected)
@@ -673,6 +1268,12 @@ final class NavigatorTests: XCTestCase {
 
         report(16, on: stream)  // bank 3, slot 2
         await events.wait { $0.contains(.currentPosition(bank: 3, slot: 1)) }
+        // Out of range, or no step at all: nothing to load.
+        await model.selectSlot(0)
+        await model.selectSlot(UInt8(Params.bankSlots + 1))
+        await model.stepRig(by: 0)
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(stream.received, [], "an out-of-range slot or a zero step is ignored")
         await model.stepBank(forward: true)  // 21, sent at once
         await model.stepRig(by: -1)  // 20, from the aim, not the position
         await model.selectSlot(5)  // slot 5 of the aimed bank 4: 24
@@ -704,6 +1305,9 @@ final class NavigatorTests: XCTestCase {
         await events.wait { $0.contains(.disconnected) }
         let state = await model.snapshot()
         XCTAssertEqual(state.navigation, Navigation())
+        // Past the settle and the window: the cancelled timers stay quiet.
+        try? await Task.sleep(
+            for: .milliseconds(Generated.rigLoadSettleMs + Generated.pendingWindowMs + 100))
         XCTAssertFalse(
             events.all.contains { if case .navigationDropped = $0 { true } else { false } })
 
@@ -714,6 +1318,61 @@ final class NavigatorTests: XCTestCase {
         XCTAssertTrue(seen.contains(.navigationDropped(index: 8, reason: .unconfirmed)))
         let after = await model.snapshot()
         XCTAssertEqual(after.navigation, Navigation())
+        await model.close()
+    }
+
+    /// `close()` cancels the Navigator's timers and clears the aim without an
+    /// event: no late settle or drop after the timers would have fired.
+    func testCloseCancelsTheNavigatorTimers() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        await model.navigateTo(14)
+        _ = await stream.received(atLeast: 2)
+        await model.close()
+        let state = await model.snapshot()
+        XCTAssertEqual(state.navigation, Navigation())
+        try? await Task.sleep(
+            for: .milliseconds(Generated.rigLoadSettleMs + Generated.pendingWindowMs + 100))
+        XCTAssertFalse(
+            events.all.contains {
+                switch $0 {
+                case .navigationDropped, .navigationSettled: return true
+                default: return false
+                }
+            })
+    }
+
+    /// A position carried by the control link settles the aim as readily as
+    /// one on the stream.
+    func testAPositionFromTheControlLinkSettlesTheAim() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: ConnectOptions(sync: .off))
+        let (events, _) = await attach(model)
+        await events.wait { $0.contains(.syncCompleted(source: .control)) }
+        guard let stream = await device.connection(selecting: Generated.protocolMidi3Stream),
+            let control = await device.connection(selecting: Generated.protocolCborControl)
+        else { return XCTFail("missing a connection") }
+
+        await model.navigateTo(14)
+        let received = await stream.received(atLeast: 2)
+        XCTAssertEqual(received, loadPair(14))
+        // Bank 2, slot 4: index 14. The bank alone (with the dump's slot 1)
+        // is index 11, which is not the aim and is ignored.
+        control.pushItems([
+            Cbor.paramWrite(addr: Generated.currentBankAddress, value: 2),
+            Cbor.paramWrite(addr: Generated.currentRigSlotAddress, value: 4),
+        ])
+        let seen = await events.wait { $0.contains(.navigationSettled(index: 14)) }
+        XCTAssertTrue(seen.contains(.navigationSettled(index: 14)))
+        let state = await model.snapshot()
+        XCTAssertNil(state.navigation.aim)
+        XCTAssertEqual(state.currentRigIndex, 14)
         await model.close()
     }
 }

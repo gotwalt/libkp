@@ -201,6 +201,37 @@ final class SessionCooldownTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(closedAt.duration(to: accepts[1]), cooldown - .milliseconds(20))
     }
 
+    /// A second close of one session does not push the cooldown out again:
+    /// the model's teardown and a caller's own `close` can both reach it, and
+    /// the cooldown runs from the first.
+    func testClosingTwiceStampsTheLedgerOnce() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        session.close()
+        try? await Task.sleep(for: .milliseconds(300))
+        session.close()
+        let peer = ConnectionLedger.Peer(host: host, port: device.port)
+        XCTAssertLessThanOrEqual(
+            ConnectionLedger.shared.delay(before: peer, cooldown: cooldown, now: .now),
+            cooldown - .milliseconds(250))
+    }
+
+    /// Nothing listening on the port is a failed dial, reported as such.
+    func testConnectToAClosedPortFails() async throws {
+        let device = try FakeDevice()
+        let port = device.port
+        device.stop()
+        try? await Task.sleep(for: .milliseconds(50))
+        do {
+            let session = try await Session.connect(host: host, port: port, timeout: 1)
+            session.close()
+            XCTFail("a closed port must not connect")
+        } catch SessionError.connect(let address, _) {
+            XCTAssertEqual(address, "\(host):\(port)")
+        }
+    }
+
     /// A peer on another port is a different peer: it opens at once even while
     /// the first is inside its cooldown.
     func testAnotherPortIsNotDelayed() async throws {
@@ -234,6 +265,55 @@ final class SessionCooldownTests: XCTestCase {
         let accepts = await device.accepts(count: 2)
         XCTAssertEqual(accepts.count, 2)
         XCTAssertGreaterThanOrEqual(closedAt.duration(to: accepts[1]), cooldown - .milliseconds(20))
+    }
+
+    /// `StateSnapshot.fetch` reads the dump over its own control link: the
+    /// position, the morph and the rig name, on one socket, the trigger
+    /// written once, nothing left open.
+    func testStateSnapshotFetchReadsTheDump() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        let snapshot = try await StateSnapshot.fetch(host: host, port: device.port, timeout: 2)
+        XCTAssertTrue(snapshot.isComplete)
+        XCTAssertEqual(snapshot.currentBank, 3)
+        XCTAssertEqual(snapshot.currentRigSlot, 1)
+        XCTAssertEqual(snapshot.morph, 8192)
+        XCTAssertEqual(snapshot.string(UInt32(Generated.stringRigName)), "Dump Rig")
+        let connections = await device.connections(atLeast: 1)
+        XCTAssertEqual(connections.count, 1)
+        XCTAssertEqual(connections[0].selected, Generated.protocolCborControl)
+        XCTAssertEqual(connections[0].receivedItems, [Cbor.stateDumpRequest()])
+        let closed = await connections[0].wait { $0.isClosed }
+        XCTAssertTrue(closed, "the fetch closes its socket")
+    }
+
+    /// `CborSession` streams the dump's numeric pairs in document order —
+    /// held for the first subscriber, who cannot exist before the link is
+    /// open — then the values pushed after it.
+    func testCborSessionStreamsTheDumpAndLaterPushes() async throws {
+        let device = try FakeDevice(offerCbor: true)
+        defer { device.stop() }
+        let session = try await CborSession.connect(host: host, port: device.port)
+        let updates = Recorder<CborUpdate>()
+        let stream = await session.updates()
+        Task {
+            for await update in stream { updates.append(update) }
+            updates.finish()
+        }
+        let expected = Cbor.numericValues(FakeDevice.defaultDump).map {
+            CborUpdate(address: $0.address, value: $0.value)
+        }
+        let dump = await updates.wait { $0.count >= expected.count }
+        XCTAssertEqual(dump, expected)
+        guard let control = await device.connection(selecting: Generated.protocolCborControl) else {
+            return XCTFail("no control connection")
+        }
+        control.pushItems([Cbor.paramWrite(addr: Generated.morphAddress, value: 0)])
+        let all = await updates.wait { $0.count > expected.count }
+        XCTAssertEqual(all.last, CborUpdate(address: Generated.morphAddress, value: 0))
+        await session.close()
+        await updates.wait { _ in updates.finished }
+        XCTAssertTrue(updates.finished)
     }
 
     /// Likewise the live CBOR session.
@@ -314,6 +394,84 @@ final class SessionHandshakeTests: XCTestCase {
         let elapsed = started.duration(to: .now)
         XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(200) - .milliseconds(20))
         XCTAssertLessThan(elapsed, .seconds(1))
+    }
+
+    /// A device that greets, reads the selection, and then never answers it
+    /// has not opened a session: the handshake fails for the selection phase
+    /// after its budget, rather than handing back an empty verdict.
+    func testASelectionReplyThatNeverBeginsTimesOut() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.acks = false }
+
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        defer { session.close() }
+        let started = ContinuousClock.Instant.now
+        do {
+            _ = try await session.handshake(
+                preferred: [Session.protocolMidi3Stream], idle: idle, greetingTimeout: 0.2)
+            XCTFail("an absent verdict must not complete the handshake")
+        } catch SessionError.timeout(let phase, let ms) {
+            XCTAssertEqual(phase, "protocol selection")
+            XCTAssertEqual(ms, 200)
+        }
+        let elapsed = started.duration(to: .now)
+        XCTAssertGreaterThanOrEqual(elapsed, .milliseconds(200) - .milliseconds(20))
+        XCTAssertLessThan(elapsed, .seconds(1))
+        let connection = await device.connections(atLeast: 1)[0]
+        let selected = await connection.wait { $0.selected != nil }
+        XCTAssertTrue(selected, "the selection was written before the wait")
+    }
+
+    /// A greeting that offers nothing to choose is the greeting failure, the
+    /// same as no greeting at all: reported for the `"greeting"` phase with
+    /// the budget it was given.
+    func testAnEmptyGreetingIsAGreetingTimeout() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.offers = [] }
+
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        defer { session.close() }
+        do {
+            _ = try await session.handshake(
+                preferred: [Session.protocolMidi3Stream], idle: idle, greetingTimeout: 0.2)
+            XCTFail("an empty greeting must not complete the handshake")
+        } catch SessionError.timeout(let phase, let ms) {
+            XCTAssertEqual(phase, "greeting")
+            XCTAssertEqual(ms, 200)
+        }
+    }
+
+    /// With none of the preferred protocols offered, the handshake takes the
+    /// device's first — the stream is better than nothing.
+    func testHandshakeFallsBackToTheFirstOfferedProtocol() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        device.configure { $0.offers = [Session.protocolMidi3Stream] }
+
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        defer { session.close() }
+        let outcome = try await session.handshake(preferred: ["not-offered"], idle: idle)
+        XCTAssertEqual(outcome.selected, Session.protocolMidi3Stream)
+        XCTAssertEqual(outcome.offered, [Session.protocolMidi3Stream])
+    }
+
+    /// A rejected selection names the protocol and carries the device's own
+    /// line.
+    func testARejectionCarriesTheDeviceDetail() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+
+        let session = try await Session.connect(host: host, port: device.port, timeout: 2)
+        defer { session.close() }
+        do {
+            _ = try await session.handshake(preferred: [Generated.protocolReserved], idle: idle)
+            XCTFail("the reserved GUID is refused")
+        } catch SessionError.protocolRejected(let name, let detail) {
+            XCTAssertEqual(name, Generated.protocolReserved)
+            XCTAssertEqual(detail, Generated.handshakeRejectPrefix + "NO")
+        }
     }
 
     /// The default budget is the generated constant, so the library and the

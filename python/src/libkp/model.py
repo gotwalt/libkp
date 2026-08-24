@@ -105,7 +105,6 @@ from . import control as control_mod
 from ._broadcast import Broadcast as _Broadcast
 from ._lane import RequestLane
 from ._link import StreamLink
-from ._nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
 from .cbor import ControlItem, ControlLink
 from .control import Control
 from .errors import (
@@ -122,6 +121,7 @@ from .errors import (
     SessionError,
     UnknownSlotError,
 )
+from .nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
 from .protocol import PORT
 from .state import (
     ApplyOutcome,
@@ -171,7 +171,9 @@ DEVICE: int = nrpn.DEVICE_OMNI
 #: MIDI channel used for Control Change commands (0 = channel 1).
 CC_CHANNEL: int = 0
 #: How long after the dump trigger the dump phase ends if the end marker never
-#: comes, in seconds.
+#: comes, in seconds. The marker is the :data:`libkp._generated.DUMP_END_RUNS`-th
+#: run based at :data:`libkp._generated.DUMP_END_ADDRESS`: a dump has two
+#: sections, and each closes with one.
 DUMP_SETTLE: float = gen.DUMP_SETTLE_MS / 1000.0
 #: The least time between two control opens, in seconds.
 CONTROL_REOPEN_MIN_GAP: float = gen.CONTROL_REOPEN_MIN_GAP_MS / 1000.0
@@ -190,11 +192,6 @@ _RIG_LOAD_CONTROLS = (
     control_mod.ProgramChange,
     control_mod.BankSelect,
 )
-#: Program Change is status ``0xC0 | channel``.
-_STATUS_PROGRAM_CHANGE = 0xC0
-#: Control Change is status ``0xB0 | channel``.
-_STATUS_CONTROL_CHANGE = 0xB0
-
 #: One past the last flat address the page/number request forms can name; at
 #: or above it a request goes out in its extended (``$46`` / ``$47``) form.
 _FLAT_ADDRESS_LIMIT = 128 * 128
@@ -313,6 +310,7 @@ class DeviceModel:
         "_closed",
         "_last_control_open",
         "_dump_open",
+        "_dump_end_runs",
         "_dump_timer",
         "_nav",
         "_settle_timer",
@@ -341,6 +339,9 @@ class DeviceModel:
         self._closed = False
         self._last_control_open = float("-inf")
         self._dump_open = False
+        #: Runs based at ``DUMP_END_ADDRESS`` folded since the trigger: each
+        #: of the dump's two sections closes with one, and the second ends it.
+        self._dump_end_runs = 0
         self._dump_timer: asyncio.TimerHandle | None = None
         #: The Navigator's state machine, and the one timer of each kind it
         #: can have armed: re-arming replaces the last, and both are cancelled
@@ -398,6 +399,7 @@ class DeviceModel:
                 await supervisor
         await self._drop_links(lost=False)
         self._set_connection(Connection.DISCONNECTED)
+        self._publish()
 
     async def __aenter__(self) -> DeviceModel:
         return self
@@ -413,26 +415,23 @@ class DeviceModel:
         open, with :class:`~libkp.errors.ChannelOffError` when the policy is
         :attr:`ControlPolicy.OFF`, and with
         :class:`~libkp.errors.ChannelDisconnectedError` while the stream is
-        down. A failure to open raises :class:`~libkp.errors.ChannelSessionError`
-        and leaves the channel :attr:`~libkp.state.ChannelState.UNAVAILABLE`.
+        down. A link already open, or already opening, is left alone: the
+        call returns at once, since what was asked for is there or under way,
+        and a live socket is never dropped to dial another. A failure to open
+        raises :class:`~libkp.errors.ChannelSessionError` and leaves the
+        channel :attr:`~libkp.state.ChannelState.UNAVAILABLE`.
         """
         if self._options.control is ControlPolicy.OFF:
             raise ChannelOffError()
         if self._closed or self._state.channels.stream is not ChannelState.OPEN:
             raise ChannelDisconnectedError()
+        if self._state.channels.control in (ChannelState.CONNECTING, ChannelState.OPEN):
+            return
         remaining = self._last_control_open + CONTROL_REOPEN_MIN_GAP - _now()
         if remaining > 0:
             raise ChannelTooSoonError(remaining)
-        epoch = self._epoch
-        link = self._control
-        if link is not None:
-            # An open link being reopened on request: drop it first, so the
-            # device never holds two control sockets from one model.
-            self._control = None
-            await link.close()
-            self._set_channel(Channel.CONTROL, ChannelState.CLOSED)
         try:
-            await self._open_control(epoch)
+            await self._open_control(self._epoch)
         except SessionError as exc:
             raise ChannelSessionError(exc) from exc
 
@@ -554,10 +553,16 @@ class DeviceModel:
         :class:`~libkp.errors.RequestTimeoutError` when the device does not
         answer, and :class:`~libkp.errors.RequestUnreadableError` at once,
         sending nothing, for an address the stream cannot answer (the morph
-        position).
+        position) -- and after the fact for a reply wider than the 14 bits a
+        ``$01`` carries: only a value from the other wire resolving the same
+        address could be, and one that does not fit the stream's word is not
+        the stream's answer.
         """
         flat = page * 128 + number
-        return await self._request_num(flat, nrpn.request_single(PRODUCT, DEVICE, page, number))
+        value = await self._request_num(flat, nrpn.request_single(PRODUCT, DEVICE, page, number))
+        if value > gen.FULL_SCALE:
+            raise RequestUnreadableError(flat)
+        return value
 
     async def request_string(self, page: int, number: int) -> str:
         """Request one string parameter (``$43``) and return the ``$03`` reply's
@@ -939,14 +944,19 @@ class DeviceModel:
         cannot, in which case the stream is closed again first."""
         epoch = self._epoch
         self._set_channel(Channel.STREAM, ChannelState.CONNECTING)
+        self._publish()
         try:
             stream = await StreamLink.open(self._ip, self._options.port)
         except SessionError:
             self._set_channel(Channel.STREAM, ChannelState.UNAVAILABLE)
+            self._publish()
             raise
         self._stream = stream
+        # One snapshot for the whole transition: the channel, then the
+        # connection it brings up, never the tree half-moved between them.
         self._set_channel(Channel.STREAM, ChannelState.OPEN)
         self._set_connection(Connection.CONNECTED)
+        self._publish()
         stream.start(
             lambda messages: self._on_stream_chunk(epoch, messages),
             lambda: self._on_stream_lost(epoch),
@@ -959,7 +969,11 @@ class DeviceModel:
             try:
                 await self._open_control(epoch)
             except SessionError:
-                await self._drop_links(lost=False)
+                # The stream was up and is torn down with the attempt: it reads
+                # ``LOST`` like any stream this life had and no longer has. The
+                # caller -- ``connect`` closing, or the reconnect loop counting
+                # the next attempt -- publishes the transition it ends in.
+                await self._drop_links(lost=True)
                 raise
         elif self._options.control is ControlPolicy.BEST_EFFORT:
             self._spawn(self._open_control_quietly(epoch))
@@ -979,6 +993,7 @@ class DeviceModel:
         leaves the channel ``UNAVAILABLE`` and the connection degraded, and
         raises the :class:`~libkp.errors.SessionError`."""
         self._set_channel(Channel.CONTROL, ChannelState.CONNECTING)
+        self._publish()
         self._last_control_open = _now()
         try:
             link = await ControlLink.open(
@@ -991,6 +1006,7 @@ class DeviceModel:
             if epoch == self._epoch and not self._closed:
                 self._set_channel(Channel.CONTROL, ChannelState.UNAVAILABLE)
                 self._refresh_connection()
+                self._publish()
                 self._schedule_control_reopen(epoch)
             raise
         if epoch != self._epoch or self._closed:
@@ -998,9 +1014,13 @@ class DeviceModel:
             await link.close()
             return
         self._control = link
+        # The dump begins before the link's first read is folded, so the
+        # handshake tail's items -- which the link holds for that read --
+        # fold as the dump they are.
         self._begin_dump(epoch)
         self._set_channel(Channel.CONTROL, ChannelState.OPEN)
         self._refresh_connection()
+        self._publish()
 
     async def _open_control_quietly(self, epoch: int) -> None:
         """Best effort: the failure is already in the tree; nobody awaits it."""
@@ -1045,13 +1065,17 @@ class DeviceModel:
                 await previous
         await self._drop_links(lost=True)
 
+        # One snapshot for the whole loss, published only now that both
+        # sockets are closed and the connection has moved on.
         backoff = self._options.reconnect.stream
         if backoff is None:
             self._set_connection(Connection.DISCONNECTED)
+            self._publish()
             return
         attempt, delay = 1, backoff.initial
+        self._set_reconnecting(attempt)
+        self._publish()
         while not self._closed:
-            self._set_reconnecting(attempt)
             await asyncio.sleep(delay)
             if self._closed:
                 return
@@ -1060,13 +1084,17 @@ class DeviceModel:
             except SessionError:
                 attempt += 1
                 delay = backoff.after(delay)
+                self._set_reconnecting(attempt)
+                self._publish()
                 continue
             return
 
     async def _drop_links(self, *, lost: bool) -> None:
         """End the current life's sockets and tasks. Both links drop together:
         the control link is ``CLOSED`` (not lost -- it was not the one that
-        went), the stream ``LOST`` or ``CLOSED`` by ``lost``."""
+        went), the stream ``LOST`` or ``CLOSED`` by ``lost``. Publishes
+        nothing: the caller sends the one snapshot for the transition this is
+        part of, once the connection has moved with the channels."""
         tasks = list(self._tasks)
         self._tasks.clear()
         for task in tasks:
@@ -1118,8 +1146,12 @@ class DeviceModel:
 
     def _on_control_items(self, epoch: int, items: list[ControlItem]) -> None:
         """Fold one read's worth of control items, each with the phase the dump
-        bookkeeping says it is in, and close the dump phase after the item that
-        always ends a dump. One snapshot per chunk, as for the stream."""
+        bookkeeping says it is in, and close the dump phase after the run that
+        ends a dump: the :data:`libkp._generated.DUMP_END_RUNS`-th one based
+        at :data:`libkp._generated.DUMP_END_ADDRESS` since the trigger -- the
+        dump's system section and its rig section each close with one, and
+        the first alone ends nothing. One snapshot per chunk, as for the
+        stream."""
         if epoch != self._epoch:
             return
         slow_changed = False
@@ -1133,7 +1165,9 @@ class DeviceModel:
                 update = Update(Channel.CONTROL, phase, address, decoded)
                 slow_changed = self._fold(update) or slow_changed
             if self._dump_open and item.base == gen.DUMP_END_ADDRESS:
-                self._finish_dump(report=True)
+                self._dump_end_runs += 1
+                if self._dump_end_runs >= gen.DUMP_END_RUNS:
+                    self._finish_dump(report=True)
         if slow_changed:
             self._snapshots.send(self._state.snapshot())
 
@@ -1176,15 +1210,18 @@ class DeviceModel:
         self._finish_dump(report=False)
         self._set_channel(Channel.CONTROL, ChannelState.LOST)
         self._refresh_connection()
+        self._publish()
         self._schedule_control_reopen(epoch)
 
     def _begin_dump(self, epoch: int) -> None:
         """The trigger is written: every control item folds as
-        :attr:`~libkp.state.Phase.DUMP` until the end marker, or the settle
-        time if the marker never comes."""
+        :attr:`~libkp.state.Phase.DUMP` until the run that ends the dump (the
+        second based at ``DUMP_END_ADDRESS``), or the settle time if it never
+        comes."""
         self._finish_dump(report=False)
         self._state.begin_dump()
         self._dump_open = True
+        self._dump_end_runs = 0
         self._dump_timer = asyncio.get_running_loop().call_later(
             DUMP_SETTLE, self._settle_dump, epoch
         )
@@ -1209,8 +1246,12 @@ class DeviceModel:
     # ------------------------------------------------------------------
 
     def _set_channel(self, channel: Channel, state: ChannelState) -> None:
-        """Record a channel transition: the event, and a snapshot since the
-        channels are part of the tree."""
+        """Move one link and raise the event that says so; nothing if it is
+        already there. Publishes no snapshot: a channel moves as part of a
+        composite transition -- a connect, a loss, a control open or its
+        failure -- and that transition sends one snapshot when all of it has
+        happened (:meth:`_publish`), so a subscriber never sees the tree
+        half-moved."""
         channels = self._state.channels
         current = channels.stream if channel is Channel.STREAM else channels.control
         if current is state:
@@ -1220,12 +1261,12 @@ class DeviceModel:
         else:
             channels.control = state
         self._emit(ChannelChanged(channel, state))
-        self._snapshots.send(self._state.snapshot())
 
     def _set_connection(self, connection: Connection) -> None:
-        """Record a connection transition (a SLOW change): the compatibility
-        event it corresponds to, then :class:`~libkp.state.ConnectionChanged`,
-        then the snapshot."""
+        """Move the connection and raise the compatibility event it
+        corresponds to, then :class:`~libkp.state.ConnectionChanged`; nothing
+        if it is already there. The snapshot is the composite transition's,
+        as for :meth:`_set_channel`."""
         previous = self._state.connection
         if previous is connection:
             return
@@ -1239,14 +1280,17 @@ class DeviceModel:
         elif connection is Connection.DISCONNECTED:
             self._emit(Disconnected())
         self._emit(ConnectionChanged(connection))
-        self._snapshots.send(self._state.snapshot())
 
     def _set_reconnecting(self, attempt: int) -> None:
         """Each attempt is its own transition: the attempt number is what a
-        client shows, so every increment is reported."""
+        client shows, so every increment is reported. The snapshot is the
+        caller's, as for :meth:`_set_connection`."""
         self._state.connection = Connection.RECONNECTING
         self._state.reconnect_attempt = attempt
         self._emit(ConnectionChanged(Connection.RECONNECTING))
+
+    def _publish(self) -> None:
+        """The one snapshot a composite transition ends in."""
         self._snapshots.send(self._state.snapshot())
 
     def _refresh_connection(self) -> None:
@@ -1291,14 +1335,16 @@ class DeviceModel:
         await stream.send(message)
 
     def _check_readable(self, address: int) -> None:
-        """A request needs the stream, and an address the stream can answer:
-        the table routes the morph position to the control channel alone, and
-        a ``$41`` for it draws no reply."""
-        if self._closed or self._state.channels.stream is not ChannelState.OPEN:
-            raise RequestDisconnectedError()
+        """A request needs an address the stream can answer, and then the
+        stream: the table routes the morph position to the control channel
+        alone, and a ``$41`` for it draws no reply, so that refusal comes
+        first -- it is a property of the address, true whether or not the
+        stream is up."""
         route = _routes.lookup(address)
         if route is not None and route.wire is gen.Wire.CONTROL:
             raise RequestUnreadableError(address)
+        if self._closed or self._state.channels.stream is not ChannelState.OPEN:
+            raise RequestDisconnectedError()
 
     async def _request_num(self, address: int, message: bytes) -> int:
         self._check_readable(address)
@@ -1368,33 +1414,21 @@ def _now() -> float:
 
 
 def _refuse_rig_loads(message: bytes) -> None:
-    """Walk the MIDI messages in ``message`` (a control may render several
-    back to back) and raise :class:`~libkp.errors.RigLoadRequiresNavigatorError`
-    at the first that would load a rig: a Program Change, or a Control Change
-    on a rig-loading controller. SysEx is skipped to its end; anything else is
-    taken at its status byte's length."""
-    i, n = 0, len(message)
-    while i < n:
-        status = message[i]
-        if status == 0xF0:
-            end = message.find(b"\xf7", i)
-            i = n if end < 0 else end + 1
-            continue
-        kind = status & 0xF0
-        if kind == _STATUS_PROGRAM_CHANGE:
+    """Raise :class:`~libkp.errors.RigLoadRequiresNavigatorError` if the MIDI
+    bytes would load a rig: a Program Change status, or a Control Change on
+    one of :data:`libkp._generated.RIG_LOAD_CONTROLLERS`. Every status byte
+    is examined, wherever it sits in the buffer (a control may render several
+    messages back to back); the data bytes between them are all below
+    ``0x80`` and cannot be mistaken for one, so malformed input is refused
+    the same way everywhere rather than parsed around."""
+    for i, byte in enumerate(message):
+        status = byte & 0xF0
+        if status == gen.PROGRAM_CHANGE_STATUS:
             raise RigLoadRequiresNavigatorError("a Program Change")
-        if kind == _STATUS_CONTROL_CHANGE and i + 1 < n:
+        if status == gen.CONTROL_CHANGE_STATUS and i + 1 < len(message):
             controller = message[i + 1]
             if controller in gen.RIG_LOAD_CONTROLLERS:
                 raise RigLoadRequiresNavigatorError(f"CC{controller}")
-        # Program Change and Channel Pressure carry one data byte; the other
-        # channel messages two. Anything unrecognised is stepped past by one.
-        if kind in (_STATUS_PROGRAM_CHANGE, 0xD0):
-            i += 2
-        elif 0x80 <= status < 0xF0:
-            i += 3
-        else:
-            i += 1
 
 
 def _slot_page(slot: str) -> int:

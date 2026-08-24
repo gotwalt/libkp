@@ -244,11 +244,25 @@ pub(crate) fn navigate(shared: &Arc<Shared>, target: u16) {
     execute(shared, epoch, &mut inner, actions);
 }
 
-/// A position report folded by the core, from either wire.
-pub(crate) fn position(shared: &Arc<Shared>, epoch: u64, index: u16) {
+/// A position report folded within a chunk, from either wire. Drives the
+/// machine and carries out its actions, but returns the events and whether the
+/// snapshot's navigation mirror moved rather than publishing: the caller folds
+/// both into the chunk's single snapshot, so a settled aim does not raise a
+/// second one. A matching position only ever produces `Settled` (and closes a
+/// window) — never a `Send` — so nothing goes on the wire from here.
+pub(crate) fn fold_position(
+    shared: &Arc<Shared>,
+    epoch: u64,
+    index: u16,
+) -> (Vec<DeviceEvent>, bool) {
+    if shared.core.epoch() != epoch {
+        return (Vec::new(), false);
+    }
     let mut inner = shared.nav.lock();
     let actions = inner.state.position(index);
-    execute(shared, epoch, &mut inner, actions);
+    let events = apply_actions(shared, epoch, &mut inner, actions);
+    let changed = shared.core.set_navigation_silent(inner.state.navigation());
+    (events, changed)
 }
 
 /// The settle timer's expiry. Stale if the life it was armed in is over.
@@ -284,6 +298,23 @@ fn window_elapsed(shared: &Arc<Shared>, epoch: u64) {
 /// stream is down, or the queue is full, the load cannot go and the aim is
 /// dropped there and then, with the event to say so.
 fn execute(shared: &Arc<Shared>, epoch: u64, inner: &mut Inner, actions: Vec<NavAction>) {
+    let events = apply_actions(shared, epoch, inner, actions);
+    shared
+        .core
+        .set_navigation(epoch, inner.state.navigation(), events);
+}
+
+/// Carry out one transition's actions under the lock and return the events they
+/// produced — the send, the timers, the cancels — without touching the
+/// snapshot. [`execute`] follows this with a publish; a chunk fold follows it
+/// with [`Core::set_navigation_silent`](super::core::Core::set_navigation_silent)
+/// so the mirror change rides in the chunk's own snapshot.
+fn apply_actions(
+    shared: &Arc<Shared>,
+    epoch: u64,
+    inner: &mut Inner,
+    actions: Vec<NavAction>,
+) -> Vec<DeviceEvent> {
     let mut events = Vec::new();
     for action in actions {
         match action {
@@ -329,9 +360,7 @@ fn execute(shared: &Arc<Shared>, epoch: u64, inner: &mut Inner, actions: Vec<Nav
             }
         }
     }
-    shared
-        .core
-        .set_navigation(epoch, inner.state.navigation(), events);
+    events
 }
 
 /// The two messages a load is: bank preselect, then the slot load that

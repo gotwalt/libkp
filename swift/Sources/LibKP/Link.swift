@@ -88,18 +88,24 @@ public struct Backoff: Sendable, Equatable {
 }
 
 /// Everything ``DeviceModel/connect(host:port:options:)`` can be told. The
-/// defaults are the recommended session: the control link best-effort, the
-/// stream burst, no reconnects.
+/// defaults are the recommended session: the device's port, the control link
+/// best-effort, the stream burst, no reconnects.
 public struct ConnectOptions: Sendable, Equatable {
+    /// The TCP port both links dial: ``Generated/port``, the only one a real
+    /// device listens on. Fakes and tests set another. A port passed to
+    /// ``DeviceModel/connect(host:port:options:)`` itself overrides this.
+    public var port: UInt16
     public var control: ControlPolicy
     public var sync: SyncStrategy
     public var reconnect: ReconnectPolicy
 
     public init(
+        port: UInt16 = Generated.port,
         control: ControlPolicy = .bestEffort,
         sync: SyncStrategy = .streamBurst,
         reconnect: ReconnectPolicy = ReconnectPolicy()
     ) {
+        self.port = port
         self.control = control
         self.sync = sync
         self.reconnect = reconnect
@@ -109,24 +115,99 @@ public struct ConnectOptions: Sendable, Equatable {
 // MARK: - The stream link
 
 /// The MIDI3 socket of one life of the model: the session, the unframer that
-/// turns its bytes into messages, and the task that reads it. The request lane
-/// rides on it (see Lane.swift); the model writes to it directly, since the
-/// session serialises writes itself.
+/// turns its bytes into messages, the task that reads it, and the command
+/// queue its writer drains. The request lane rides on it (see Lane.swift).
+///
+/// Every command the model sends — a parameter write, a control change, a
+/// request, the Navigator's rig-load pair — goes through the queue, so the
+/// wire order is the queue order, and the queue is bounded at
+/// ``commandQueueDepth``: a caller that finds it full waits for room
+/// (``DeviceModel/write(_:)``), except the Navigator, whose load is dropped
+/// rather than queued behind a wedged socket (``enqueue(pair:)``).
 ///
 /// Owned by the actor and mutated only on it; `Sendable` is claimed so the
 /// actor's `deinit` may close it.
 final class StreamLink: @unchecked Sendable {
+    /// How many commands may wait for the writer at once.
+    static let commandQueueDepth = 64
+
     let session: Session
     var unframer = Midi3.Unframer()
     var ingestTask: Task<Void, Never>?
+    var writerTask: Task<Void, Never>?
+    /// The commands queued for the writer, oldest first, unframed.
+    private(set) var commands: [[UInt8]] = []
+    /// The writer, parked while the queue is empty.
+    private var writer: CheckedContinuation<[UInt8]?, Never>?
+    /// Callers parked while the queue is full, oldest first.
+    private var roomWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var closed = false
 
     init(session: Session) {
         self.session = session
     }
 
+    /// Queue one command if there is room; `false` leaves the queue as it was.
+    func enqueue(_ bytes: [UInt8]) -> Bool {
+        guard !closed, commands.count < StreamLink.commandQueueDepth else { return false }
+        commands.append(bytes)
+        wakeWriter()
+        return true
+    }
+
+    /// Queue two commands together, or neither: the Navigator's bank
+    /// preselect and slot load must go out back to back with nothing between
+    /// them, and a queue too full for both is a socket the load should not be
+    /// left waiting on.
+    func enqueue(pair: ([UInt8], [UInt8])) -> Bool {
+        guard !closed, commands.count + 2 <= StreamLink.commandQueueDepth else { return false }
+        commands.append(pair.0)
+        commands.append(pair.1)
+        wakeWriter()
+        return true
+    }
+
+    /// Wait until the writer has taken a command off a full queue. `false`
+    /// means the link closed while waiting.
+    func waitForRoom() async -> Bool {
+        guard !closed else { return false }
+        return await withCheckedContinuation { roomWaiters.append($0) }
+    }
+
+    /// The next command for the writer, waiting while the queue is empty;
+    /// `nil` once the link is closed.
+    func nextCommand() async -> [UInt8]? {
+        if !commands.isEmpty {
+            let next = commands.removeFirst()
+            if !roomWaiters.isEmpty { roomWaiters.removeFirst().resume(returning: true) }
+            return next
+        }
+        guard !closed else { return nil }
+        return await withCheckedContinuation { writer = $0 }
+    }
+
+    private func wakeWriter() {
+        guard let writer else { return }
+        self.writer = nil
+        writer.resume(returning: commands.removeFirst())
+    }
+
+    /// Close the socket, stop both tasks, and wake whoever was waiting on the
+    /// queue with nothing.
     func close() {
+        closed = true
         ingestTask?.cancel()
         ingestTask = nil
+        writerTask?.cancel()
+        writerTask = nil
+        commands.removeAll()
+        if let writer {
+            self.writer = nil
+            writer.resume(returning: nil)
+        }
+        let waiters = roomWaiters
+        roomWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: false) }
         session.close()
     }
 }
@@ -134,17 +215,20 @@ final class StreamLink: @unchecked Sendable {
 // MARK: - Supervisor
 
 extension DeviceModel {
-    /// Connect to `host:port`, open the stream, start ingesting, and — per
+    /// Connect to `host`, open the stream, start ingesting, and — per
     /// `options` — start the connect-time sync and open the control link.
     ///
-    /// Returns once the stream's handshake and preamble are done and the sync
-    /// burst has been queued; the state fills in as the replies land. The
-    /// control link opens in the background, spaced from the stream by the
-    /// ``ConnectionLedger``, unless it is ``ControlPolicy/required``, in which
-    /// case this waits for it. Subscribe *before* awaiting fresh events.
+    /// The port is ``ConnectOptions/port`` unless `port` is given, which
+    /// overrides it; either way ``DeviceModel/options`` reports the one
+    /// dialled. Returns once the stream's handshake and preamble are done and
+    /// the sync burst has been queued; the state fills in as the replies
+    /// land. The control link opens in the background, spaced from the
+    /// stream by the ``ConnectionLedger``, unless it is
+    /// ``ControlPolicy/required``, in which case this waits for it. Subscribe
+    /// *before* awaiting fresh events.
     public static func connect(
         host: String,
-        port: UInt16 = Generated.port,
+        port: UInt16? = nil,
         options: ConnectOptions = ConnectOptions()
     ) async throws -> DeviceModel {
         let model = DeviceModel(host: host, port: port, options: options)
@@ -186,23 +270,26 @@ extension DeviceModel {
             close()
             throw error
         }
+        reconnectAttempt = 0
     }
 
     /// Install a freshly opened stream as the current life: mark it up, ingest
-    /// the handshake tail, start the read loop, and queue the sync burst.
+    /// the handshake tail, start the read and write loops, and queue the sync
+    /// burst. The reconnect count is not reset here: a life is up only once
+    /// its control link, if required, is too, and the caller says so.
     private func beginLife(session: Session, tail: [UInt8]) {
         epoch += 1
         let epoch = self.epoch
         let link = StreamLink(session: session)
         stream = link
-        reconnectAttempt = 0
         setChannel(.stream, .open)
         setConnection(.connected)
         publishSnapshot()
         ingestStream(tail, epoch: epoch)
 
-        // The loop holds the model weakly and only while folding a chunk, so a
-        // handle nobody references can still be deallocated mid-stream.
+        // The loops hold the model weakly and only while folding a chunk or
+        // writing a command, so a handle nobody references can still be
+        // deallocated mid-stream.
         link.ingestTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
@@ -213,6 +300,9 @@ extension DeviceModel {
                     return
                 }
             }
+        }
+        link.writerTask = Task { [weak self] in
+            await self?.drainCommands(from: link, epoch: epoch)
         }
 
         if options.sync == .streamBurst {
@@ -233,11 +323,26 @@ extension DeviceModel {
             return
         case .bestEffort:
             let epoch = self.epoch
-            Task { [weak self] in
+            controlOpenTask = Task { [weak self] in
                 _ = try? await self?.openControl(epoch: epoch)
             }
         case .required:
             try await openControl(epoch: epoch)
+        }
+    }
+
+    /// The stream link's writer: take each queued command in turn, frame it,
+    /// and write it. A failed write is the stream ending, and is reported as
+    /// such; a link that closes underneath the loop simply ends it.
+    func drainCommands(from link: StreamLink, epoch: Int) async {
+        while !Task.isCancelled, epoch == self.epoch {
+            guard let bytes = await link.nextCommand() else { return }
+            do {
+                try await link.session.writeAll(Midi3.frame(bytes))
+            } catch {
+                streamEnded(epoch: epoch)
+                return
+            }
         }
     }
 
@@ -257,28 +362,13 @@ extension DeviceModel {
             guard let decoded = DeviceState.decode(message) else { continue }
             switch decoded {
             case .update(let update):
-                let outcome = state.applyUpdate(update)
-                for event in outcome.events { emit(event) }
-                slow = slow || outcome.slowChanged
-                resolve(update)
-                slow = forwardPosition(outcome) || slow
+                slow = fold(update) || slow
             case let .renderedString(page, number, value, text):
                 emit(.renderedString(page: page, number: number, value: value, text: text))
                 resolveRender(page: page, number: number, value: value, text: text)
             }
         }
         if slow { publishSnapshot() }
-    }
-
-    /// A folded update moved the device's position: hand the flat index to
-    /// the Navigator, whichever wire carried it. Returns whether the
-    /// snapshot's navigation changed.
-    private func forwardPosition(_ outcome: ApplyOutcome) -> Bool {
-        let moved = outcome.events.contains {
-            if case .currentPosition = $0 { true } else { false }
-        }
-        guard moved, let index = state.currentRigIndex else { return false }
-        return navigationPosition(index)
     }
 
     /// The stream ended — a read error, EOF, or a failed write. Both links go
@@ -313,6 +403,10 @@ extension DeviceModel {
         settleTask = nil
         reopenTask?.cancel()
         reopenTask = nil
+        // An open still parked in the ledger, or dialling, must not reach the
+        // device on behalf of a life that is over.
+        controlOpenTask?.cancel()
+        controlOpenTask = nil
         controlIngestTask?.cancel()
         controlIngestTask = nil
         control?.close()
@@ -323,7 +417,8 @@ extension DeviceModel {
             dumpActive = false
             state.endDump()
         }
-        // The control link is closed, not lost: it did not fail on its own.
+        // The control link is closed, not lost: it did not fail on its own —
+        // and it goes first, being closed *because* the stream went.
         setChannel(.control, .closed)
         setChannel(.stream, lost ? .lost : .closed)
         failPending()
@@ -340,7 +435,10 @@ extension DeviceModel {
 
     /// One reconnect attempt: the whole connect sequence again, on this handle.
     /// The ledger spaces the dial from the close that preceded it; the backoff
-    /// has already been slept.
+    /// has already been slept. The attempt count resets only once the life is
+    /// fully up — a stream that opens but whose required control link is
+    /// refused is the next failure, counted and backed off like a dial that
+    /// never connected.
     private func retryLife(epoch: Int) async {
         guard epoch == self.epoch, !closed, let backoff = options.reconnect.stream else { return }
         setChannel(.stream, .connecting)
@@ -354,6 +452,7 @@ extension DeviceModel {
             beginLife(session: session, tail: tail)
             do {
                 try await bringUpControl()
+                reconnectAttempt = 0
             } catch {
                 // Required and refused: this life is over before it began.
                 streamEnded(epoch: self.epoch)
@@ -449,6 +548,7 @@ extension DeviceModel {
 
         control = link
         dumpActive = true
+        dumpEndRuns = 0
         state.beginDump()
         setChannel(.control, .open)
         refreshConnection()
@@ -477,8 +577,11 @@ extension DeviceModel {
 
     /// Fold one chunk off the control link: every item's values, tagged with
     /// the dump phase while the dump is streaming, and at most one snapshot.
-    /// The run based at ``Generated/dumpEndAddress`` closes the dump once it
-    /// has been folded; whatever follows it is live.
+    /// The dump has two sections — the system state, then the loaded rig —
+    /// and each closes with a run based at ``Generated/dumpEndAddress``, so
+    /// the ``Generated/dumpEndRuns``-th such run since the trigger closes
+    /// the dump once it has been folded, the count kept across chunks; a
+    /// lone run ends nothing, and whatever follows the last is live.
     func ingestControl(_ items: [CBORValue], epoch: Int, from link: ControlLink) {
         guard epoch == self.epoch, control === link else { return }
         var slow = false
@@ -497,13 +600,12 @@ extension DeviceModel {
                     update = Update(
                         source: .control, phase: phase, address: address, decoded: .text(text))
                 }
-                let outcome = state.applyUpdate(update)
-                for event in outcome.events { emit(event) }
-                slow = slow || outcome.slowChanged
-                resolve(update)
-                slow = forwardPosition(outcome) || slow
+                slow = fold(update) || slow
             }
-            if dumpActive && item.base == Generated.dumpEndAddress { finishDump() }
+            if dumpActive && item.base == Generated.dumpEndAddress {
+                dumpEndRuns += 1
+                if dumpEndRuns >= Generated.dumpEndRuns { finishDump() }
+            }
         }
         if slow { publishSnapshot() }
     }
@@ -542,9 +644,14 @@ extension DeviceModel {
     }
 
     /// Queue the one automatic reopen the policy allows, if it allows any.
+    /// The interval is measured from the last attempt's start, not from the
+    /// moment it failed or the link was lost, so a link that took a while to
+    /// fail — or ran for a while — is not reopened later than asked.
     private func scheduleControlReopen() {
         guard let requested = options.reconnect.controlReopen else { return }
-        let wait = Swift.max(requested, .milliseconds(Generated.controlReopenMinGapMs))
+        let interval = Swift.max(requested, .milliseconds(Generated.controlReopenMinGapMs))
+        let elapsed = lastControlAttempt?.duration(to: .now) ?? .zero
+        let wait = Swift.max(interval - elapsed, .zero)
         let epoch = self.epoch
         reopenTask = Task { [weak self] in
             try? await Task.sleep(for: wait)

@@ -412,9 +412,13 @@ impl Session {
     /// gap between its chunks. Exists so a test against a fake that never
     /// answers need not sit out the full two seconds.
     ///
-    /// A reply that never begins is handed back empty rather than raised: the
-    /// device's `+`/`-` verdict is what the caller inspects, and an absent
-    /// verdict is left for it to judge as it did before the wait was lengthened.
+    /// A reply that never begins is a failed handshake, not a silent success:
+    /// the device greeted, read the selection, and then said nothing, so
+    /// there is no `+`/`-` verdict to act on. It is reported as
+    /// `SessionError::Timeout { phase: "protocol selection", .. }`, reporting
+    /// the wait actually made — the same way a greeting that never begins
+    /// fails — rather than handed back empty for a caller to open a session
+    /// the device never acknowledged.
     pub async fn select_protocol_within(
         &mut self,
         name: &str,
@@ -434,7 +438,11 @@ impl Session {
                     detail: Some(String::from_utf8_lossy(&resp).trim().to_string()),
                 })
             }
-            _ => Ok(resp), // '+' accept, or unknown -> hand back for inspection
+            Some(_) => Ok(resp), // '+' accept, or unknown -> hand back for inspection
+            None => Err(SessionError::Timeout {
+                phase: "protocol selection",
+                ms: reply_timeout.as_millis() as u64,
+            }),
         }
     }
 
@@ -842,18 +850,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_selection_reply_that_never_begins_is_handed_back_empty() {
+    async fn a_selection_reply_that_never_begins_times_out() {
+        // The device greets, reads the selection, then says nothing: an absent
+        // verdict is a failed handshake, reported for the selection phase with
+        // the wait actually made — not an open session against a device that
+        // never acknowledged the protocol.
         let port = slow_device(Some(Duration::ZERO), None).await;
         let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
             .await
             .unwrap();
         let wait = Duration::from_millis(150);
-        let outcome = session
+        let started = Instant::now();
+        let err = session
             .handshake_within(&[PROTOCOL_MIDI3_STREAM], IDLE, wait)
             .await
-            .unwrap();
-        assert_eq!(outcome.selected, PROTOCOL_MIDI3_STREAM);
-        assert!(outcome.response.is_empty());
+            .expect_err("no verdict, no session");
+        assert!(started.elapsed() >= wait);
+        assert!(started.elapsed() < HANDSHAKE_TIMEOUT);
+        assert!(
+            matches!(
+                err,
+                SessionError::Timeout {
+                    phase: "protocol selection",
+                    ms: 150
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -863,5 +886,127 @@ mod tests {
             Duration::from_millis(generated::HANDSHAKE_TIMEOUT_MS)
         );
         assert!(HANDSHAKE_TIMEOUT > IDLE);
+    }
+
+    // ---- the handshake's greeting and selection outcomes -------------------
+
+    /// A fake that greets with `offered`, then answers the selection `+name`
+    /// (`accept`) or `-NO`. One connection, then it parks.
+    async fn greeting_fake(offered: Vec<String>, accept: bool) -> u16 {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let greeting = offered
+                .iter()
+                .map(|p| format!("{p}\r\n"))
+                .collect::<String>()
+                + ".\r\n";
+            stream.write_all(greeting.as_bytes()).await.unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while !line.ends_with(HANDSHAKE_TERMINATOR) {
+                if stream.read_exact(&mut byte).await.is_err() {
+                    return;
+                }
+                line.push(byte[0]);
+            }
+            let name =
+                String::from_utf8_lossy(line.strip_suffix(HANDSHAKE_TERMINATOR).unwrap_or(&line))
+                    .to_string();
+            let reply = if accept {
+                format!("+{name}\r\n")
+            } else {
+                "-NO\r\n".to_string()
+            };
+            let _ = stream.write_all(reply.as_bytes()).await;
+            std::future::pending::<()>().await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn an_empty_greeting_fails_as_a_greeting_timeout() {
+        // The device answered, but offered nothing to select: reported the same
+        // way as never hearing back, naming the wait it was given.
+        let port = greeting_fake(Vec::new(), true).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let wait = Duration::from_millis(150);
+        let err = session
+            .handshake_within(&[PROTOCOL_MIDI3_STREAM], IDLE, wait)
+            .await
+            .expect_err("nothing to select from");
+        assert!(
+            matches!(
+                err,
+                SessionError::Timeout {
+                    phase: "greeting",
+                    ms: 150
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_handshake_falls_back_to_the_first_offered_protocol() {
+        let port = greeting_fake(vec!["{ONLY-ONE}".to_string()], true).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let outcome = session
+            .handshake(&[PROTOCOL_MIDI3_STREAM], IDLE)
+            .await
+            .unwrap();
+        assert_eq!(outcome.selected, "{ONLY-ONE}");
+        assert!(outcome.response.starts_with(b"+"));
+    }
+
+    #[tokio::test]
+    async fn a_rejection_carries_the_name_and_the_detail() {
+        let port = greeting_fake(vec![PROTOCOL_MIDI3_STREAM.to_string()], false).await;
+        let mut session = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let err = session
+            .handshake(&[PROTOCOL_MIDI3_STREAM], IDLE)
+            .await
+            .expect_err("the device says -NO");
+        match err {
+            SessionError::ProtocolRejected { name, detail } => {
+                assert_eq!(name, PROTOCOL_MIDI3_STREAM);
+                assert!(detail.unwrap_or_default().contains("NO"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_are_serialised() {
+        // Two opens racing to the same peer do not both dial inside the other's
+        // cooldown: the turn lock serialises them, so the second waits a full
+        // cooldown after the first, which waited one after the seed open.
+        let port = fake_listener().await;
+        let seed = Session::connect_to(Ipv4Addr::LOCALHOST, port)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let (a, b) = tokio::join!(
+            Session::connect_to(Ipv4Addr::LOCALHOST, port),
+            Session::connect_to(Ipv4Addr::LOCALHOST, port),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        // Serialised: the later of the two opened about two cooldowns after the
+        // seed, not one (which is what a parallel pair would have cost).
+        assert!(
+            started.elapsed() >= CONNECTION_COOLDOWN * 2 - Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        drop((seed, a, b));
     }
 }

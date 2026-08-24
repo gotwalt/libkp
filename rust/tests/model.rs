@@ -21,7 +21,7 @@ use libkp::model::{
 };
 use libkp::nrpn::{self, FUNCTION_EXT_PARAM, set_single};
 use libkp::params::{BankPreviewField, bank_preview_address};
-use libkp::session::CONNECTION_COOLDOWN;
+use libkp::session::{CONNECTION_COOLDOWN, PROTOCOL_CBOR_CONTROL};
 use libkp::state::{Channel, ChannelState, Connection, DeviceState, NavDrop, Navigation};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, timeout};
@@ -368,6 +368,48 @@ async fn required_control_with_a_rejecting_device_fails_the_connect() {
         )
         .await
     );
+    // The control link saw the greeting offered no CBOR and never wrote a
+    // selection: it does not offer the device its own reserved protocol.
+    let conns = fake.connections();
+    assert_eq!(conns.len(), 2);
+    assert!(conns[1].selected().is_none());
+}
+
+#[tokio::test]
+async fn a_control_link_offered_but_refused_degrades_the_connection() {
+    // The greeting offers CBOR, but the device answers the selection with -NO:
+    // the control link writes the selection, is rejected, and the connection
+    // degrades — the stream still up.
+    let fake = FakeDevice::start_with(Config::offers_but_refuses_cbor()).await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            sync: SyncStrategy::Off,
+            ..fake.options()
+        },
+    )
+    .await
+    .unwrap();
+    let mut events = model.events();
+    next_event(
+        &mut events,
+        channel_event(Channel::Control, ChannelState::Unavailable),
+    )
+    .await;
+    next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::ConnectionChanged(Connection::Degraded))
+    })
+    .await;
+    assert_eq!(model.state().connection, Connection::Degraded);
+
+    // Unlike the not-offered case, a selection *was* written — the reserved
+    // CBOR GUID — and refused.
+    let control = fake.wait_for_connections(2).await;
+    assert_eq!(
+        control[1].selected().as_deref(),
+        Some(libkp::session::PROTOCOL_CBOR_CONTROL)
+    );
+    model.close().await;
 }
 
 #[tokio::test]
@@ -625,6 +667,21 @@ async fn refresh_issues_the_forty_six_requests() {
     assert_eq!(count(nrpn::FUNCTION_REQUEST_SINGLE), 16 + 7);
     assert_eq!(count(nrpn::FUNCTION_REQUEST_EXT_STRING), 15);
     assert_eq!(count(nrpn::FUNCTION_REQUEST_EXT_PARAM), 2);
+
+    // The rows leave in STATE_ROUTES (address-sorted) order, so the wire order
+    // is the table order — the same in all three languages. The first request
+    // is the Rig Name string tag, then the functions run in blocks.
+    assert_eq!(
+        received[0],
+        nrpn::request_string(0, 0x7F, generated::PAGE_STRINGS, generated::STRING_RIG_NAME)
+    );
+    let functions: Vec<u8> = received.iter().map(|m| m[6]).collect();
+    let mut expected = Vec::new();
+    expected.extend(std::iter::repeat_n(nrpn::FUNCTION_REQUEST_STRING, 6));
+    expected.extend(std::iter::repeat_n(nrpn::FUNCTION_REQUEST_SINGLE, 23));
+    expected.extend(std::iter::repeat_n(nrpn::FUNCTION_REQUEST_EXT_STRING, 15));
+    expected.extend(std::iter::repeat_n(nrpn::FUNCTION_REQUEST_EXT_PARAM, 2));
+    assert_eq!(functions, expected);
     model.close().await;
 }
 
@@ -643,21 +700,24 @@ async fn connect_runs_the_burst_in_the_background_and_reports_it_done() {
     let mut events = model.events();
     let stream = fake.wait_for_stream(0).await;
     assert!(wait_for(|| stream.requests() == 46, PATIENCE).await);
-    let done = next_event(&mut events, |e| {
-        matches!(
-            e,
-            DeviceEvent::SyncCompleted {
-                source: Channel::Stream
+    // Nothing answers, so every one of the 46 times out, and then the burst
+    // reports itself done — SyncCompleted last.
+    let mut timed_out = 0usize;
+    let done = timeout(PATIENCE, async {
+        loop {
+            match events.recv().await {
+                Ok(DeviceEvent::RequestTimedOut { .. }) => timed_out += 1,
+                Ok(DeviceEvent::SyncCompleted {
+                    source: Channel::Stream,
+                }) => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => panic!("event stream closed"),
             }
-        )
+        }
     })
     .await;
-    assert_eq!(
-        done,
-        DeviceEvent::SyncCompleted {
-            source: Channel::Stream
-        }
-    );
+    assert!(done.is_ok(), "the burst never reported done");
+    assert_eq!(timed_out, 46);
     model.close().await;
 }
 
@@ -1157,13 +1217,43 @@ async fn close_is_idempotent_and_closes_both_links() {
     .await;
 
     model.close().await;
-    let gone = next_event(&mut events, |e| matches!(e, DeviceEvent::Disconnected)).await;
-    assert_eq!(gone, DeviceEvent::Disconnected);
-    // The last word of a close is the connection transition.
-    next_event(&mut events, |e| {
-        matches!(e, DeviceEvent::ConnectionChanged(Connection::Disconnected))
-    })
-    .await;
+    // The teardown events, in order: the control link closes first, then the
+    // stream, then the compatibility Disconnected, then the transition it
+    // belongs to. (The control link was Open, so it has an event to raise.)
+    let mut teardown = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                let last = matches!(
+                    event,
+                    DeviceEvent::ConnectionChanged(Connection::Disconnected)
+                );
+                teardown.push(event);
+                if last {
+                    break;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(e) => panic!("event stream: {e:?}"),
+        }
+    }
+    assert_eq!(
+        teardown,
+        vec![
+            DeviceEvent::ChannelChanged {
+                channel: Channel::Control,
+                state: ChannelState::Closed
+            },
+            DeviceEvent::ChannelChanged {
+                channel: Channel::Stream,
+                state: ChannelState::Closed
+            },
+            DeviceEvent::Disconnected,
+            DeviceEvent::ConnectionChanged(Connection::Disconnected),
+        ]
+    );
     let state = model.state();
     assert_eq!(state.connection, Connection::Disconnected);
     assert_eq!(state.channels.stream, ChannelState::Closed);
@@ -1249,13 +1339,516 @@ async fn the_apply_cbor_shim_still_folds_through_the_funnel() {
     model.close().await;
 }
 
-/// The default dump the fake serves is a real dump's shape: it ends with the
-/// run at `DUMP_END_ADDRESS`.
+/// The default dump the fake serves is a real dump's two-section shape: two
+/// runs based at `DUMP_END_ADDRESS`, the second of which ends it.
 #[test]
-fn the_fake_dump_ends_with_the_marker() {
+fn the_fake_dump_has_two_end_runs_the_second_of_which_ends_it() {
     let dump = default_dump();
+    let ends: Vec<usize> = dump
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| *item == &multi_item(generated::DUMP_END_ADDRESS, &[0, 0]))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(ends.len(), generated::DUMP_END_RUNS);
     assert_eq!(
         dump.last(),
-        Some(&multi_item(generated::DUMP_END_ADDRESS, &[0, 0, 0]))
+        Some(&multi_item(generated::DUMP_END_ADDRESS, &[0, 0]))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Parity additions: control link, requests, loss/reconnect, teardown
+// ---------------------------------------------------------------------------
+
+/// A message that rode in on the handshake acceptance tail is folded before
+/// the first read of the stream.
+#[tokio::test]
+async fn the_handshake_tail_is_decoded_before_the_first_read() {
+    let rig_name = nrpn::sysex(
+        0,
+        0,
+        nrpn::FUNCTION_STRING_PARAM,
+        generated::PAGE_STRINGS,
+        generated::STRING_RIG_NAME,
+        b"Tail Rig\0",
+    );
+    let fake = FakeDevice::start_with(Config {
+        tail: vec![rig_name],
+        ..Config::default()
+    })
+    .await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    assert!(
+        wait_for(
+            || model.state().rig.name.as_deref() == Some("Tail Rig"),
+            PATIENCE
+        )
+        .await
+    );
+    model.close().await;
+}
+
+/// A value pushed live on the stream during the dump window outranks the
+/// dump's stale copy of that address: the dump is a snapshot taken when it was
+/// asked for, and the live value is newer.
+#[tokio::test]
+async fn a_live_push_during_the_dump_outranks_the_dump() {
+    // The fake serves nothing on the trigger, so the dump phase stays open and
+    // the test drives it: a live tempo on the stream, then the dump's stale
+    // copy and the two runs that end the phase.
+    let fake = FakeDevice::start_with(Config {
+        dump: vec![],
+        ..Config::default()
+    })
+    .await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            sync: SyncStrategy::Off,
+            ..fake.options()
+        },
+    )
+    .await
+    .unwrap();
+    let mut events = model.events();
+    next_event(
+        &mut events,
+        channel_event(Channel::Control, ChannelState::Open),
+    )
+    .await;
+    let stream = fake.wait_for_stream(0).await;
+    let control = fake.wait_for_control(0).await;
+
+    let tempo_addr =
+        u32::from(generated::PAGE_RIG_SETTINGS) * 128 + u32::from(generated::TEMPO_NUMBER);
+    // 120 bpm, live on the stream.
+    stream
+        .push(&set_single(
+            0,
+            0,
+            generated::PAGE_RIG_SETTINGS,
+            generated::TEMPO_NUMBER,
+            120 * generated::TEMPO_BPM_SCALE,
+        ))
+        .await;
+    assert!(wait_for(|| model.state().rig.tempo_bpm == Some(120), PATIENCE).await);
+
+    // The dump's stale copy of the same address (100 bpm), then the two runs
+    // that close the phase.
+    control
+        .push_items(&[
+            libkp::cbor::param_write(tempo_addr, i64::from(100 * generated::TEMPO_BPM_SCALE)),
+            multi_item(generated::DUMP_END_ADDRESS, &[0, 0]),
+            multi_item(generated::DUMP_END_ADDRESS, &[0, 0]),
+        ])
+        .await;
+    let done = next_event(&mut events, |e| {
+        matches!(
+            e,
+            DeviceEvent::SyncCompleted {
+                source: Channel::Control
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        done,
+        DeviceEvent::SyncCompleted {
+            source: Channel::Control
+        }
+    );
+    // The live tempo held; the dump's stale copy was refused.
+    assert_eq!(model.state().rig.tempo_bpm, Some(120));
+    model.close().await;
+}
+
+/// `reopen_control` opening the link and returning the connection to
+/// `Connected` — the success path the refusal tests do not cover.
+#[tokio::test]
+async fn reopen_control_recovers_a_degraded_connection() {
+    // The greeting offers CBOR, but the device refuses the selection at first,
+    // so the connection degrades.
+    let fake = FakeDevice::start_with(Config::offers_but_refuses_cbor()).await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            sync: SyncStrategy::Off,
+            ..fake.options()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        wait_for(
+            || model.state().connection == Connection::Degraded,
+            PATIENCE
+        )
+        .await
+    );
+
+    // The device starts accepting the control protocol. The reopen gap is
+    // thirty seconds by spec; forget the last attempt so the reopen is allowed
+    // now (the ledger still spaces the socket).
+    fake.configure(|c| c.accepts.push(PROTOCOL_CBOR_CONTROL.to_string()));
+    model.clear_control_attempt_for_tests();
+    model.reopen_control().await.unwrap();
+
+    assert!(wait_for(|| model.state().morph == Some(8192), PATIENCE).await);
+    let state = model.state();
+    assert_eq!(state.connection, Connection::Connected);
+    assert_eq!(state.channels.control, ChannelState::Open);
+    model.close().await;
+}
+
+/// `close()` while the default-policy control open is still parked in the
+/// ledger returns promptly and leaves no control socket behind.
+#[tokio::test]
+async fn close_cancels_a_control_link_still_waiting_its_turn() {
+    let fake = FakeDevice::start_with(Config {
+        // sync off so the stream is quiet; control link default (BestEffort).
+        ..Config::default()
+    })
+    .await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            sync: SyncStrategy::Off,
+            ..fake.options()
+        },
+    )
+    .await
+    .unwrap();
+    // The control open is queued in the ledger, a cooldown behind the stream.
+    let started = Instant::now();
+    model.close().await;
+    assert!(
+        started.elapsed() < CONNECTION_COOLDOWN / 4,
+        "close waited on the parked control open: {:?}",
+        started.elapsed()
+    );
+    // Well past when the control open would have landed: it never did.
+    tokio::time::sleep(CONNECTION_COOLDOWN + Duration::from_millis(300)).await;
+    assert!(fake.controls().is_empty());
+}
+
+/// `refresh()` with one row unanswered: `Err(Timeout)`, while every answered
+/// row still folded into the tree.
+#[tokio::test]
+async fn refresh_reports_a_timeout_after_the_rest_landed() {
+    let rig_name = u32::from(generated::PAGE_STRINGS) * 128 + u32::from(generated::STRING_RIG_NAME);
+    let mut config = Config::answering();
+    config.silent.insert(rig_name);
+    let fake = FakeDevice::start_with(config).await;
+    // Control off, so no dump fills the rig name behind the lane's back.
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+
+    assert_eq!(model.refresh().await, Err(RequestError::Timeout));
+    let state = model.state();
+    assert_eq!(state.rig.name, None, "the one silent row never landed");
+    assert_eq!(state.amp.name.as_deref(), Some("X"), "the rest did");
+    model.close().await;
+}
+
+/// A stream loss with the control link Open closes the control link too — to
+/// `Closed`, not `Lost`, and both sockets drop together.
+#[tokio::test]
+async fn a_stream_loss_closes_the_control_link_too() {
+    let fake = FakeDevice::start_with(Config {
+        ..Config::default()
+    })
+    .await;
+    // Sync off, control link by default (BestEffort), no reconnect.
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            sync: SyncStrategy::Off,
+            ..fake.options()
+        },
+    )
+    .await
+    .unwrap();
+    let mut events = model.events();
+    next_event(
+        &mut events,
+        channel_event(Channel::Control, ChannelState::Open),
+    )
+    .await;
+    let stream = fake.wait_for_stream(0).await;
+    let control = fake.wait_for_control(0).await;
+
+    // Hang up only the stream.
+    stream.hang_up().await;
+
+    // Collect the teardown events up to Disconnected: the control link goes
+    // Closed (never Lost), and the stream goes Lost.
+    let mut saw_control_closed = false;
+    let mut saw_control_lost = false;
+    timeout(PATIENCE, async {
+        loop {
+            match events.recv().await {
+                Ok(DeviceEvent::ChannelChanged {
+                    channel: Channel::Control,
+                    state: ChannelState::Closed,
+                }) => saw_control_closed = true,
+                Ok(DeviceEvent::ChannelChanged {
+                    channel: Channel::Control,
+                    state: ChannelState::Lost,
+                }) => saw_control_lost = true,
+                Ok(DeviceEvent::Disconnected) => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => panic!("event stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("no Disconnected");
+    assert!(saw_control_closed, "the control link went Closed");
+    assert!(!saw_control_lost, "the control link is Closed, not Lost");
+
+    let state = model.state();
+    assert_eq!(state.channels.stream, ChannelState::Lost);
+    assert_eq!(state.channels.control, ChannelState::Closed);
+    // The control socket really dropped: the fake's side reads EOF.
+    assert!(wait_for(|| control.is_closed(), PATIENCE).await);
+    model.close().await;
+}
+
+/// A reconnect keeps the tree, never says Disconnected, and retries with a
+/// doubling backoff when the first redial is refused.
+#[tokio::test]
+async fn a_reconnect_keeps_the_tree_and_retries_until_it_lands() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            reconnect: ReconnectPolicy {
+                stream: Some(Backoff {
+                    initial: Duration::from_millis(50),
+                    max: Duration::from_millis(200),
+                }),
+                control_reopen: None,
+            },
+            ..quiet(&fake)
+        },
+    )
+    .await
+    .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    // A value in the tree before the loss; it must survive the reconnect.
+    stream
+        .push(&set_single(
+            0,
+            0,
+            generated::PAGE_RIG_SETTINGS,
+            generated::TEMPO_NUMBER,
+            120 * generated::TEMPO_BPM_SCALE,
+        ))
+        .await;
+    assert!(wait_for(|| model.state().rig.tempo_bpm == Some(120), PATIENCE).await);
+
+    // Refuse the first redials, then let one through — so a second attempt is
+    // forced.
+    fake.pause_accepting();
+    stream.hang_up().await;
+
+    let mut reconnecting_1: Option<Instant> = None;
+    let mut reconnecting_2: Option<Instant> = None;
+    let mut resumed = false;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await {
+                Ok(DeviceEvent::ConnectionChanged(Connection::Reconnecting { attempt })) => {
+                    if attempt == 1 {
+                        reconnecting_1 = Some(Instant::now());
+                    } else if attempt >= 2 {
+                        if reconnecting_2.is_none() {
+                            reconnecting_2 = Some(Instant::now());
+                        }
+                        // Let the next dial land.
+                        if !resumed {
+                            fake.resume_accepting();
+                            resumed = true;
+                        }
+                    }
+                }
+                Ok(DeviceEvent::Disconnected)
+                | Ok(DeviceEvent::ConnectionChanged(Connection::Disconnected)) => {
+                    panic!("a reconnect must not report Disconnected");
+                }
+                Ok(DeviceEvent::ConnectionChanged(Connection::Connected)) => return,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => panic!("event stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("the reconnect never landed");
+
+    let first = reconnecting_1.expect("a first attempt");
+    let second = reconnecting_2.expect("a second attempt");
+    // The second attempt waited at least the doubled backoff after the first.
+    assert!(second.duration_since(first) >= Duration::from_millis(100));
+
+    // The tree carried across the reconnect.
+    assert_eq!(model.state().connection, Connection::Connected);
+    assert_eq!(model.state().rig.tempo_bpm, Some(120));
+    model.close().await;
+}
+
+/// The parameter setters put the exact Single Parameter Changes on the wire,
+/// and the tempo setter clamps to the 14-bit maximum.
+#[tokio::test]
+async fn parameter_setters_emit_single_parameter_changes() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let stream = fake.wait_for_stream(0).await;
+
+    model.set_gain(8192).await.unwrap();
+    model.set_effect_enabled("rev", true).await.unwrap();
+    model.set_effect_mix("DLY", 4096).await.unwrap();
+    model.set_tempo_bpm(120).await.unwrap();
+    model.set_main_volume(9000).await.unwrap();
+    model.set_monitor_volume(3000).await.unwrap();
+    model.set_rig_volume(4096).await.unwrap();
+    assert!(wait_for(|| stream.received().len() >= 7, PATIENCE).await);
+    let received = stream.received();
+    assert_eq!(
+        received[0],
+        set_single(0, 0x7F, generated::AMP_PAGE, generated::GAIN_NUMBER, 8192)
+    );
+    assert_eq!(received[1], set_single(0, 0x7F, 0x3D, 3, 1));
+    assert_eq!(received[2], set_single(0, 0x7F, 0x3C, 4, 4096));
+    assert_eq!(
+        received[3],
+        set_single(0, 0x7F, generated::PAGE_RIG_SETTINGS, 0, 7680)
+    );
+    assert_eq!(
+        received[4],
+        set_single(0, 0x7F, generated::SYSTEM_PAGE, 0, 9000)
+    );
+    assert_eq!(
+        received[5],
+        set_single(0, 0x7F, generated::SYSTEM_PAGE, 2, 3000)
+    );
+    assert_eq!(
+        received[6],
+        set_single(0, 0x7F, generated::PAGE_RIG_SETTINGS, 1, 4096)
+    );
+    model.close().await;
+}
+
+#[tokio::test]
+async fn set_tempo_clamps_to_the_fourteen_bit_maximum() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let stream = fake.wait_for_stream(0).await;
+    model.set_tempo_bpm(9999).await.unwrap();
+    assert!(wait_for(|| !stream.received().is_empty(), PATIENCE).await);
+    assert_eq!(
+        stream.received()[0],
+        set_single(
+            0,
+            0x7F,
+            generated::PAGE_RIG_SETTINGS,
+            0,
+            generated::FULL_SCALE
+        )
+    );
+    model.close().await;
+}
+
+#[tokio::test]
+async fn actions_emit_control_changes() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let stream = fake.wait_for_stream(0).await;
+    model.tap_tempo().await.unwrap();
+    model.bank(4).await.unwrap();
+    model.tuner_mode(true).await.unwrap();
+    model.freeze(false).await.unwrap();
+    model.send_raw(&[0xB0, 30, 1]).await.unwrap();
+    assert!(wait_for(|| stream.received().len() >= 5, PATIENCE).await);
+    assert_eq!(
+        stream.received()[..5],
+        [
+            Control::TapTempo.message(0),
+            Control::BankPreselect(3).message(0),
+            Control::TunerMode(true).message(0),
+            Control::Freeze(false).message(0),
+            vec![0xB0, 30, 1],
+        ]
+    );
+    model.close().await;
+}
+
+#[tokio::test]
+async fn an_unknown_effect_slot_is_rejected() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    assert!(matches!(
+        model.set_effect_enabled("nope", true).await,
+        Err(CommandError::UnknownSlot(_))
+    ));
+    model.close().await;
+}
+
+/// `close()` cancels the Navigator's timers and clears the aim without an
+/// event: no late NavigationSettled or NavigationDropped after the settle and
+/// the window would have fired.
+#[tokio::test]
+async fn close_cancels_the_navigator_and_clears_the_aim_without_an_event() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    model.navigate_to(14);
+    assert!(wait_for(|| stream.received().len() >= 2, PATIENCE).await);
+    model.close().await;
+    assert_eq!(model.state().navigation, Navigation::default());
+
+    // Past the settle and the window: the cancelled timers stay quiet.
+    tokio::time::sleep(Duration::from_millis(
+        generated::RIG_LOAD_SETTLE_MS + generated::PENDING_WINDOW_MS + 100,
+    ))
+    .await;
+    assert!(drain_navigation(&mut events).is_empty());
+}
+
+/// A request in flight when the model closes fails with `Disconnected`.
+#[tokio::test]
+async fn a_pending_request_fails_when_the_model_closes() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let stream = fake.wait_for_stream(0).await;
+    let request = tokio::spawn({
+        let model = model.clone();
+        async move {
+            model
+                .request_param(generated::AMP_PAGE, generated::GAIN_NUMBER)
+                .await
+        }
+    });
+    assert!(wait_for(|| stream.requests() == 1, PATIENCE).await);
+    model.close().await;
+    assert_eq!(request.await.unwrap(), Err(RequestError::Disconnected));
 }

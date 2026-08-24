@@ -378,6 +378,18 @@ class Session:
             raise ProtocolRejectedError(name, resp.decode("utf-8", "replace").strip())
         return resp
 
+    async def read_greeting(self, idle: float, timeout: float = HANDSHAKE_TIMEOUT) -> bytes:
+        """Read the device's greeting -- the protocol list it sends first -- as
+        raw bytes, for :func:`parse_protocol_list`.
+
+        The first half of :meth:`handshake`, on its own for a caller that must
+        see what is offered before it selects: the control link, which takes
+        one protocol or none. Waits up to ``timeout`` for the first byte and
+        then until an ``idle`` gap. Raises :class:`TimeoutErrorLibKP` for the
+        ``"greeting"`` phase if the device never greets.
+        """
+        return await self._read_reply("greeting", timeout, idle)
+
     async def handshake(
         self,
         preferred: list[str] | tuple[str, ...] = (PROTOCOL_MIDI3_STREAM,),
@@ -393,7 +405,7 @@ class Session:
         phase -- reporting ``timeout``, the wait actually made -- when the device
         never greets, or greets with no protocol to choose.
         """
-        greeting = await self._read_reply("greeting", timeout, idle)
+        greeting = await self.read_greeting(idle, timeout)
         offered = parse_protocol_list(greeting)
 
         selected = next((p for p in preferred if p in offered), None)
