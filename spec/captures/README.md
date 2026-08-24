@@ -73,7 +73,10 @@ it to the CBOR decoder in a single push and assert whichever of these
 - `numeric_count` — number of numeric `(address, value)` pairs the items carry
   (every single, every element of every run, in document order).
 - `strings` — the exact `[address, text]` pairs the walk yields, in document
-  order. An empty string is not a value and is not listed.
+  order, as a reader surfaces them: a sensitive address
+  (`sensitive_addresses`) is listed as `[redacted]`, never as its payload.
+  An empty string is a value like any other — it is how a cleared tag reads —
+  and is listed.
 - `blob_count` — number of `[5, addr, bytes]` items. The decoder carries them
   as opaque byte strings; the walk yields nothing for them.
 - `live_items` — `{ "<address>": count }`: how many single `[1, addr, value]`

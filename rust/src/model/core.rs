@@ -550,17 +550,21 @@ impl Core {
     /// Move the connection to `next`, returning the events that says it: the
     /// [`DeviceEvent::ConnectionChanged`] every transition raises, preceded by
     /// the legacy [`DeviceEvent::Connected`] when a session comes up and
-    /// [`DeviceEvent::Disconnected`] when it goes. Moving between
-    /// [`Connection::Connected`] and [`Connection::Degraded`] is neither.
+    /// [`DeviceEvent::Disconnected`] when it goes.
+    ///
+    /// "Comes up" is the rule Python and Swift apply: a move *to*
+    /// [`Connection::Connected`] from anywhere but [`Connection::Degraded`].
+    /// A control link that merely recovers is not a session coming up, and a
+    /// session that lands already degraded raises no `Connected` either —
+    /// its `ConnectionChanged` says exactly what it is.
     fn transition(&self, st: &mut DeviceState, next: Connection) -> Vec<DeviceEvent> {
         let prev = st.connection;
         if prev == next {
             return Vec::new();
         }
         st.connection = next;
-        let up = |c: Connection| matches!(c, Connection::Connected | Connection::Degraded);
         let mut events = Vec::new();
-        if up(next) && !up(prev) {
+        if next == Connection::Connected && prev != Connection::Degraded {
             events.push(DeviceEvent::Connected);
         }
         if next == Connection::Disconnected {
@@ -699,6 +703,34 @@ impl Core {
 mod tests {
     use super::*;
     use crate::state::Phase;
+
+    /// The legacy `Connected` event follows the rule the other two languages
+    /// hand-write: a session coming up, not a control link recovering, and
+    /// not a session that lands already degraded.
+    #[test]
+    fn the_legacy_connected_event_matches_the_other_languages() {
+        let core = Core::new(ControlPolicy::BestEffort);
+        let mut st = DeviceState::new();
+        // Coming up degraded is not the legacy "connected".
+        assert_eq!(
+            core.transition(&mut st, Connection::Degraded),
+            vec![DeviceEvent::ConnectionChanged(Connection::Degraded)]
+        );
+        // Nor is the control link recovering.
+        assert_eq!(
+            core.transition(&mut st, Connection::Connected),
+            vec![DeviceEvent::ConnectionChanged(Connection::Connected)]
+        );
+        // A reconnect landing is.
+        let _ = core.transition(&mut st, Connection::Reconnecting { attempt: 1 });
+        assert_eq!(
+            core.transition(&mut st, Connection::Connected),
+            vec![
+                DeviceEvent::Connected,
+                DeviceEvent::ConnectionChanged(Connection::Connected)
+            ]
+        );
+    }
 
     /// The request lane hands out what the fold would store: a text reply at
     /// a sensitive address is the placeholder, never the secret.

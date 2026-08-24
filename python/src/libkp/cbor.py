@@ -549,7 +549,10 @@ def control_items(items: list) -> list[ControlItem]:
                     values.append((addr + i, Num(value)))
         elif selector == gen.CBOR_SELECTOR_STRING:
             value = rest[2] if len(rest) > 2 else None
-            if isinstance(value, str) and value:
+            # An empty string is a value like any other: it is how a cleared
+            # tag (a blank rig comment, say) reaches the tree, which could
+            # otherwise never unlearn the old text.
+            if isinstance(value, str):
                 values.append((addr, Text(value)))
         else:
             continue

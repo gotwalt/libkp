@@ -61,6 +61,25 @@
       }
     },
     {
+      "name": "an empty string clears a tag rather than vanishing",
+      "stream_hex": "c1830401664d617a203138c183040160",
+      "expect": {
+        "current_bank": null,
+        "current_rig_slot": null,
+        "morph": null,
+        "strings": [
+          {
+            "addr": 1,
+            "text": "Maz 18"
+          },
+          {
+            "addr": 1,
+            "text": ""
+          }
+        ]
+      }
+    },
+    {
       "name": "the dump carries the morph position alongside the indices",
       "stream_hex": "c183011a0001895d01c183011a0001895e02c183011877193fff",
       "expect": {

@@ -708,9 +708,10 @@ fn walk(items: &[Value], visit: &mut dyn FnMut(Element)) {
             }
         } else if selector == generated::CBOR_SELECTOR_STRING as i128 {
             if let (Some(a), Some(Value::Text(t))) = (addr, rest.get(2)) {
-                if !t.is_empty() {
-                    visit(Element::Text(a, t));
-                }
+                // An empty string is a value like any other: it is how a
+                // cleared tag (a blank rig comment, say) reaches the tree,
+                // which could otherwise never unlearn the old text.
+                visit(Element::Text(a, t));
             }
         }
     }
