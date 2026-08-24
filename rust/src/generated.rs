@@ -49,6 +49,7 @@ pub const CBOR_FILLER_BYTE: u8 = 0xc0;
 pub const STATE_DUMP_TRIGGER_ADDRESS: u32 = 102528;
 pub const STATE_DUMP_TRIGGER_VALUE: i64 = 1;
 pub const DUMP_END_ADDRESS: u32 = 100800;
+pub const DUMP_END_RUNS: usize = 2;
 pub const SENSITIVE_ADDRESSES: [u32; 2] = [200008, 200009];
 pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 

@@ -1017,6 +1017,173 @@ fn check_stream_fixture(name: &str, fixture: &Value) {
     }
 }
 
+/// The `(selector, address)` an item names, a leading source flag skipped;
+/// `None` for anything that is not one of the channel's array shapes.
+fn item_head(item: &cbor::Value) -> Option<(i128, u32)> {
+    let fields = item.as_array()?;
+    let rest = match fields.first().and_then(cbor::Value::as_i128) {
+        Some(n) if n < 0 => &fields[1..],
+        _ => fields,
+    };
+    let selector = rest.first().and_then(cbor::Value::as_i128)?;
+    let address = u32::try_from(rest.get(1).and_then(cbor::Value::as_i128)?).ok()?;
+    Some((selector, address))
+}
+
+/// Assert a `kind: "cbor_stream"` fixture: decode the whole control-channel
+/// stream in one push, then check whichever expectations the fixture carries.
+fn check_cbor_stream_fixture(name: &str, fixture: &Value) {
+    /// The selector of an opaque `[5, addr, bytes]` blob, which the walk ignores.
+    const BLOB: i128 = 5;
+    let single = i128::from(generated::CBOR_SELECTOR_SINGLE);
+    let multi = i128::from(generated::CBOR_SELECTOR_MULTI);
+
+    let raw = unhex(&str_of(fixture, "raw"));
+    let mut decoder = Decoder::new();
+    let items = decoder.push(&raw);
+    let heads: Vec<Option<(i128, u32)>> = items.iter().map(item_head).collect();
+    let expect = &fixture["expected"];
+
+    if let Some(n) = expect.get("item_count").and_then(|v| v.as_u64()) {
+        assert_eq!(items.len() as u64, n, "[{name}] item_count");
+    }
+    if let Some(n) = expect.get("pending").and_then(|v| v.as_u64()) {
+        assert_eq!(decoder.pending() as u64, n, "[{name}] pending");
+    }
+    if let Some(n) = expect.get("filler_bytes").and_then(|v| v.as_u64()) {
+        assert_eq!(decoder.filler_bytes() as u64, n, "[{name}] filler_bytes");
+    }
+    if let Some(n) = expect.get("numeric_count").and_then(|v| v.as_u64()) {
+        assert_eq!(
+            cbor::numeric_values(&items).len() as u64,
+            n,
+            "[{name}] numeric_count"
+        );
+    }
+    if let Some(want) = expect.get("strings").and_then(|v| v.as_array()) {
+        let got = cbor::extract_snapshot(&items).strings;
+        let want: Vec<(u32, String)> = want
+            .iter()
+            .map(|p| {
+                let a = p.as_array().unwrap();
+                (
+                    a[0].as_u64().unwrap() as u32,
+                    a[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "[{name}] strings");
+    }
+
+    if let Some(n) = expect.get("blob_count").and_then(|v| v.as_u64()) {
+        let blobs: Vec<&cbor::Value> = items
+            .iter()
+            .zip(&heads)
+            .filter(|(_, head)| matches!(head, Some((BLOB, _))))
+            .map(|(item, _)| item)
+            .collect();
+        assert_eq!(blobs.len() as u64, n, "[{name}] blob_count");
+        for blob in blobs {
+            // A blob is opaque to the walk: it yields nothing.
+            let alone = std::slice::from_ref(blob);
+            assert!(
+                cbor::numeric_values(alone).is_empty(),
+                "[{name}] a blob yielded a numeric"
+            );
+            assert!(
+                cbor::extract_snapshot(alone).strings.is_empty(),
+                "[{name}] a blob yielded a string"
+            );
+        }
+    }
+    if let Some(live) = expect.get("live_items").and_then(|v| v.as_object()) {
+        for (address, count) in live {
+            let address: u32 = address.parse().expect("a decimal address");
+            let got = heads
+                .iter()
+                .filter(|head| **head == Some((single, address)))
+                .count();
+            assert_eq!(
+                got as u64,
+                count.as_u64().unwrap(),
+                "[{name}] live items at {address}"
+            );
+        }
+    }
+    if let Some(n) = expect.get("dump_end_index").and_then(|v| v.as_u64()) {
+        let end = heads
+            .iter()
+            .rposition(|head| *head == Some((multi, generated::DUMP_END_ADDRESS)))
+            .unwrap_or_else(|| panic!("[{name}] no run based at DUMP_END_ADDRESS"));
+        assert_eq!(end as u64, n, "[{name}] dump_end_index");
+    }
+
+    if let Some(st) = expect.get("state") {
+        // Fold item by item so the numerics and the strings land in document
+        // order, each through the control path.
+        let mut state = DeviceState::new();
+        for item in &items {
+            let alone = std::slice::from_ref(item);
+            for (address, value) in cbor::numeric_values(alone) {
+                state.apply_cbor(address, value);
+            }
+            for (address, text) in cbor::extract_snapshot(alone).strings {
+                state.apply_cbor_text(address, &text);
+            }
+        }
+        if let Some(v) = st.get("rig_name") {
+            assert_eq!(state.rig.name.as_deref(), v.as_str(), "[{name}] rig_name");
+        }
+        if let Some(v) = st.get("amp_name") {
+            assert_eq!(state.amp.name.as_deref(), v.as_str(), "[{name}] amp_name");
+        }
+        if let Some(v) = st.get("cab_name") {
+            assert_eq!(
+                state.cabinet.name.as_deref(),
+                v.as_str(),
+                "[{name}] cab_name"
+            );
+        }
+        if let Some(v) = st.get("current_bank") {
+            let want = v.as_u64().map(|b| b as u16);
+            assert_eq!(state.current_bank, want, "[{name}] current_bank");
+        }
+        if let Some(v) = st.get("current_rig_slot") {
+            let want = v.as_u64().map(|s| s as u16);
+            assert_eq!(state.current_rig_slot, want, "[{name}] current_rig_slot");
+        }
+        if let Some(v) = st.get("morph") {
+            let want = v.as_u64().map(|m| m as u16);
+            assert_eq!(state.morph, want, "[{name}] morph");
+        }
+        if let Some(slots) = st.get("bank").and_then(|v| v.as_array()) {
+            assert_eq!(slots.len(), generated::BANK_SLOTS, "[{name}] bank slots");
+            for (i, slot) in slots.iter().enumerate() {
+                let got = &state.bank.slots[i];
+                assert_eq!(
+                    got.rig_name.as_deref(),
+                    slot["rig_name"].as_str(),
+                    "[{name}] bank slot {i} rig_name"
+                );
+                assert_eq!(
+                    got.amp_name.as_deref(),
+                    slot["amp_name"].as_str(),
+                    "[{name}] bank slot {i} amp_name"
+                );
+                assert_eq!(
+                    got.cabinet_name.as_deref(),
+                    slot["cab_name"].as_str(),
+                    "[{name}] bank slot {i} cab_name"
+                );
+            }
+        }
+        if let Some(raw) = st.get("status_raw").and_then(|v| v.as_array()) {
+            let want: Vec<u16> = raw.iter().map(|x| x.as_u64().unwrap() as u16).collect();
+            assert_eq!(state.status.raw.to_vec(), want, "[{name}] status_raw");
+        }
+    }
+}
+
 #[test]
 fn replay_capture_fixtures() {
     let dir = spec_dir().join("captures");
@@ -1042,6 +1209,7 @@ fn replay_capture_fixtures() {
         match kind.as_str() {
             "discovery" => check_discovery_fixture(&name, &fixture),
             "midi3_stream" => check_stream_fixture(&name, &fixture),
+            "cbor_stream" => check_cbor_stream_fixture(&name, &fixture),
             other => panic!("manifest lists an unknown fixture kind {other:?}"),
         }
     }

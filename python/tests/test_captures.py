@@ -13,10 +13,10 @@ import pytest
 from conftest import CAPTURES_DIR, load_json
 
 from libkp import _generated as gen
-from libkp import midi3
+from libkp import cbor, midi3
 from libkp.nrpn import NrpnHeader
 from libkp.protocol import TagStream
-from libkp.state import DeviceState
+from libkp.state import DeviceState, Num, Text
 
 MANIFEST = load_json(CAPTURES_DIR / "manifest.json")
 FIXTURES = MANIFEST["fixtures"]
@@ -38,7 +38,7 @@ def test_manifest_lists_existing_fixtures():
     assert FIXTURES, "the capture manifest is empty"
     for entry in FIXTURES:
         assert (CAPTURES_DIR / entry["file"]).is_file(), entry["file"]
-        assert entry["kind"] in {"discovery", "midi3_stream"}
+        assert entry["kind"] in {"discovery", "midi3_stream", "cbor_stream"}
 
 
 # ---------------------------------------------------------------------------
@@ -165,3 +165,138 @@ def test_midi3_stream_survives_arbitrary_chunking(entry):
     for i in range(0, len(raw), step):
         chunked.extend(unframer.push(raw[i : i + step]))
     assert chunked == whole
+
+
+# ---------------------------------------------------------------------------
+# kind: cbor_stream
+# ---------------------------------------------------------------------------
+
+_CBOR_STREAMS = _fixtures_of("cbor_stream")
+
+
+def _decode(fixture: dict) -> tuple[list, cbor.Decoder]:
+    decoder = cbor.Decoder()
+    items = decoder.push(bytes.fromhex(fixture["raw"]))
+    return items, decoder
+
+
+def _item_head(item: object) -> tuple[int, int] | None:
+    """The ``(selector, address)`` an item names, a leading source flag skipped;
+    ``None`` for anything that is not one of the channel's array shapes."""
+    fields = cbor._as_array(item)
+    if not fields:
+        return None
+    first = cbor._as_int(fields[0])
+    rest = fields[1:] if first is not None and first < 0 else fields
+    selector = cbor._as_int(rest[0]) if rest else None
+    address = cbor._as_int(rest[1]) if len(rest) > 1 else None
+    if selector is None or address is None:
+        return None
+    return selector, address
+
+
+@pytest.mark.parametrize("entry", _CBOR_STREAMS, ids=_ids(_CBOR_STREAMS))
+def test_cbor_stream_decodes(entry):
+    fixture = _load(entry)
+    expected = fixture["expected"]
+    items, decoder = _decode(fixture)
+
+    if "item_count" in expected:
+        assert len(items) == expected["item_count"]
+    if "pending" in expected:
+        assert decoder.pending() == expected["pending"]
+    if "filler_bytes" in expected:
+        assert decoder.filler_bytes() == expected["filler_bytes"]
+    if "numeric_count" in expected:
+        assert len(cbor.numeric_values(items)) == expected["numeric_count"]
+    if "strings" in expected:
+        got = [
+            [address, decoded.text]
+            for item in cbor.control_items(items)
+            for address, decoded in item.values
+            if isinstance(decoded, Text)
+        ]
+        assert got == expected["strings"]
+
+
+@pytest.mark.parametrize("entry", _CBOR_STREAMS, ids=_ids(_CBOR_STREAMS))
+def test_cbor_stream_item_shapes(entry):
+    """The blobs, the live singles and the run that closes the dump, by index."""
+    fixture = _load(entry)
+    expected = fixture["expected"]
+    items, _decoder = _decode(fixture)
+    heads = [_item_head(item) for item in items]
+
+    if "blob_count" in expected:
+        blobs = sum(1 for head in heads if head is not None and head[0] == 5)
+        assert blobs == expected["blob_count"]
+        # A blob is opaque to the walk: every other item is one of the three
+        # value-bearing shapes, so the walk yields exactly the rest.
+        assert len(cbor.control_items(items)) == len(items) - blobs
+    if "live_items" in expected:
+        for address, count in expected["live_items"].items():
+            got = sum(1 for head in heads if head == (gen.CBOR_SELECTOR_SINGLE, int(address)))
+            assert got == count, f"live items at {address}"
+    if "dump_end_index" in expected:
+        ends = [
+            i
+            for i, head in enumerate(heads)
+            if head == (gen.CBOR_SELECTOR_MULTI, gen.DUMP_END_ADDRESS)
+        ]
+        assert ends, "no run based at DUMP_END_ADDRESS"
+        assert ends[-1] == expected["dump_end_index"]
+
+
+@pytest.mark.parametrize("entry", _CBOR_STREAMS, ids=_ids(_CBOR_STREAMS))
+def test_cbor_stream_state(entry):
+    fixture = _load(entry)
+    expected = fixture["expected"].get("state")
+    if not expected:
+        pytest.skip("fixture declares no state expectations")
+
+    items, _decoder = _decode(fixture)
+    state = DeviceState()
+    for item in cbor.control_items(items):
+        for address, decoded in item.values:
+            if isinstance(decoded, Num):
+                state.apply_cbor(address, decoded.value)
+            else:
+                state.apply_cbor_text(address, decoded.text)
+
+    if "rig_name" in expected:
+        assert state.rig.name == expected["rig_name"]
+    if "amp_name" in expected:
+        assert state.amp.name == expected["amp_name"]
+    if "cab_name" in expected:
+        assert state.cabinet.name == expected["cab_name"]
+    if "current_bank" in expected:
+        assert state.current_bank == expected["current_bank"]
+    if "current_rig_slot" in expected:
+        assert state.current_rig_slot == expected["current_rig_slot"]
+    if "morph" in expected:
+        assert state.morph == expected["morph"]
+    if "bank" in expected:
+        got = [
+            {"rig_name": s.rig_name, "amp_name": s.amp_name, "cab_name": s.cabinet_name}
+            for s in state.bank.slots
+        ]
+        assert got == expected["bank"]
+    if "status_raw" in expected:
+        assert list(state.status.raw) == expected["status_raw"]
+        assert len(expected["status_raw"]) == gen.METER_COUNT
+
+
+@pytest.mark.parametrize("entry", _CBOR_STREAMS, ids=_ids(_CBOR_STREAMS))
+def test_cbor_stream_survives_arbitrary_chunking(entry):
+    """Splitting the stream at a non-item boundary must not change the decode."""
+    fixture = _load(entry)
+    raw = bytes.fromhex(fixture["raw"])
+    whole, _decoder = _decode(fixture)
+
+    decoder = cbor.Decoder()
+    chunked: list = []
+    step = 7  # small enough to split every multi-byte head and run
+    for i in range(0, len(raw), step):
+        chunked.extend(decoder.push(raw[i : i + step]))
+    assert chunked == whole
+    assert decoder.pending() == 0
