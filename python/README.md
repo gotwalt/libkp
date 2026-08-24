@@ -110,13 +110,23 @@ from libkp import DeviceModel, find_first
 
 async def main():
     reply = await find_first()  # UDP broadcast discovery
+    # A bare connect is the whole session: the stream, its read-only sync
+    # burst, and the control link that carries the morph position.
     async with await DeviceModel.connect(reply.ip) as model:
         snapshots = model.subscribe()  # coalesced state snapshots
         state = await snapshots.get()
-        print(state.rig.name, state.amp.name, state.status.loudness)
+        print(state.connection.value, state.rig.name, state.morph)
 
-        await model.set_effect_enabled("REV", False)  # a tracked parameter
+        # A tracked parameter, then the read-back that confirms it: the device
+        # applies a write silently, and request_param returns what it now holds.
+        await model.set_effect_enabled("REV", False)
+        rev_on = await model.request_param(0x3D, 3)  # 0
+
         await model.tap_tempo()  # a momentary action
+        model.step_rig(1)  # aim at the next rig; the Navigator loads it
+
+        state = await snapshots.get()
+        print(state.navigation.aim, state.aimed_rig_index)
 
 
 asyncio.run(main())

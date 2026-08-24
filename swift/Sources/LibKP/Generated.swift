@@ -327,7 +327,7 @@ public enum Generated {
         NonEffectKey(0x96, 13): "Bank Cabinet Name",
         NonEffectKey(0x96, 14): "Bank Cabinet Name",
     ]
-    public static let stringTags: [UInt8: String] = [1: "Rig Name", 2: "Rig Author", 3: "Rig Creation Date", 4: "Rig Comment", 10: "Amp Name", 11: "Amp Author", 14: "Amp Location", 15: "Amp Manufacturer", 16: "Amp Comment", 18: "Amp Model", 19: "Amp Channel", 20: "Pickup Type", 21: "Year of Production", 32: "Cabinet Name", 33: "Cabinet Author", 36: "Cabinet Location", 37: "Cabinet Manufacturer", 38: "Microphone Model", 39: "Cabinet Comment", 40: "Microphone Position", 41: "Speaker Configuration", 42: "Cabinet Model", 44: "Speaker Manufacturer", 45: "Speaker Model"]
+    public static let stringTags: [UInt8: String] = [1: "Rig Name", 2: "Rig Author", 3: "Rig Creation Date", 4: "Rig Comment", 16: "Amp Name", 17: "Amp Author", 18: "Amp Creation Date", 20: "Amp Location", 21: "Amp Manufacturer", 22: "Amp Comment", 24: "Amp Model", 25: "Amp Channel", 26: "Pickup Type", 27: "Year of Production", 32: "Cabinet Name", 33: "Cabinet Author", 36: "Cabinet Location", 37: "Cabinet Manufacturer", 38: "Microphone Model", 39: "Cabinet Comment", 40: "Microphone Position", 41: "Speaker Configuration", 42: "Cabinet Model", 44: "Speaker Manufacturer", 45: "Speaker Model"]
     public static let page0Numeric: [UInt8: String] = [0x50: "Morph Button", 0x77: "Morph Position"]
     public static let effectTypes: [UInt16: String] = [
         0: "empty",

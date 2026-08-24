@@ -28,18 +28,20 @@ The protocol is documented in [`docs/`](docs/):
 3. [Handshake](docs/03-handshake.md) — the TCP GUID negotiation
 4. [MIDI3 framing](docs/04-midi3-framing.md)
 5. [SysEx / NRPN dialect](docs/05-sysex-nrpn.md)
-6. [The CBOR channel](docs/06-cbor-channel.md) — the current bank/rig snapshot
+6. [The CBOR channel](docs/06-cbor-channel.md) — the model's control link: the state dump and the morph
 7. [Realtime status & meters](docs/07-realtime-status.md)
-8. [Control model](docs/08-control-model.md) — CC vs NRPN vs the device model
+8. [Control model](docs/08-control-model.md) — CC vs NRPN, the device model, and the Navigator
 9. [Parameter registry](docs/09-parameter-registry.md)
 10. [Versioning & compatibility](docs/10-versioning-and-compatibility.md)
+11. [Channels and data paths](docs/11-channels-and-data-paths.md) — the design record: both channels, one model, and the measurements behind it
 
 ## How the three implementations stay compatible
 
 Everything derives from one source of truth in [`spec/`](spec/):
 
 - **`spec/*.toml`** — the transport constants, parameter maps, effect types, the
-  control vocabulary, and the meter block.
+  control vocabulary, the meter block, the state routing table, and the pacing
+  the model applies on the device's behalf.
 - **`codegen/generate.py`** turns the spec into a *data-only* module for each
   language (`generated.rs`, `_generated.py`, `Generated.swift`). CI fails if a
   committed module drifts from the spec, so the constant tables are provably
@@ -57,12 +59,19 @@ See [docs/10](docs/10-versioning-and-compatibility.md) for the full mechanism.
 
 ## Status
 
-`libkp` implements the fully-validated MIDI3 surface: discovery, session,
-framing, NRPN read/write, CC control, the realtime meter/tuner decode, a typed
-parameter registry, and an observable device model. It also speaks the device's
-native CBOR channel for one purpose — the state-dump snapshot that reads the
-current bank and rig (docs/06); the channel's wider management grammar is not
-implemented.
+`libkp` implements the validated MIDI3 surface — discovery, session, framing,
+NRPN read/write, CC control, the realtime meter/tuner decode, a typed parameter
+registry — and an observable device model that is the only object holding a
+socket to the device. The model owns two links: the MIDI3 stream, and the
+device's native CBOR channel as a read-only control link whose state dump and
+live pushes fold into the same state tree (that is where the morph position
+comes from). Every request is answered or timed out through a paced request
+lane; every rig load goes through a Navigator that keeps loads from
+overlapping; every socket passes a connection ledger that spaces opens to one
+device; reconnecting is an opt-in policy. The CBOR channel's wider management
+grammar is not implemented, and by construction nothing in the library can send
+it. The design and the measurements behind it are in
+[docs/11](docs/11-channels-and-data-paths.md).
 
 ## Attribution
 

@@ -87,8 +87,9 @@ reject_prefix = "-"
 session_preamble_len = 8
 
 [protocols]
-# The protocol GUIDs the device offers. Only the MIDI3 stream is implemented in
-# libkp; the CBOR channel is documented (docs/06) but not implemented.
+# The protocol GUIDs the device offers. libkp speaks two of them — the MIDI3
+# stream and the CBOR control channel, as the model's two links (docs/11); the
+# other two are named and never opened.
 midi3_stream    = "{369F50E7-750B-459A-BAEE-85ADD3F3798D}"  # bidirectional MIDI3: meters + request/reply/control
 request_response = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}" # accepts; sends an 11-byte token on open
 cbor_control    = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"  # native CBOR (Protocol3): the state-dump snapshot route

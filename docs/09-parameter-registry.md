@@ -213,11 +213,13 @@ string_tag_name(99)  →  null
 ```
 
 The string tags cover rig, amp and cabinet metadata: name, author, creation
-date, comment, manufacturer, model, microphone, speaker. The numeric side of
-page 0 is sparse — its members are number `$50`, the **Morph Button**, and
-number `$77`, the **Morph Position**. Number `$0B` is *not* the morph: it reads
-a constant 0 whether the rig is morphed or at base. See
-[the morph](05-sysex-nrpn.md#the-morph).
+date, comment, manufacturer, model, microphone, speaker. The state tree reads
+the three names at the `[well_known]` keys — the rig's at `$01`, the amp's at
+`$10`, the cabinet's at `$20`; see [the string tags](05-sysex-nrpn.md#the-string-tags).
+The numeric side of page 0 is sparse — its members are number `$50`, the
+**Morph Button**, and number `$77`, the **Morph Position**. Number `$0B` is
+*not* the morph: it reads a constant 0 whether the rig is morphed or at base.
+See [the morph](05-sysex-nrpn.md#the-morph).
 
 ## State routing
 
@@ -253,9 +255,12 @@ Untracked addresses have no row: the stream still reports them as a generic
 `text` address is untracked.
 
 Like everything else the generator emits, the table is data only. The fold that
-turns a route into a store write is hand-written per language and held to
-[`../spec/vectors/state.json`](../spec/vectors/state.json) and
-[`../spec/vectors/cbor.json`](../spec/vectors/cbor.json).
+turns a route into a store write is hand-written per language — its eight
+rules are set out in [Channels and data paths](11-channels-and-data-paths.md#the-fold)
+— and held to [`../spec/vectors/state.json`](../spec/vectors/state.json), whose
+`steps` cases drive it with transport-tagged updates from both wires,
+[`../spec/vectors/cbor.json`](../spec/vectors/cbor.json), and the sanitized
+CBOR state dump replayed from [`../spec/captures`](../spec/captures).
 
 ## Where the data comes from
 
