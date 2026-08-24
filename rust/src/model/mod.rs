@@ -130,7 +130,7 @@ use tokio::sync::broadcast;
 
 use crate::control::{self, Control};
 use crate::error::SessionError;
-use crate::generated::{self, Field};
+use crate::generated::{self, Refresh};
 use crate::nrpn::{
     self, request_extended_param, request_extended_string, request_rendered_string, request_single,
     request_string, set_single,
@@ -804,22 +804,10 @@ impl DeviceModel {
     }
 
     /// The rig subset of [`refresh`](Self::refresh): the rig strings and every
-    /// effect slot's Type and On/Off. Read-only.
+    /// effect slot's Type and On/Off — the rows `spec/state.toml` marks
+    /// `refresh = "rig"`. Read-only.
     pub async fn refresh_rig(&self) -> Result<(), RequestError> {
-        lane::refresh(&self.handle.shared, |row| {
-            matches!(
-                row.field,
-                Field::RigName
-                    | Field::RigAuthor
-                    | Field::RigDate
-                    | Field::RigComment
-                    | Field::AmpName
-                    | Field::CabinetName
-                    | Field::EffectType
-                    | Field::EffectOn
-            )
-        })
-        .await
+        lane::refresh(&self.handle.shared, |row| row.refresh == Some(Refresh::Rig)).await
     }
 
     /// The bank subset of [`refresh`](Self::refresh): the current bank's
@@ -829,10 +817,7 @@ impl DeviceModel {
     /// controller need only call this once at connect.
     pub async fn refresh_bank(&self) -> Result<(), RequestError> {
         lane::refresh(&self.handle.shared, |row| {
-            matches!(
-                row.field,
-                Field::BankRigName | Field::BankAmpName | Field::BankCabinetName
-            )
+            row.refresh == Some(Refresh::Bank)
         })
         .await
     }
@@ -847,7 +832,7 @@ impl DeviceModel {
     /// caused it.
     pub async fn refresh_position(&self) -> Result<(), RequestError> {
         lane::refresh(&self.handle.shared, |row| {
-            matches!(row.field, Field::CurrentBank | Field::CurrentRigSlot)
+            row.refresh == Some(Refresh::Position)
         })
         .await
     }

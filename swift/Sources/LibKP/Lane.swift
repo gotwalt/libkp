@@ -157,14 +157,10 @@ extension DeviceModel {
     }
 
     /// Re-request the rig strings and every effect slot's Type/State — the
-    /// subset of ``refresh()`` a rig load changes.
+    /// subset of ``refresh()`` a rig load changes: the rows `spec/state.toml`
+    /// marks `refresh = "rig"`.
     public func refreshRig() async throws {
-        let fields: Set<Route.Field> = [
-            .rigName, .rigAuthor, .rigDate, .rigComment, .ampName, .cabinetName, .effectType,
-            .effectOn,
-        ]
-        try await request(
-            rows: Generated.stateRoutes.filter { $0.request && fields.contains($0.field) })
+        try await request(rows: Generated.stateRoutes.filter { $0.refresh == .rig })
     }
 
     /// Request the current bank's five-slot name preview (rig / amp / cabinet
@@ -173,9 +169,7 @@ extension DeviceModel {
     /// bank change, so a controller need only call this once at connect —
     /// which ``SyncStrategy/streamBurst`` already does.
     public func refreshBank() async throws {
-        let fields: Set<Route.Field> = [.bankRigName, .bankAmpName, .bankCabinetName]
-        try await request(
-            rows: Generated.stateRoutes.filter { $0.request && fields.contains($0.field) })
+        try await request(rows: Generated.stateRoutes.filter { $0.refresh == .bank })
     }
 
     /// Ask the device where it is: the current bank and rig slot, as two `$46`
@@ -186,9 +180,7 @@ extension DeviceModel {
     /// pushes an unsolicited `$06` for whichever of the two changed on every
     /// subsequent rig change, whoever caused it.
     public func refreshPosition() async throws {
-        let fields: Set<Route.Field> = [.currentBank, .currentRigSlot]
-        try await request(
-            rows: Generated.stateRoutes.filter { $0.request && fields.contains($0.field) })
+        try await request(rows: Generated.stateRoutes.filter { $0.refresh == .position })
     }
 
     /// Issue every row's request through the lane, in the order given — the

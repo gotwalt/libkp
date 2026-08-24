@@ -554,34 +554,62 @@ impl StateSnapshot {
 /// [`is_sensitive`] says so, whether or not the tree tracks them: the snapshot
 /// is a reader's view of the dump, not of the tree.
 pub fn extract_snapshot(items: &[Value]) -> StateSnapshot {
-    let mut scratch = DeviceState::new();
-    let mut strings = Vec::new();
-    walk(items, &mut |element| match element {
-        Element::Numeric(addr, value) => {
-            // A negative or oversized address is malformed, not an address to
-            // wrap into a plausible-looking one.
-            if let (Ok(a), Ok(v)) = (u32::try_from(addr), i64::try_from(value)) {
-                scratch.apply_cbor(a, v);
+    let mut folder = SnapshotFolder::default();
+    folder.fold(items);
+    folder.snapshot()
+}
+
+/// The incremental form of [`extract_snapshot`]: fold each chunk as it
+/// arrives and read the snapshot off at the end. [`StateSnapshot::fetch`]
+/// polls for completeness after every read, and re-walking everything
+/// received so far on each poll would make the read quadratic in the dump.
+#[derive(Default)]
+struct SnapshotFolder {
+    scratch: DeviceState,
+    strings: Vec<(u32, String)>,
+}
+
+impl SnapshotFolder {
+    fn fold(&mut self, items: &[Value]) {
+        let scratch = &mut self.scratch;
+        let strings = &mut self.strings;
+        walk(items, &mut |element| match element {
+            Element::Numeric(addr, value) => {
+                // A negative or oversized address is malformed, not an
+                // address to wrap into a plausible-looking one.
+                if let (Ok(a), Ok(v)) = (u32::try_from(addr), i64::try_from(value)) {
+                    scratch.apply_cbor(a, v);
+                }
             }
+            Element::Text(addr, text) => {
+                let Ok(a) = u32::try_from(addr) else {
+                    return;
+                };
+                scratch.apply_cbor_text(a, text);
+                let text = if is_sensitive(a) {
+                    generated::REDACTED_PLACEHOLDER.to_string()
+                } else {
+                    text.to_string()
+                };
+                strings.push((a, text));
+            }
+        });
+    }
+
+    /// [`StateSnapshot::is_complete`], without building the snapshot.
+    fn is_complete(&self) -> bool {
+        self.scratch.current_bank.is_some()
+            && self.scratch.current_rig_slot.is_some()
+            && self.scratch.morph.is_some()
+    }
+
+    fn snapshot(&self) -> StateSnapshot {
+        StateSnapshot {
+            current_bank: self.scratch.current_bank,
+            current_rig_slot: self.scratch.current_rig_slot,
+            morph: self.scratch.morph,
+            strings: self.strings.clone(),
         }
-        Element::Text(addr, text) => {
-            let Ok(a) = u32::try_from(addr) else {
-                return;
-            };
-            scratch.apply_cbor_text(a, text);
-            let text = if is_sensitive(a) {
-                generated::REDACTED_PLACEHOLDER.to_string()
-            } else {
-                text.to_string()
-            };
-            strings.push((a, text));
-        }
-    });
-    StateSnapshot {
-        current_bank: scratch.current_bank,
-        current_rig_slot: scratch.current_rig_slot,
-        morph: scratch.morph,
-        strings,
     }
 }
 
@@ -745,13 +773,14 @@ impl StateSnapshot {
     ) -> Result<StateSnapshot, SessionError> {
         let idle = Duration::from_millis(30);
         let mut link = ControlLink::open(ip, port, idle).await?;
-        let mut items = Vec::new();
+        let mut folder = SnapshotFolder::default();
 
-        // The trigger went out with the open; read until every value the
-        // snapshot wants has landed or the deadline passes.
+        // The trigger went out with the open; fold each read as it lands —
+        // never re-walking what came before — until every value the snapshot
+        // wants is known or the deadline passes.
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if extract_snapshot(&items).is_complete() {
+            if folder.is_complete() {
                 break;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -759,12 +788,12 @@ impl StateSnapshot {
                 break;
             }
             match link.read(idle.min(remaining)).await {
-                Ok(chunk) => items.extend(chunk),
+                Ok(chunk) => folder.fold(&chunk),
                 Err(SessionError::Closed) => break,
                 Err(e) => return Err(e),
             }
         }
-        Ok(extract_snapshot(&items))
+        Ok(folder.snapshot())
     }
 }
 

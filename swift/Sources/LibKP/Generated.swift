@@ -450,77 +450,77 @@ public enum Generated {
     ]
     /// The state routing table, sorted by address (spec/state.toml).
     public static let stateRoutes: [Route] = [
-        Route(address: 1, field: .rigName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 2, field: .rigAuthor, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 3, field: .rigDate, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 4, field: .rigComment, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 16, field: .ampName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 32, field: .cabinetName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 80, field: .morphButton, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 119, field: .morphPosition, slot: nil, kind: .u14, lane: .slow, wire: .control, dedupe: true, request: false),
-        Route(address: 512, field: .tempoBpm, slot: nil, kind: .bpm, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 513, field: .rigVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 1282, field: .ampOn, slot: nil, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 1284, field: .ampGain, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 1538, field: .cabinetOn, slot: nil, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 6400, field: .effectType, slot: 0, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6403, field: .effectOn, slot: 0, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6404, field: .effectMix, slot: 0, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 6528, field: .effectType, slot: 1, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6531, field: .effectOn, slot: 1, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6532, field: .effectMix, slot: 1, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 6656, field: .effectType, slot: 2, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6659, field: .effectOn, slot: 2, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6660, field: .effectMix, slot: 2, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 6784, field: .effectType, slot: 3, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6787, field: .effectOn, slot: 3, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 6788, field: .effectMix, slot: 3, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 7168, field: .effectType, slot: 4, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7171, field: .effectOn, slot: 4, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7172, field: .effectMix, slot: 4, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 7424, field: .effectType, slot: 5, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7427, field: .effectOn, slot: 5, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7428, field: .effectMix, slot: 5, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 7680, field: .effectType, slot: 6, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7683, field: .effectOn, slot: 6, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7684, field: .effectMix, slot: 6, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 7808, field: .effectType, slot: 7, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7811, field: .effectOn, slot: 7, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 7812, field: .effectMix, slot: 7, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false),
-        Route(address: 15872, field: .beatPulse, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15887, field: .tunerDeviance, slot: nil, kind: .u14, lane: .fast, wire: .stream, dedupe: true, request: false),
-        Route(address: 15950, field: .status, slot: 0, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15951, field: .status, slot: 1, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15952, field: .status, slot: 2, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15953, field: .status, slot: 3, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15954, field: .status, slot: 4, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15955, field: .status, slot: 5, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15956, field: .status, slot: 6, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15957, field: .status, slot: 7, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15958, field: .status, slot: 8, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15959, field: .status, slot: 9, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 15960, field: .status, slot: 10, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false),
-        Route(address: 16084, field: .tunerNote, slot: nil, kind: .u7, lane: .slow, wire: .stream, dedupe: true, request: false),
-        Route(address: 16256, field: .mainVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 16257, field: .headphoneVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 16258, field: .monitorVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19200, field: .bankRigName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19201, field: .bankRigName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19202, field: .bankRigName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19203, field: .bankRigName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19204, field: .bankRigName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19205, field: .bankAmpName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19206, field: .bankAmpName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19207, field: .bankAmpName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19208, field: .bankAmpName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19209, field: .bankAmpName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19210, field: .bankCabinetName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19211, field: .bankCabinetName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19212, field: .bankCabinetName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19213, field: .bankCabinetName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 19214, field: .bankCabinetName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 100701, field: .currentBank, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 100702, field: .currentRigSlot, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 1, field: .rigName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 2, field: .rigAuthor, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 3, field: .rigDate, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 4, field: .rigComment, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 16, field: .ampName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 32, field: .cabinetName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 80, field: .morphButton, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 119, field: .morphPosition, slot: nil, kind: .u14, lane: .slow, wire: .control, dedupe: true, request: false, refresh: nil),
+        Route(address: 512, field: .tempoBpm, slot: nil, kind: .bpm, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 513, field: .rigVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 1282, field: .ampOn, slot: nil, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 1284, field: .ampGain, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 1538, field: .cabinetOn, slot: nil, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 6400, field: .effectType, slot: 0, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6403, field: .effectOn, slot: 0, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6404, field: .effectMix, slot: 0, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 6528, field: .effectType, slot: 1, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6531, field: .effectOn, slot: 1, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6532, field: .effectMix, slot: 1, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 6656, field: .effectType, slot: 2, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6659, field: .effectOn, slot: 2, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6660, field: .effectMix, slot: 2, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 6784, field: .effectType, slot: 3, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6787, field: .effectOn, slot: 3, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 6788, field: .effectMix, slot: 3, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 7168, field: .effectType, slot: 4, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7171, field: .effectOn, slot: 4, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7172, field: .effectMix, slot: 4, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 7424, field: .effectType, slot: 5, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7427, field: .effectOn, slot: 5, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7428, field: .effectMix, slot: 5, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 7680, field: .effectType, slot: 6, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7683, field: .effectOn, slot: 6, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7684, field: .effectMix, slot: 6, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 7808, field: .effectType, slot: 7, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7811, field: .effectOn, slot: 7, kind: .bool, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .rig),
+        Route(address: 7812, field: .effectMix, slot: 7, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: false, refresh: nil),
+        Route(address: 15872, field: .beatPulse, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15887, field: .tunerDeviance, slot: nil, kind: .u14, lane: .fast, wire: .stream, dedupe: true, request: false, refresh: nil),
+        Route(address: 15950, field: .status, slot: 0, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15951, field: .status, slot: 1, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15952, field: .status, slot: 2, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15953, field: .status, slot: 3, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15954, field: .status, slot: 4, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15955, field: .status, slot: 5, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15956, field: .status, slot: 6, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15957, field: .status, slot: 7, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15958, field: .status, slot: 8, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15959, field: .status, slot: 9, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 15960, field: .status, slot: 10, kind: .multi, lane: .fast, wire: .stream, dedupe: false, request: false, refresh: nil),
+        Route(address: 16084, field: .tunerNote, slot: nil, kind: .u7, lane: .slow, wire: .stream, dedupe: true, request: false, refresh: nil),
+        Route(address: 16256, field: .mainVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 16257, field: .headphoneVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 16258, field: .monitorVolume, slot: nil, kind: .u14, lane: .slow, wire: .both, dedupe: true, request: true, refresh: nil),
+        Route(address: 19200, field: .bankRigName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19201, field: .bankRigName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19202, field: .bankRigName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19203, field: .bankRigName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19204, field: .bankRigName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19205, field: .bankAmpName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19206, field: .bankAmpName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19207, field: .bankAmpName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19208, field: .bankAmpName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19209, field: .bankAmpName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19210, field: .bankCabinetName, slot: 0, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19211, field: .bankCabinetName, slot: 1, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19212, field: .bankCabinetName, slot: 2, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19213, field: .bankCabinetName, slot: 3, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 19214, field: .bankCabinetName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
+        Route(address: 100701, field: .currentBank, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .position),
+        Route(address: 100702, field: .currentRigSlot, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .position),
     ]
 }
 
@@ -602,6 +602,14 @@ public struct Route: Hashable, Sendable {
         case both = "both"
     }
 
+    /// The targeted-refresh group a `request = true` row belongs to, if any:
+    /// the subset `refreshRig()` / `refreshBank()` / `refreshPosition()` re-asks.
+    public enum Refresh: String, CaseIterable, Hashable, Sendable {
+        case rig = "rig"
+        case bank = "bank"
+        case position = "position"
+    }
+
     public let address: UInt32
     public let field: Field
     /// The per-slot index for expanded rows: effect slot, bank-preview slot, or
@@ -612,12 +620,14 @@ public struct Route: Hashable, Sendable {
     public let wire: Wire
     public let dedupe: Bool
     public let request: Bool
+    public let refresh: Refresh?
     public init(
         address: UInt32, field: Field, slot: UInt8?, kind: Kind, lane: Lane, wire: Wire,
-        dedupe: Bool, request: Bool
+        dedupe: Bool, request: Bool, refresh: Refresh? = nil
     ) {
         self.address = address; self.field = field; self.slot = slot; self.kind = kind
         self.lane = lane; self.wire = wire; self.dedupe = dedupe; self.request = request
+        self.refresh = refresh
     }
 }
 
