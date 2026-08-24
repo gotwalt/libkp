@@ -14,6 +14,10 @@ public enum Generated {
     public static let reconnectDelayMs: UInt64 = 4000
     public static let reconnectMaxDelayMs: UInt64 = 30000
     public static let controlReopenMinGapMs: UInt64 = 30000
+    public static let rigLoadSettleMs: UInt64 = 500
+    public static let pendingWindowMs: UInt64 = 1500
+    public static let rigLoadControllers: [UInt8] = [48, 49, 50, 51, 52, 53, 54]
+    public static let handshakeTimeoutMs: UInt64 = 2000
     public static let discoveryHeader: String = "DSCV"
     public static let pollIntervalMs: UInt64 = 500
     public static let pollMacPrefix: String = "MAC#"
@@ -108,7 +112,7 @@ public enum Generated {
     public static let stringRigAuthor: UInt8 = 0x02
     public static let stringRigDate: UInt8 = 0x03
     public static let stringRigComment: UInt8 = 0x04
-    public static let stringAmpName: UInt8 = 0x0a
+    public static let stringAmpName: UInt8 = 0x10
     public static let stringCabinetName: UInt8 = 0x20
     public static let cabinetPage: UInt8 = 0x0c
     public static let cabinetOnNumber: UInt8 = 0x02
@@ -449,7 +453,7 @@ public enum Generated {
         Route(address: 2, field: .rigAuthor, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
         Route(address: 3, field: .rigDate, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
         Route(address: 4, field: .rigComment, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
-        Route(address: 10, field: .ampName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
+        Route(address: 16, field: .ampName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
         Route(address: 32, field: .cabinetName, slot: nil, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true),
         Route(address: 80, field: .morphButton, slot: nil, kind: .bool, lane: .fast, wire: .stream, dedupe: false, request: false),
         Route(address: 119, field: .morphPosition, slot: nil, kind: .u14, lane: .slow, wire: .control, dedupe: true, request: false),

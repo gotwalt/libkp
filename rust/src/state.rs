@@ -731,7 +731,7 @@ mod tests {
             0x7F,
             FUNCTION_STRING_PARAM,
             PAGE_STRINGS,
-            10,
+            generated::STRING_AMP_NAME,
             b"JCM",
         ));
         st.apply(&sysex(
@@ -982,12 +982,17 @@ mod tests {
     #[test]
     fn ext_string_recovers_amp_name() {
         let mut st = DeviceState::new();
-        // Amp Name is string tag 10 on the string page.
-        let msg = ext_string(PAGE_STRINGS, 10, b"JCM800");
+        // Amp Name is string tag 0x10 on the string page (docs/05).
+        let msg = ext_string(PAGE_STRINGS, generated::STRING_AMP_NAME, b"JCM800");
         let out = st.apply(&msg);
         assert_eq!(st.amp.name.as_deref(), Some("JCM800"));
         assert!(out.slow_changed);
-        assert_eq!(out.events, vec![DeviceEvent::StringTag { number: 10 }]);
+        assert_eq!(
+            out.events,
+            vec![DeviceEvent::StringTag {
+                number: generated::STRING_AMP_NAME
+            }]
+        );
     }
 
     #[test]

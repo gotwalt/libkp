@@ -126,7 +126,7 @@ def test_rig_name_string_updates_and_signals_a_rig_change():
     assert out.slow_changed
     assert out.events == [StringTag(2)]
 
-    state.apply(sysex(0x00, 0x7F, FN_STRING, PAGE_STRINGS, 10, b"JCM"))
+    state.apply(sysex(0x00, 0x7F, FN_STRING, PAGE_STRINGS, gen.STRING_AMP_NAME, b"JCM"))
     state.apply(sysex(0x00, 0x7F, FN_STRING, PAGE_STRINGS, 32, b"412"))
     assert state.amp.name == "JCM"
     assert state.cabinet.name == "412"
@@ -139,10 +139,10 @@ def test_rig_name_string_updates_and_signals_a_rig_change():
 
 def test_ext_string_recovers_amp_name():
     state = DeviceState()
-    out = state.apply(ext_string(PAGE_STRINGS, 10, b"JCM800"))
+    out = state.apply(ext_string(PAGE_STRINGS, gen.STRING_AMP_NAME, b"JCM800"))
     assert state.amp.name == "JCM800"
     assert out.slow_changed
-    assert out.events == [StringTag(10)]
+    assert out.events == [StringTag(gen.STRING_AMP_NAME)]
 
 
 def test_ext_string_rig_name_signals_a_rig_change():

@@ -697,7 +697,8 @@ final class StateTests: XCTestCase {
         state.apply(
             Nrpn.sysex(
                 product: 0x00, device: 0x7F, function: Generated.fnStringParam,
-                page: Generated.pageStrings, number: 10, values: Array("JCM".utf8)
+                page: Generated.pageStrings, number: Generated.stringAmpName,
+                values: Array("JCM".utf8)
             ))
         state.apply(
             Nrpn.sysex(
@@ -891,10 +892,10 @@ final class StateTests: XCTestCase {
     func testExtStringRecoversAmpName() {
         var state = DeviceState()
         let outcome = state.apply(
-            extString(page: Generated.pageStrings, number: 10, text: "JCM800"))
+            extString(page: Generated.pageStrings, number: Generated.stringAmpName, text: "JCM800"))
         XCTAssertEqual(state.amp.name, "JCM800")
         XCTAssertTrue(outcome.slowChanged)
-        XCTAssertEqual(outcome.events, [.stringTag(number: 10)])
+        XCTAssertEqual(outcome.events, [.stringTag(number: Generated.stringAmpName)])
     }
 
     func testExtStringRigNameSignalsRigChange() {
