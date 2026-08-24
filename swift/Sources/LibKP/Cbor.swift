@@ -337,8 +337,9 @@ private func f16ToDouble(_ bits: UInt16) -> Double {
 
 // MARK: - Encode / snapshot
 
-/// The reader and writer for the device's native CBOR channel, and the
-/// state-dump snapshot that reads the current bank and rig slot out of it.
+/// The reader and writer for the device's native CBOR channel: the item
+/// encoder, the one item this library ever writes (the state-dump trigger),
+/// and the decode from a raw item to the addresses and values the tree folds.
 public enum Cbor {
     /// Encode a value as a fresh byte array, using minimal-length integer heads —
     /// the shortest head that fits each argument, as the device itself emits.
@@ -450,14 +451,16 @@ public enum Cbor {
     public static func extractSnapshot(_ items: [CBORValue]) -> StateSnapshot {
         var state = DeviceState()
         var strings: [SnapshotString] = []
-        walk(
-            items,
-            numeric: { state.applyCbor(address: $0, value: $1) },
-            text: { address, text in
+        for entry in items.compactMap(controlItem).flatMap(\.entries) {
+            switch entry {
+            case let .num(address, value):
+                state.applyCbor(address: address, value: value)
+            case let .text(address, text):
                 state.applyCborText(address: address, text: text)
                 let value = isSensitive(address) ? Generated.redactedPlaceholder : text
                 strings.append(SnapshotString(address: address, text: value))
-            })
+            }
+        }
         return StateSnapshot(
             currentBank: state.currentBank, currentRigSlot: state.currentRigSlot,
             morph: state.morph, strings: strings)
@@ -466,58 +469,154 @@ public enum Cbor {
     /// Every numeric address/value pair the items carry, in document order.
     ///
     /// The dump and a session's live pushes are the same shapes, so this is what
-    /// a ``CborSession`` folds into a state tree as values move.
+    /// a ``CborSession`` hands out as values move.
     public static func numericValues(_ items: [CBORValue]) -> [(address: UInt32, value: Int64)] {
         var out: [(address: UInt32, value: Int64)] = []
-        walk(items, numeric: { out.append(($0, $1)) }, text: { _, _ in })
+        for entry in items.compactMap(controlItem).flatMap(\.entries) {
+            if case let .num(address, value) = entry { out.append((address, value)) }
+        }
         return out
     }
 
-    /// Walk decoded items, handing each numeric and string element to a callback.
+    /// Decode one item off the channel into the addresses and values it names.
     ///
-    /// Scans the value-bearing shapes: a single `[1, addr, value]`, a
-    /// consecutive-run `[2, base, v0, v1, …]` where the whole run is walked
-    /// because the target address can fall anywhere inside it, and a string
-    /// `[4, addr, text]`. A leading negative source-flag word, if present, is
-    /// skipped. An address outside the 32-bit space — negative, or past what
-    /// any page or extended address can name — is dropped rather than wrapped
-    /// onto some other parameter.
-    private static func walk(
-        _ items: [CBORValue],
-        numeric: (UInt32, Int64) -> Void,
-        text: (UInt32, String) -> Void
-    ) {
-        let address = { (n: Int64) -> UInt32? in UInt32(exactly: n) }
-        for item in items {
-            guard let fields = item.asArray else { continue }
-            // Skip a leading negative source-flags word.
-            let rest: [CBORValue]
-            if let first = fields.first?.asInt, first < 0 {
-                rest = Array(fields.dropFirst())
-            } else {
-                rest = fields
-            }
-            guard let selector = rest.first?.asInt else { continue }
-            let addr = rest.count > 1 ? rest[1].asInt : nil
-
-            if selector == Generated.cborSelectorSingle {
-                if let a = addr.flatMap(address), rest.count > 2, let v = rest[2].asInt {
-                    numeric(a, v)
-                }
-            } else if selector == Generated.cborSelectorMulti {
-                if let base = addr {
-                    for (i, element) in rest.dropFirst(2).enumerated() {
-                        if let a = address(base + Int64(i)), let v = element.asInt { numeric(a, v) }
-                    }
-                }
-            } else if selector == Generated.cborSelectorString {
-                if let a = addr.flatMap(address), rest.count > 2, case .text(let t) = rest[2],
-                    !t.isEmpty
-                {
-                    text(a, t)
-                }
-            }
+    /// Reads the value-bearing shapes: a single `[1, addr, value]`, a
+    /// consecutive-run `[2, base, v0, v1, …]` where every element is an address
+    /// of its own, and a string `[4, addr, text]`. A leading negative
+    /// source-flag word, if present, is skipped. Anything else — the `[5, …]`
+    /// opaque blobs the dump carries, an item that is not an array, a selector
+    /// this library does not know — is `nil`: not a value, so nothing to fold.
+    /// An address outside the 32-bit space (negative, or past what any page or
+    /// extended address can name) drops the item rather than wrapping onto some
+    /// other parameter, and an empty string is no string at all.
+    static func controlItem(_ item: CBORValue) -> ControlItem? {
+        guard let fields = item.asArray else { return nil }
+        // Skip a leading negative source-flags word.
+        let rest: [CBORValue]
+        if let first = fields.first?.asInt, first < 0 {
+            rest = Array(fields.dropFirst())
+        } else {
+            rest = fields
         }
+        guard let selector = rest.first?.asInt, rest.count > 1, let raw = rest[1].asInt,
+            let base = UInt32(exactly: raw)
+        else { return nil }
+
+        if selector == Generated.cborSelectorSingle {
+            guard rest.count > 2, let value = rest[2].asInt else { return nil }
+            return ControlItem(base: base, entries: [.num(address: base, value: value)])
+        } else if selector == Generated.cborSelectorMulti {
+            var entries: [ControlItem.Entry] = []
+            for (i, element) in rest.dropFirst(2).enumerated() {
+                guard let address = UInt32(exactly: Int64(base) + Int64(i)),
+                    let value = element.asInt
+                else { continue }
+                entries.append(.num(address: address, value: value))
+            }
+            return ControlItem(base: base, entries: entries)
+        } else if selector == Generated.cborSelectorString {
+            guard rest.count > 2, case .text(let text) = rest[2], !text.isEmpty else { return nil }
+            return ControlItem(base: base, entries: [.text(address: base, text: text)])
+        }
+        return nil
+    }
+}
+
+/// One item off the control channel, as the tree consumes it.
+struct ControlItem: Sendable, Equatable {
+    /// The address the item names: a single's or a string's own, or a run's
+    /// base. The state dump always ends with the run based at
+    /// ``Generated/dumpEndAddress``, so this is what closes the dump phase.
+    let base: UInt32
+    /// The values, one per address the item covers.
+    let entries: [Entry]
+
+    enum Entry: Sendable, Equatable {
+        case num(address: UInt32, value: Int64)
+        case text(address: UInt32, text: String)
+    }
+}
+
+// MARK: - Control link
+
+/// The CBOR socket: the one place the control channel is opened and read.
+///
+/// ``DeviceModel`` holds one beside its stream; ``CborSession`` and
+/// ``StateSnapshot/fetch(host:port:timeout:)`` are the same link without the
+/// model. It writes exactly one thing, once, on opening — the state-dump
+/// trigger — and has no write method after that: the CBOR channel also carries
+/// the device's own command grammar, and this library structurally cannot
+/// speak it.
+///
+/// Exactly one task reads a link. The decoder inside is not locked; a second
+/// reader would be a bug, not a race to tolerate.
+final class ControlLink: @unchecked Sendable {
+    /// How long a read waits before looping. Short, so a close takes effect
+    /// promptly and the model's ingest reacts per packet.
+    static let readIdle: TimeInterval = 0.03
+
+    let session: Session
+    /// Stream bytes that rode in on the handshake acceptance, before the dump
+    /// was asked for. Feed them through ``push(_:)`` before reading more.
+    let tail: [UInt8]
+    private var decoder = CBORDecoder()
+
+    private init(session: Session, tail: [UInt8]) {
+        self.session = session
+        self.tail = tail
+    }
+
+    /// Dial `host:port`, select the CBOR protocol, write the preamble, and ask
+    /// for the state dump.
+    ///
+    /// The dial passes the ``ConnectionLedger``, so a link opened beside a
+    /// stream is spaced from it without the caller sleeping. The CBOR protocol
+    /// is required, not preferred: a greeting that does not offer it, or a
+    /// rejection of it, fails the open — there is no other protocol this link
+    /// could usefully speak. A failed trigger write fails the open too; a
+    /// control link that never asked for the dump would leave the morph
+    /// unknown for as long as it stayed up. On any failure the socket is
+    /// closed before the error propagates.
+    static func open(host: String, port: UInt16) async throws -> ControlLink {
+        let session = try await Session.connect(host: host, port: port)
+        do {
+            let greeting = try await session.readAvailable(idle: readIdle, max: 256)
+            let offered = Session.parseProtocolList(greeting)
+            guard offered.contains(Generated.protocolCborControl) else {
+                throw SessionError.protocolRejected(
+                    name: Generated.protocolCborControl, detail: "not offered in the greeting")
+            }
+            let response = try await session.selectProtocol(
+                Generated.protocolCborControl, idle: readIdle)
+            try await session.writeSessionPreamble()
+            let outcome = HandshakeOutcome(
+                greeting: greeting, offered: offered, selected: Generated.protocolCborControl,
+                response: response)
+            // Writing one item asks for the whole state; the reply is the burst
+            // the stream opens with.
+            try await session.writeAll(Cbor.encode(Cbor.stateDumpRequest()))
+            return ControlLink(session: session, tail: outcome.responseTail)
+        } catch {
+            session.close()
+            throw error
+        }
+    }
+
+    /// Decode bytes into whole items; a partial item stays buffered.
+    func push(_ bytes: [UInt8]) -> [CBORValue] {
+        decoder.push(bytes)
+    }
+
+    /// Read once, waiting up to `wait`, and decode what arrived. Empty when
+    /// nothing did; throws once the socket has ended.
+    func read(wait: TimeInterval) async throws -> [CBORValue] {
+        let chunk = try await session.readOnce(wait: wait)
+        return chunk.isEmpty ? [] : push(chunk)
+    }
+
+    /// Close the socket. Stamps the ledger, as every close does.
+    func close() {
+        session.close()
     }
 }
 
@@ -537,6 +636,10 @@ public struct SnapshotString: Sendable, Equatable {
 /// The device's current position and the values carried alongside it, read out
 /// of a state dump. Both indices are 0-based; any field is `nil` if the dump did
 /// not carry it.
+///
+/// This is tooling: a way to read one dump without a ``DeviceModel``. A model
+/// folds the same dump into its own tree when its control link opens, so an
+/// app that holds a model already has everything here in ``DeviceState``.
 public struct StateSnapshot: Sendable, Equatable {
     /// Current bank, 0-based (``Generated/currentBankAddress``).
     public var currentBank: UInt16?
@@ -546,10 +649,11 @@ public struct StateSnapshot: Sendable, Equatable {
     /// The morph position (0 = base, 16383 = fully morphed), at
     /// ``Generated/morphAddress``.
     ///
-    /// This dump is the only way a client that is not holding a CBOR session
-    /// open can learn it: the position is never sent on the MIDI3 stream, and
-    /// answers neither a `$41` nor a `$46` request. It is a live value, so it is
-    /// true as of the read and stale the moment anyone morphs.
+    /// The position is never sent on the MIDI3 stream and answers neither a
+    /// `$41` nor a `$46` request, so the dump — this one, or the one the
+    /// model's control link asks for — is the only way to learn it. It is a
+    /// live value, so it is true as of the read and stale the moment anyone
+    /// morphs.
     public var morph: UInt16?
     /// String parameters the dump carried, in document order, sensitive values
     /// redacted. Useful for the current rig name (address 1) and the bank name.
@@ -584,43 +688,32 @@ public struct StateSnapshot: Sendable, Equatable {
     /// Default time to keep reading the dump before giving up on the indices.
     public static let defaultTimeout: TimeInterval = 3
 
-    /// Open a fresh CBOR session to `host`, trigger the state dump, and read back
-    /// the current bank, rig slot and morph position.
+    /// Open a fresh control link to `host`, trigger the state dump, and read
+    /// back the current bank, rig slot and morph position.
     ///
     /// This opens its **own** short-lived connection, independent of any
-    /// ``DeviceModel``, and closes it on return. The device is fragile under
-    /// connection churn, so run this sparingly. Returns as soon as every value it
-    /// reads is known (see ``StateSnapshot/isComplete``) or `timeout` elapses.
-    ///
-    /// For a *live* view, and to run alongside a streaming session rather than
-    /// before it, use ``CborSession``.
+    /// ``DeviceModel``, and closes it on return. The dial passes the
+    /// ``ConnectionLedger`` like every other, but the device is fragile under
+    /// connection churn, so run this sparingly — and not at all when a model is
+    /// already up, since its control link has folded the same dump. Returns as
+    /// soon as every value it reads is known (see ``StateSnapshot/isComplete``)
+    /// or `timeout` elapses.
     public static func fetch(
         host: String,
         port: UInt16 = Generated.port,
         timeout: TimeInterval = StateSnapshot.defaultTimeout
     ) async throws -> StateSnapshot {
-        let idle: TimeInterval = 0.03
-        let session = try await Session.connect(host: host, port: port)
-        defer { session.close() }
+        let link = try await ControlLink.open(host: host, port: port)
+        defer { link.close() }
 
-        let outcome = try await session.handshake(
-            preferred: [Session.protocolCborControl], idle: idle)
-        try await session.writeSessionPreamble()
-
-        var decoder = CBORDecoder()
-        var items = decoder.push(outcome.responseTail)
-
-        // Ask for the full state, then read until both indices land or the
-        // deadline passes.
-        try await session.writeAll(Cbor.encode(Cbor.stateDumpRequest()))
-
+        var items = link.push(link.tail)
         let deadline = Date().addingTimeInterval(timeout)
         while !Cbor.extractSnapshot(items).isComplete {
             let remaining = deadline.timeIntervalSinceNow
             if remaining <= 0 { break }
             do {
-                let chunk = try await session.readOnce(wait: min(idle, remaining))
-                if !chunk.isEmpty { items.append(contentsOf: decoder.push(chunk)) }
+                items.append(
+                    contentsOf: try await link.read(wait: min(ControlLink.readIdle, remaining)))
             } catch SessionError.closed {
                 break
             }
@@ -644,26 +737,21 @@ public struct CborUpdate: Sendable, Equatable {
     }
 }
 
-/// A **live** session on the native CBOR channel: it opens, asks for the state
-/// dump, and then streams every value the device pushes until it is closed.
+/// A **live** view of the native CBOR channel: it opens, asks for the state
+/// dump, and then hands out every numeric value the device pushes until it is
+/// closed.
 ///
-/// This is the counterpart to ``StateSnapshot/fetch(host:port:timeout:)``, which
-/// reads one dump and hangs up. Hold this open instead when you want to *watch*
-/// the values the MIDI3 stream never carries — the morph position above all,
-/// which is pushed here at about 40 Hz while a morph ramps and is unreachable by
-/// any request on the streaming session.
-///
-/// **It may run alongside a ``DeviceModel``.** The device's fragility is about
-/// connection *churn*, not concurrency: two read-only sessions coexist happily,
-/// and the pair is how a client gets both the meter lane and the morph. Space
-/// the two connections by ``Session/connectionCooldown`` when opening them, and
-/// do not reopen either in a tight loop.
+/// This is tooling — a raw tap on the channel for capturing or inspecting what
+/// the device says, address by address. It is not how an app gets the morph:
+/// ``DeviceModel`` opens the same link by default (``ControlPolicy/bestEffort``)
+/// and folds its values into the one state tree, so an app that holds a model
+/// should never open this beside it. Doing so costs a third session on a device
+/// that objects to session churn, for values the model already has.
 ///
 /// Read-only. The one thing it writes is the state-dump trigger, which is a flag
 /// the device already carries — see [docs/06](../../../docs/06-cbor-channel.md).
 public actor CborSession {
-    private let session: Session
-    private var decoder = CBORDecoder()
+    private let link: ControlLink
     private var ingestTask: Task<Void, Never>?
     private var continuations: [UUID: AsyncStream<CborUpdate>.Continuation] = [:]
     private var closed = false
@@ -674,16 +762,13 @@ public actor CborSession {
     /// morph among them, appear until something moves them.
     private var backlog: [CborUpdate] = []
 
-    /// How long a read waits before looping. Short, so `close()` takes effect
-    /// promptly.
-    private static let readIdle: TimeInterval = 0.25
     /// How many pre-subscription values to hold. The state dump is a couple of
     /// thousand; this keeps the most recent of them rather than growing without
     /// bound if nobody ever subscribes.
     private static let backlogLimit = 4096
 
-    private init(session: Session) {
-        self.session = session
+    private init(link: ControlLink) {
+        self.link = link
     }
 
     /// Connect to `host:5727`, open the CBOR protocol, ask for the state dump,
@@ -694,25 +779,14 @@ public actor CborSession {
     public static func connect(
         host: String, port: UInt16 = Generated.port
     ) async throws -> CborSession {
-        let session = try await Session.connect(host: host, port: port)
-        do {
-            let outcome = try await session.handshake(
-                preferred: [Session.protocolCborControl], idle: 0.03)
-            try await session.writeSessionPreamble()
-            let model = CborSession(session: session)
-            await model.start(tail: outcome.responseTail)
-            return model
-        } catch {
-            session.close()
-            throw error
-        }
+        let link = try await ControlLink.open(host: host, port: port)
+        let session = CborSession(link: link)
+        await session.start()
+        return session
     }
 
-    private func start(tail: [UInt8]) async {
-        emit(decoder.push(tail))
-        // Writing one item asks for the whole state; the reply is the burst the
-        // stream opens with.
-        try? await session.writeAll(Cbor.encode(Cbor.stateDumpRequest()))
+    private func start() {
+        emit(link.push(link.tail))
         ingestTask = Task { [weak self] in
             await self?.ingestLoop()
         }
@@ -721,9 +795,7 @@ public actor CborSession {
     private func ingestLoop() async {
         while !Task.isCancelled {
             do {
-                let chunk = try await session.readOnce(wait: CborSession.readIdle)
-                if chunk.isEmpty { continue }
-                emit(decoder.push(chunk))
+                emit(try await link.read(wait: ControlLink.readIdle))
             } catch {
                 finish()
                 return
@@ -764,7 +836,7 @@ public actor CborSession {
     public func close() {
         ingestTask?.cancel()
         ingestTask = nil
-        session.close()
+        link.close()
         finish()
     }
 

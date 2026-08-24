@@ -1,6 +1,6 @@
 //! The device's native CBOR control channel and its state-dump snapshot.
 //!
-//! The `{774CDB9E-…}` protocol GUID ([`session::PROTOCOL_CBOR_CONTROL`]) completes
+//! The `{774CDB9E-…}` protocol GUID ([`PROTOCOL_CBOR_CONTROL`]) completes
 //! the same [handshake](crate::session) and 8-byte preamble as the MIDI3 stream,
 //! then speaks **CBOR** (RFC 8949) rather than MIDI3 frames — a continuous
 //! sequence of bare items with no outer framing (see `docs/06`). This module is
@@ -11,9 +11,18 @@
 //!   inter-item filler the channel emits.
 //! - [`encode`] / [`to_vec`] and [`param_write`] write the one item this library
 //!   sends — the write that asks the device for its full state.
-//! - [`extract_snapshot`] reads the device's current bank and rig slot out of the
-//!   resulting dump, and [`StateSnapshot::fetch`] runs the whole exchange over a
-//!   fresh session.
+//! - `ControlLink` (crate-private) opens the channel — dial, handshake,
+//!   preamble, the dump trigger — and reads it back as items. It is the one
+//!   CBOR ingest path: the [`DeviceModel`](crate::model::DeviceModel)'s control
+//!   link is built on it, and so are the two tools below.
+//! - [`extract_snapshot`] reads the device's current bank and rig slot out of a
+//!   dump, and [`StateSnapshot::fetch`] runs the whole exchange over a fresh
+//!   session; [`CborSession`] holds one open and streams its pushes.
+//!
+//! Most callers want none of this directly: a `DeviceModel` opens the channel
+//! by default, folds its dump and its pushes into the one state tree, and
+//! reports its health in `DeviceState::channels`. The tools here are for
+//! reading the channel on its own.
 //!
 //! The channel does not volunteer state: a passive session sees only live change
 //! events. Writing [`param_write`]`(`[`generated::STATE_DUMP_TRIGGER_ADDRESS`]`,
@@ -21,7 +30,8 @@
 //! multi-parameter and string items carrying — among much else — the current
 //! bank ([`generated::CURRENT_BANK_ADDRESS`]) and rig slot
 //! ([`generated::CURRENT_RIG_SLOT_ADDRESS`]), both 0-based. The write is
-//! non-mutating.
+//! non-mutating. The burst always ends with the run whose base is
+//! [`generated::DUMP_END_ADDRESS`], which is how a reader knows it is over.
 
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
@@ -32,8 +42,9 @@ use tokio::task::JoinHandle;
 
 use crate::SessionError;
 use crate::generated;
-use crate::session::{PROTOCOL_CBOR_CONTROL, Session};
-use crate::state::DeviceState;
+use crate::protocol::DISCOVERY_PORT;
+use crate::session::{HandshakeOutcome, PROTOCOL_CBOR_CONTROL, Session, parse_protocol_list};
+use crate::state::{Channel, Decoded, DeviceState, Phase, Update};
 
 /// A decoded CBOR data item.
 #[derive(Debug, Clone, PartialEq)]
@@ -594,6 +605,64 @@ pub fn numeric_values(items: &[Value]) -> Vec<(u32, i64)> {
     out
 }
 
+/// Every value the items carry as [`Update`]s for the funnel, tagged as the
+/// control channel's and with the given phase, in document order.
+///
+/// This is what the model's control link folds. A negative value is dropped
+/// here rather than reinterpreted (no tracked row holds one, exactly as
+/// [`DeviceState::apply_cbor`] does); a `[5, …]` blob and anything else that is
+/// not one of the three value-bearing shapes is not a value and is skipped.
+pub(crate) fn updates(items: &[Value], phase: Phase) -> Vec<Update> {
+    let mut out = Vec::new();
+    walk(items, &mut |element| {
+        let (address, decoded) = match element {
+            Element::Numeric(addr, value) => match (u32::try_from(addr), u64::try_from(value)) {
+                (Ok(a), Ok(v)) => (a, Decoded::Num(v)),
+                _ => return,
+            },
+            Element::Text(addr, text) => match u32::try_from(addr) {
+                Ok(a) => (a, Decoded::Text(text.to_string())),
+                Err(_) => return,
+            },
+        };
+        out.push(Update {
+            source: Channel::Control,
+            phase,
+            address,
+            decoded,
+        });
+    });
+    out
+}
+
+/// The index of the item that always ends a state dump — the run whose base
+/// address is [`generated::DUMP_END_ADDRESS`] — if it is among these.
+pub(crate) fn dump_end_index(items: &[Value]) -> Option<usize> {
+    items
+        .iter()
+        .position(|item| item_base(item) == Some(generated::DUMP_END_ADDRESS))
+}
+
+/// The base address of one value-bearing item: the address of a single or a
+/// string, the base of a run. `None` for any other shape.
+fn item_base(item: &Value) -> Option<u32> {
+    let fields = item.as_array()?;
+    let rest = match fields.first().and_then(Value::as_i128) {
+        Some(n) if n < 0 => &fields[1..],
+        _ => fields,
+    };
+    let selector = rest.first().and_then(Value::as_i128)?;
+    let known = [
+        generated::CBOR_SELECTOR_SINGLE,
+        generated::CBOR_SELECTOR_MULTI,
+        generated::CBOR_SELECTOR_STRING,
+    ];
+    if !known.iter().any(|s| i128::from(*s) == selector) {
+        return None;
+    }
+    u32::try_from(rest.get(1).and_then(Value::as_i128)?).ok()
+}
+
 /// Walk decoded items, handing each numeric and string element to a callback.
 ///
 /// Scans the value-bearing shapes: a single `[1, addr, value]`, a consecutive-run
@@ -659,17 +728,11 @@ impl StateSnapshot {
         timeout: Duration,
     ) -> Result<StateSnapshot, SessionError> {
         let idle = Duration::from_millis(30);
-        let mut session = Session::connect(ip).await?;
-        let outcome = session.handshake(&[PROTOCOL_CBOR_CONTROL], idle).await?;
-        session.write_session_preamble().await?;
+        let mut link = ControlLink::open(ip, DISCOVERY_PORT, idle).await?;
+        let mut items = Vec::new();
 
-        let mut decoder = Decoder::new();
-        let mut items = decoder.push(outcome.response_tail());
-
-        // Ask for the full state, then read until both indices land or the
-        // deadline passes.
-        session.write_all(&to_vec(&state_dump_request())).await?;
-
+        // The trigger went out with the open; read until every value the
+        // snapshot wants has landed or the deadline passes.
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if extract_snapshot(&items).is_complete() {
@@ -679,14 +742,91 @@ impl StateSnapshot {
             if remaining.is_zero() {
                 break;
             }
-            match session.read_once(idle.min(remaining), 64 * 1024).await {
-                Ok(chunk) if chunk.is_empty() => {}
-                Ok(chunk) => items.extend(decoder.push(&chunk)),
+            match link.read(idle.min(remaining)).await {
+                Ok(chunk) => items.extend(chunk),
                 Err(SessionError::Closed) => break,
                 Err(e) => return Err(e),
             }
         }
         Ok(extract_snapshot(&items))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The link
+// ---------------------------------------------------------------------------
+
+/// An open control channel: the socket, the streaming decoder, and whatever
+/// items rode in on the handshake tail. Opening it is the whole sequence —
+/// dial, greeting, protocol selection, preamble, dump trigger — so every
+/// reader of the channel in this crate goes through the one code path, and
+/// none of them can drift in how they ask.
+///
+/// It offers no write: the dump trigger is the one item this library sends,
+/// and it goes out inside [`open`](Self::open). There is deliberately no way
+/// to push a command through here.
+pub(crate) struct ControlLink {
+    session: Session,
+    decoder: Decoder,
+    /// Items decoded from the acceptance line's tail, handed out by the first
+    /// [`read`](Self::read) so nothing that arrived before the trigger is lost.
+    pending: Vec<Value>,
+}
+
+impl ControlLink {
+    /// Dial `ip:port`, select the CBOR protocol, write the preamble and the
+    /// dump trigger. Every step's error propagates, the trigger write's
+    /// included: a link that could not ask for the dump is not open.
+    ///
+    /// The protocol is selected only if the greeting offers it. The generic
+    /// handshake falls back to the device's first offered protocol when the
+    /// preferred one is missing, which is right for the stream and wrong here
+    /// — a control link on some other protocol is not a control link — so a
+    /// greeting without it is a rejection.
+    pub(crate) async fn open(
+        ip: Ipv4Addr,
+        port: u16,
+        idle: Duration,
+    ) -> Result<Self, SessionError> {
+        let mut session = Session::connect_to(ip, port).await?;
+        let greeting = session.read_available(idle, 256).await?;
+        let offered = parse_protocol_list(&greeting);
+        if !offered.iter().any(|o| o == PROTOCOL_CBOR_CONTROL) {
+            return Err(SessionError::ProtocolRejected {
+                name: PROTOCOL_CBOR_CONTROL.to_string(),
+                detail: Some("not offered in the greeting".to_string()),
+            });
+        }
+        let response = session.select_protocol(PROTOCOL_CBOR_CONTROL, idle).await?;
+        session.write_session_preamble().await?;
+        let outcome = HandshakeOutcome {
+            greeting,
+            offered,
+            selected: PROTOCOL_CBOR_CONTROL.to_string(),
+            response,
+        };
+        let mut decoder = Decoder::new();
+        let pending = decoder.push(outcome.response_tail());
+
+        // Writing one item asks for the whole state; the reply is the burst the
+        // channel opens with.
+        session.write_all(&to_vec(&state_dump_request())).await?;
+        Ok(ControlLink {
+            session,
+            decoder,
+            pending,
+        })
+    }
+
+    /// The items completed by the next read — or by the handshake tail, the
+    /// first time. An empty vector is a quiet `wait`; `Err(Closed)` is the
+    /// socket ending.
+    pub(crate) async fn read(&mut self, wait: Duration) -> Result<Vec<Value>, SessionError> {
+        if !self.pending.is_empty() {
+            return Ok(std::mem::take(&mut self.pending));
+        }
+        let chunk = self.session.read_once(wait, 64 * 1024).await?;
+        Ok(self.decoder.push(&chunk))
     }
 }
 
@@ -698,21 +838,22 @@ impl StateSnapshot {
 /// value, as the channel encodes it (35-bit range, so wider than `$01`).
 pub type CborUpdate = (u32, i64);
 
-/// A **live** session on the native CBOR channel: it opens, asks for the state
-/// dump, and then streams every value the device pushes until it is dropped.
+/// A **live** session on the native CBOR channel, on its own: it opens, asks
+/// for the state dump, and then streams every value the device pushes until
+/// it is dropped.
 ///
-/// This is the counterpart to [`StateSnapshot::fetch`], which reads one dump and
-/// hangs up. Hold this open instead when you want to *watch* the values the
-/// MIDI3 stream never carries — the morph position above all, which is pushed
-/// here at about 40 Hz while a morph ramps and is unreachable by any request on
-/// the streaming session.
+/// This is a tool for watching the channel raw. An application wants the
+/// [`DeviceModel`](crate::model::DeviceModel) instead, which opens the same
+/// link by default, folds the dump and the pushes into its state tree — that
+/// is how the morph position reaches `DeviceState::morph` — and reports the
+/// link's health in `DeviceState::channels`. Hold one of these only to see the
+/// address/value pairs themselves, the ones the tree tracks and the ones it
+/// does not.
 ///
-/// **It may run alongside a [`DeviceModel`](crate::model::DeviceModel).** The
-/// device's fragility is about connection *churn*, not concurrency: two
-/// read-only sessions coexist happily, and the pair is how a client gets both
-/// the meter lane and the morph. Space the two connections by
-/// [`generated::CONNECTION_COOLDOWN_MS`] when opening them, and do not reopen
-/// either in a tight loop.
+/// It is the counterpart to [`StateSnapshot::fetch`], which reads one dump and
+/// hangs up. Every open passes the connection ledger in [`crate::session`], so
+/// running one alongside a model needs no spacing of its own — but the device
+/// is fragile under connection churn, so do not reopen it in a loop.
 ///
 /// Read-only. The one thing it writes is the state-dump trigger, which is a flag
 /// the device already carries — see `docs/06`.
@@ -737,16 +878,7 @@ impl CborSession {
     /// [`subscribe`](Self::subscribe). Subscribe *before* awaiting them, or the
     /// dump's own burst is missed.
     pub async fn connect(ip: Ipv4Addr) -> Result<Self, SessionError> {
-        let mut session = Session::connect(ip).await?;
-        let outcome = session
-            .handshake(&[PROTOCOL_CBOR_CONTROL], Duration::from_millis(30))
-            .await?;
-        session.write_session_preamble().await?;
-        let tail = outcome.response_tail().to_vec();
-
-        // Writing one item asks for the whole state; the reply is the burst the
-        // stream opens with.
-        session.write_all(&to_vec(&state_dump_request())).await?;
+        let link = ControlLink::open(ip, DISCOVERY_PORT, Duration::from_millis(30)).await?;
 
         // Subscribe before spawning: `broadcast::Sender::send` discards when
         // nothing is listening, and the opening burst — the only place several
@@ -754,7 +886,7 @@ impl CborSession {
         // lands immediately. This receiver keeps it, and `subscribe` hands it to
         // the first caller.
         let (updates, initial) = broadcast::channel(4096);
-        let task = tokio::spawn(ingest(session, updates.clone(), tail));
+        let task = tokio::spawn(ingest(link, updates.clone()));
         Ok(CborSession {
             updates,
             initial: Mutex::new(Some(initial)),
@@ -780,17 +912,13 @@ impl Drop for CborSession {
     }
 }
 
-/// Own the socket: read, decode, and fan out every numeric value.
-async fn ingest(mut session: Session, updates: broadcast::Sender<CborUpdate>, tail: Vec<u8>) {
-    let mut decoder = Decoder::new();
-    for pair in numeric_values(&decoder.push(&tail)) {
-        let _ = updates.send(pair);
-    }
+/// Own the link: read, decode, and fan out every numeric value until the
+/// socket ends.
+async fn ingest(mut link: ControlLink, updates: broadcast::Sender<CborUpdate>) {
     loop {
-        match session.read_once(CborSession::READ_IDLE, 64 * 1024).await {
-            Ok(chunk) if chunk.is_empty() => {}
-            Ok(chunk) => {
-                for pair in numeric_values(&decoder.push(&chunk)) {
+        match link.read(CborSession::READ_IDLE).await {
+            Ok(items) => {
+                for pair in numeric_values(&items) {
                     let _ = updates.send(pair);
                 }
             }
@@ -906,6 +1034,57 @@ mod tests {
             snap.string(generated::SENSITIVE_ADDRESSES[0]),
             Some(generated::REDACTED_PLACEHOLDER)
         );
+    }
+
+    /// The model's control link folds items as updates: a run element by
+    /// element, a string as text, a blob or a negative not at all — and the
+    /// end marker is found by its base wherever it sits.
+    #[test]
+    fn items_become_control_updates_and_the_marker_is_found() {
+        let run = Value::Tag(
+            1,
+            Box::new(Value::Array(vec![
+                Value::Uint(2),
+                Value::Uint(generated::DUMP_END_ADDRESS as u64),
+                Value::Uint(7),
+                Value::Uint(8),
+            ])),
+        );
+        let name = Value::Tag(
+            1,
+            Box::new(Value::Array(vec![
+                Value::Uint(4),
+                Value::Uint(1),
+                Value::Text("AC30".into()),
+            ])),
+        );
+        let blob = Value::Tag(
+            1,
+            Box::new(Value::Array(vec![
+                Value::Uint(5),
+                Value::Uint(17),
+                Value::Bytes(vec![1, 2, 3]),
+            ])),
+        );
+        let negative = param_write(generated::MORPH_ADDRESS, -1);
+        let items = [name, blob, negative, run];
+        let updates = updates(&items, Phase::Dump);
+        let expect = |address, decoded| Update {
+            source: Channel::Control,
+            phase: Phase::Dump,
+            address,
+            decoded,
+        };
+        assert_eq!(
+            updates,
+            vec![
+                expect(1, Decoded::Text("AC30".into())),
+                expect(generated::DUMP_END_ADDRESS, Decoded::Num(7)),
+                expect(generated::DUMP_END_ADDRESS + 1, Decoded::Num(8)),
+            ]
+        );
+        assert_eq!(dump_end_index(&items), Some(3));
+        assert_eq!(dump_end_index(&items[..3]), None);
     }
 
     /// A negative or oversized address is malformed; wrapping it into a

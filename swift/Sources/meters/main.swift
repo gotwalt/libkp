@@ -4,10 +4,11 @@ import LibKP
 
 // `meters` — a live full-screen terminal view of a Profiler's realtime stream.
 //
-// It connects, performs the read-only initial rig sync, and then renders the
-// current patch: rig header, amp and cabinet, the eight effect blocks with
-// their on/off state and effect type, the tuner strobe, the level bars, a
-// tempo pulse and the last parameter seen.
+// It connects — the model runs the read-only sync burst and opens the control
+// link on its own — and then renders the current patch: rig header, amp and
+// cabinet, the eight effect blocks with their on/off state and effect type,
+// the tuner strobe, the level bars, a tempo pulse and the last parameter seen.
+// It exits when the device closes the stream.
 
 // MARK: - Command line
 
@@ -465,25 +466,15 @@ if let given = options.host {
 
 FileHandle.standardError.write(Data("Connecting to \(host):\(Generated.port) ...\n".utf8))
 
+// A bare connect is the whole session: the stream, the read-only sync burst
+// that fills the header (rig/amp/cab names, each effect slot's type + on/off,
+// amp on/gain, tempo, the volumes, the position), and — in the background —
+// the control link that carries the morph position.
 let model: DeviceModel
 do {
     model = try await DeviceModel.connect(host: host)
 } catch {
     fail("\(error)")
-}
-
-// `DeviceModel.connect` already ran the read-only rig sync (rig/amp/cab names
-// and each effect slot's type + on/off). Ask for the handful of extra values
-// the header shows; these are requests too, so nothing on the device changes.
-for (page, number) in [
-    (Generated.ampPage, Generated.ampOnNumber),
-    (Generated.ampPage, Generated.gainNumber),
-    (Generated.pageRigSettings, Generated.tempoNumber),
-    (Generated.pageRigSettings, Generated.rigVolumeNumber),
-    (Generated.pageMorph, Generated.morphNumber),
-    (Generated.systemPage, Generated.mainVolumeNumber),
-] {
-    try? await model.requestParam(page: page, number: number)
 }
 
 let view = MeterView(host: host, width: options.width, showAll: options.showAll)

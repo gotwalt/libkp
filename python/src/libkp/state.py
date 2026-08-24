@@ -45,6 +45,8 @@ __all__ = [
     "Block",
     "Update",
     "Connection",
+    "ChannelState",
+    "Channels",
     "RealtimeStatus",
     "Rig",
     "Amp",
@@ -72,17 +74,64 @@ __all__ = [
     "CurrentPosition",
     "Connected",
     "Disconnected",
+    "ConnectionChanged",
+    "ChannelChanged",
+    "SyncCompleted",
+    "RequestTimedOut",
     "ApplyOutcome",
 ]
 
 
 class Connection(Enum):
-    """Whether a live session to the Profiler is currently open."""
+    """The model's overall link to the Profiler, summarising its two channels.
 
-    #: A session is open and the stream is being ingested.
-    CONNECTED = "connected"
-    #: No session (initial state, or the device closed the connection).
+    The MIDI3 stream is the link that matters: without it there is no
+    connection at all. The CBOR control channel is the optional second socket
+    that carries what the stream omits (the morph position), and losing it only
+    *degrades* the connection -- everything the stream carries keeps flowing.
+    """
+
+    #: No session: the initial state, the device closed the connection and the
+    #: model was not asked to reconnect, or :meth:`~libkp.model.DeviceModel.close`
+    #: was called.
     DISCONNECTED = "disconnected"
+    #: The stream was lost and the model is waiting out a backoff before dialing
+    #: again (:attr:`DeviceState.reconnect_attempt` counts the tries). Only seen
+    #: when a :class:`~libkp.model.ReconnectPolicy` asked for it.
+    RECONNECTING = "reconnecting"
+    #: The stream is open and being ingested, and the control channel is either
+    #: open, still on its way, or was never asked for.
+    CONNECTED = "connected"
+    #: The stream is open but the control channel was asked for and is not
+    #: there: it could not be opened, or it was open and the device ended it.
+    #: The morph position is stale or unknown; nothing else is affected.
+    DEGRADED = "degraded"
+
+
+class ChannelState(Enum):
+    """Where one of the model's two sockets is in its life."""
+
+    #: Not asked for: the policy is off, or no attempt has been made yet.
+    CLOSED = "closed"
+    #: Dialing, or in the protocol handshake.
+    CONNECTING = "connecting"
+    #: Handshaken and streaming.
+    OPEN = "open"
+    #: The open failed -- the dial, the handshake, or (for the control channel)
+    #: the write that asks for the state dump.
+    UNAVAILABLE = "unavailable"
+    #: Was open, then the socket ended.
+    LOST = "lost"
+
+
+@dataclass(slots=True)
+class Channels:
+    """The state of the model's two sockets, side by side."""
+
+    #: The MIDI3 stream: the meter lane, the parameter pushes, every request.
+    stream: ChannelState = ChannelState.CLOSED
+    #: The CBOR control channel: the state dump and the morph position.
+    control: ChannelState = ChannelState.CLOSED
 
 
 # ---------------------------------------------------------------------------
@@ -382,8 +431,9 @@ class MorphChanged(DeviceEvent):
     """The morph position changed (``$01`` page 0 / number 0x77): 0 = base,
     16383 = fully morphed.
 
-    Only a CBOR session ever sees this: the position is never sent on the MIDI3
-    stream, even while a morph is ramping. See :class:`MorphButton`.
+    Only the control link ever carries this: the position is never sent on the
+    MIDI3 stream, even while a morph is ramping, so a model whose control link
+    is off or lost never raises it. See :class:`MorphButton`.
     """
 
     value: int
@@ -452,7 +502,55 @@ class Connected(DeviceEvent):
 
 @dataclass(frozen=True, slots=True)
 class Disconnected(DeviceEvent):
-    """The device closed the connection."""
+    """The device closed the connection, or the model was closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionChanged(DeviceEvent):
+    """:attr:`DeviceState.connection` moved to a new value.
+
+    Raised on *every* transition, so a client watching this one event follows
+    the whole life of the link -- reconnect attempts and degradation included.
+    :class:`Connected` and :class:`Disconnected` are still raised alongside it
+    for the two transitions they name.
+    """
+
+    connection: Connection
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelChanged(DeviceEvent):
+    """One of the model's two sockets moved to a new :class:`ChannelState`.
+
+    The only event that names a channel: everything else about the two wires
+    is folded into one tree and one event stream.
+    """
+
+    channel: Channel
+    state: ChannelState
+
+
+@dataclass(frozen=True, slots=True)
+class SyncCompleted(DeviceEvent):
+    """A channel finished filling the tree in.
+
+    For :attr:`Channel.STREAM` the connect-time request burst has had its last
+    reply (or its last timeout); for :attr:`Channel.CONTROL` the state dump
+    has ended. After either, what that channel can tell is in the snapshot.
+    """
+
+    source: Channel
+
+
+@dataclass(frozen=True, slots=True)
+class RequestTimedOut(DeviceEvent):
+    """A read request drew no reply inside its deadline and was abandoned.
+
+    Never retried: the device ignores an address it cannot answer, and asking
+    again would only cost it more. ``address`` is the flat address asked for.
+    """
+
+    address: int
 
 
 @dataclass(slots=True)
@@ -578,8 +676,13 @@ class DeviceState:
     copies of this through its snapshot stream.
     """
 
-    #: Whether a live session is open.
+    #: The model's overall link to the device, summarising :attr:`channels`.
     connection: Connection = Connection.DISCONNECTED
+    #: Which reconnect attempt is pending while :attr:`connection` is
+    #: :attr:`Connection.RECONNECTING`; ``0`` at every other time.
+    reconnect_attempt: int = 0
+    #: The state of each of the model's two sockets.
+    channels: Channels = field(default_factory=Channels)
     #: The loaded rig's metadata and settings.
     rig: Rig = field(default_factory=Rig)
     #: The amplifier block.
@@ -597,11 +700,9 @@ class DeviceState:
     #: Current bank, 0-based, once known. Kept live by the ``$06`` Extended
     #: Parameter the device sends at :data:`libkp._generated.CURRENT_BANK_ADDRESS`
     #: whenever the bank changes -- from the front panel as readily as from a
-    #: controller -- and by the reply to
-    #: :meth:`libkp.model.DeviceModel.refresh_position`. Can also be seeded
-    #: before a session opens, from the CBOR state-dump snapshot
-    #: (:func:`libkp.cbor.fetch_state_snapshot`) via
-    #: :meth:`libkp.model.DeviceModel.set_current_position`.
+    #: controller -- by the reply to
+    #: :meth:`libkp.model.DeviceModel.refresh_position`, and by the control
+    #: channel's state dump and pushes, all through the one fold.
     current_bank: int | None = None
     #: Current rig slot within the bank, 0-based, once known. Same source as
     #: :attr:`current_bank`, at
@@ -621,9 +722,10 @@ class DeviceState:
         return self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
 
     #: Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
-    #: ``0x00/0x77``). Filled only from a CBOR source -- the state dump
-    #: (:attr:`libkp.cbor.StateSnapshot.morph`) or a CBOR session's live pushes.
-    #: A MIDI3-only client never learns it, so this stays ``None`` there.
+    #: ``0x00/0x77``). Filled only from the CBOR control channel -- its state
+    #: dump when the model's control link opens, then its live pushes -- so it
+    #: stays ``None`` while :attr:`channels` says the control link never opened,
+    #: and goes stale once it is lost (:attr:`Connection.DEGRADED`).
     morph: int | None = None
     #: The most recent realtime status / meter frame (the FAST lane).
     status: RealtimeStatus = field(default_factory=RealtimeStatus)
@@ -670,54 +772,21 @@ class DeviceState:
         One reply stays outside the table: a ``$3C`` rendered-string reply is a
         transient :class:`RenderedString` event and stores nothing.
         """
-        parsed = NrpnHeader.parse(msg)
-        if parsed is None:
+        decoded = _decode_stream(msg)
+        if decoded is None:
             return ApplyOutcome.empty()
-        header, vals = parsed
-        function = header.function
-        flat = header.page * 128 + header.number
-        decoded: Decoded
-
-        # The extended ($06) and extended-string ($07) addresses are 5x7-bit
-        # encoded and do not fit the fixed header layout, so decode both off the
-        # raw message.
-        if function == nrpn.FUNCTION_EXT_PARAM:
-            ext = nrpn.parse_extended_param(msg)
-            if ext is None:
-                return ApplyOutcome.empty()
-            flat, value = ext
-            decoded = Num(value)
-        elif function == nrpn.FUNCTION_EXT_STRING_PARAM:
-            ext_string = nrpn.parse_extended_string(msg)
-            if ext_string is None:
-                return ApplyOutcome.empty()
-            flat, text = ext_string
-            decoded = Text(text)
-        elif function == nrpn.FUNCTION_STRING_PARAM:
-            decoded = Text(_ascii_until_nul(vals))
-        elif function == nrpn.FUNCTION_SINGLE_PARAM:
-            if len(vals) < 2:
-                return ApplyOutcome.empty()
-            decoded = Num(u14(vals[0], vals[1]))
-        elif function == nrpn.FUNCTION_MULTI_PARAM:
-            decoded = Block(tuple(value for _number, value in nrpn.multi_values(0, vals)))
-        elif function == nrpn.FUNCTION_RENDERED_STRING_REPLY:
-            rendered = nrpn.parse_rendered_string(msg)
-            if rendered is None:
-                return ApplyOutcome.empty()
-            page, number, value, text = rendered
-            return ApplyOutcome.fast(RenderedString(page, number, value, text))
-        else:
-            return ApplyOutcome.empty()
-        return self.apply_update(Update(Channel.STREAM, Phase.LIVE, flat, decoded))
+        if isinstance(decoded, RenderedString):
+            return ApplyOutcome.fast(decoded)
+        return self.apply_update(decoded)
 
     def apply_cbor(self, address: int, value: int) -> ApplyOutcome:
         """Fold one live **CBOR** numeric into the tree.
 
         The CBOR channel and the MIDI3 stream are two wire formats over one event
         universe, so a value arriving either way lands in the same field and
-        raises the same event. This is the entry point for a
-        :class:`libkp.cbor.CborSession`'s live pushes. A negative value is not a
+        raises the same event. The model's control link folds its items through
+        the same rules (with the dump phase set where it applies); this is the
+        one-value entry point for tooling and vectors. A negative value is not a
         parameter value on this channel and is dropped before routing; anything
         else is range-checked by the row it lands on.
         """
@@ -942,6 +1011,60 @@ def _decode(kind: gen.Kind, decoded: Decoded, address: int) -> object | None:
     if kind is gen.Kind.BPM:
         return value // gen.TEMPO_BPM_SCALE if value <= gen.FULL_SCALE else None
     raise ValueError(f"no decode for {kind}")
+
+
+def _decode_stream(msg: bytes) -> Update | RenderedString | None:
+    """What one unframed MIDI3 message carries, before any of it is folded.
+
+    The decode half of :meth:`DeviceState.apply`, on its own so that the
+    model's stream link can see the address and value of every message it
+    ingests -- a request's reply is recognised by exactly that, whether or not
+    the fold then stores it (a reply carrying the value already held is deduped
+    to nothing, yet it answers the request all the same). Returns the
+    :class:`Update` the message is, the :class:`RenderedString` reply that
+    stays outside the table, or ``None`` for a non-Kemper or unparseable
+    message.
+    """
+    parsed = NrpnHeader.parse(msg)
+    if parsed is None:
+        return None
+    header, vals = parsed
+    function = header.function
+    flat = header.page * 128 + header.number
+    decoded: Decoded
+
+    # The extended ($06) and extended-string ($07) addresses are 5x7-bit
+    # encoded and do not fit the fixed header layout, so decode both off the
+    # raw message.
+    if function == nrpn.FUNCTION_EXT_PARAM:
+        ext = nrpn.parse_extended_param(msg)
+        if ext is None:
+            return None
+        flat, value = ext
+        decoded = Num(value)
+    elif function == nrpn.FUNCTION_EXT_STRING_PARAM:
+        ext_string = nrpn.parse_extended_string(msg)
+        if ext_string is None:
+            return None
+        flat, text = ext_string
+        decoded = Text(text)
+    elif function == nrpn.FUNCTION_STRING_PARAM:
+        decoded = Text(_ascii_until_nul(vals))
+    elif function == nrpn.FUNCTION_SINGLE_PARAM:
+        if len(vals) < 2:
+            return None
+        decoded = Num(u14(vals[0], vals[1]))
+    elif function == nrpn.FUNCTION_MULTI_PARAM:
+        decoded = Block(tuple(value for _number, value in nrpn.multi_values(0, vals)))
+    elif function == nrpn.FUNCTION_RENDERED_STRING_REPLY:
+        rendered = nrpn.parse_rendered_string(msg)
+        if rendered is None:
+            return None
+        page, number, value, text = rendered
+        return RenderedString(page, number, value, text)
+    else:
+        return None
+    return Update(Channel.STREAM, Phase.LIVE, flat, decoded)
 
 
 def _ascii_until_nul(data: bytes) -> str:

@@ -2,8 +2,10 @@
 
 This is the rich, widget-based counterpart to the zero-dependency
 :mod:`libkp.examples.meters` ANSI view. It connects (discovering the device if
-no ``--ip`` is given), performs the read-only initial rig sync, then drives a
-full-screen Textual UI straight off the async :class:`~libkp.model.DeviceModel`:
+no ``--ip`` is given) with the model's default options -- the stream, the
+control link that carries the morph, and the read-only request burst -- then
+drives a full-screen Textual UI straight off the async
+:class:`~libkp.model.DeviceModel`:
 
 - the **slow lane** — rig name / author / tempo / morph, amp and cabinet, and
   the eight effect blocks with their on/off state and type — bound to
@@ -321,14 +323,18 @@ def _build_app_class():
             if state.morph is not None:
                 meta.append(f"morph {state.morph / FULL_SCALE * 100:.0f}%", style="magenta")
 
-            connected = state.connection is Connection.CONNECTED
+            # Degraded is the stream without the control link: everything but
+            # the morph is live, so it reads as connected with a caveat.
             conn = Text()
-            if connected:
+            if state.connection is Connection.CONNECTED:
                 conn.append("● ", style="green")
                 conn.append("connected  ", style="grey50")
+            elif state.connection is Connection.DEGRADED:
+                conn.append("● ", style="yellow")
+                conn.append("connected, morph unavailable  ", style="grey50")
             else:
                 conn.append("○ ", style="grey50")
-                conn.append("disconnected  ", style="grey50")
+                conn.append(f"{state.connection.value}  ", style="grey50")
             conn.append(f"{self._ip}:{self._args.port}   ", style="cyan")
             conn.append(
                 f"{self.view.frames} frames ({self.view.message_rate():.0f}/s)",

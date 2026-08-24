@@ -455,6 +455,12 @@ final class ConformanceTests: XCTestCase {
         case .currentPosition: return "current_position"
         case .connected: return "connected"
         case .disconnected: return "disconnected"
+        // The model raises these from what its sockets do; no vector step
+        // drives them, so they have no wire name to check.
+        case .connectionChanged: return "connection_changed"
+        case .channelChanged: return "channel_changed"
+        case .syncCompleted: return "sync_completed"
+        case .requestTimedOut: return "request_timed_out"
         }
     }
 

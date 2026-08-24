@@ -1,9 +1,16 @@
-"""Unit tests for the CBOR channel codec and the state-dump snapshot."""
+"""Unit tests for the CBOR channel codec, the control link and the state-dump
+snapshot."""
 
 from __future__ import annotations
 
+import asyncio
+
+from fake_device import DEFAULT_DUMP, FakeDevice, wait_for
+
 from libkp import _generated as gen
 from libkp import cbor
+from libkp.session import PROTOCOL_CBOR_CONTROL
+from libkp.state import Num, Text
 
 
 def test_encodes_with_minimal_length_heads():
@@ -108,19 +115,79 @@ def test_empty_snapshot_is_incomplete():
     assert not snap.is_complete()
 
 
+def test_control_items_keep_item_boundaries_and_skip_blobs():
+    """The model ends the dump phase on the item whose base is the end
+    address, so the walk must keep items apart -- and an opaque ``[5, …]``
+    blob, or a pair no implementation can represent, yields nothing."""
+    run = cbor.Tag(1, [2, gen.DUMP_END_ADDRESS, 7, 8])
+    name = cbor.Tag(1, [4, 1, "Maz 18 Pushed"])
+    blob = cbor.Tag(1, [5, 17, b"\x00\x01"])
+    flagged = cbor.Tag(1, [-1, 1, gen.MORPH_ADDRESS, 3])
+    wide = cbor.param_write(0xFFFF_FFFF + 1, 1)
+    items = cbor.control_items([run, name, blob, flagged, wide])
+    assert [item.base for item in items] == [gen.DUMP_END_ADDRESS, 1, gen.MORPH_ADDRESS, 4294967296]
+    assert items[0].values == ((gen.DUMP_END_ADDRESS, Num(7)), (gen.DUMP_END_ADDRESS + 1, Num(8)))
+    assert items[1].values == ((1, Text("Maz 18 Pushed")),)
+    assert items[2].values == ((gen.MORPH_ADDRESS, Num(3)),)
+    assert items[3].values == ()
+
+
 def test_session_backlog_survives_a_late_subscriber():
-    """The state dump lands as soon as the session opens, which is before a
+    """The state dump lands as soon as the link opens, which is before a
     caller can subscribe. Those values must not be sent into a void -- the morph
-    among them appears nowhere else until something moves it."""
-    session = cbor.CborSession(session=None)
+    among them appears nowhere else until something moves them."""
+    session = cbor.CborSession(None)
     # Values arriving with nobody subscribed are held...
-    session._emit([cbor.param_write(gen.MORPH_ADDRESS, 8192)])
+    session._on_items(cbor.control_items([cbor.param_write(gen.MORPH_ADDRESS, 8192)]))
     assert list(session._backlog) == [(gen.MORPH_ADDRESS, 8192)]
     # ...and replayed to the first subscriber.
     queue = session.updates()
     assert queue.get_nowait() == (gen.MORPH_ADDRESS, 8192)
     assert not session._backlog
     # Once subscribed, values go straight out rather than accumulating.
-    session._emit([cbor.param_write(gen.MORPH_ADDRESS, 0)])
+    session._on_items(cbor.control_items([cbor.param_write(gen.MORPH_ADDRESS, 0)]))
     assert queue.get_nowait() == (gen.MORPH_ADDRESS, 0)
     assert not session._backlog
+
+
+# ---------------------------------------------------------------------------
+# The link, against the stand-in device
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_state_snapshot_reads_the_dump_over_the_control_link():
+    async def scenario():
+        async with FakeDevice(offer_cbor=True) as device:
+            snapshot = await cbor.fetch_state_snapshot("127.0.0.1", port=device.port, timeout=2.0)
+            await wait_for(lambda: all(c.closed.is_set() for c in device.connections))
+            return snapshot, device
+
+    snapshot, device = asyncio.run(scenario())
+    assert snapshot.is_complete()
+    assert (snapshot.current_bank, snapshot.current_rig_slot, snapshot.morph) == (3, 1, 8192)
+    assert snapshot.string(gen.STRING_RIG_NAME) == "Dump Rig"
+    # One socket, the trigger written exactly once, and nothing left open.
+    assert device.connection_count(PROTOCOL_CBOR_CONTROL) == 1
+    assert device.control.received_items == [cbor.state_dump_request()]
+
+
+def test_cbor_session_streams_the_dump_and_later_pushes():
+    async def scenario():
+        async with FakeDevice(offer_cbor=True) as device:
+            async with await cbor.CborSession.connect("127.0.0.1", device.port) as session:
+                queue = session.updates()
+                seen = []
+                while len(seen) < len(cbor.numeric_values(DEFAULT_DUMP)):
+                    seen.append(await asyncio.wait_for(queue.get(), 2.0))
+                await device.push_items([cbor.param_write(gen.MORPH_ADDRESS, 0)])
+                seen.append(await asyncio.wait_for(queue.get(), 2.0))
+                return seen
+
+    seen = asyncio.run(scenario())
+    assert seen[:4] == [
+        (gen.CURRENT_BANK_ADDRESS - 1, 0),
+        (gen.CURRENT_BANK_ADDRESS, 3),
+        (gen.CURRENT_RIG_SLOT_ADDRESS, 1),
+        (gen.MORPH_ADDRESS, 8192),
+    ]
+    assert seen[-1] == (gen.MORPH_ADDRESS, 0)

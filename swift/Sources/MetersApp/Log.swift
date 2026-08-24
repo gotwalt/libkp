@@ -86,6 +86,14 @@ enum Log {
             return "connected"
         case .disconnected:
             return "disconnected"
+        case let .connectionChanged(connection):
+            return "connection \(connection)"
+        case let .channelChanged(channel, state):
+            return "channel \(channel) \(state)"
+        case let .syncCompleted(source):
+            return "sync completed (\(source))"
+        case let .requestTimedOut(address):
+            return "request timed out at \(address)"
         }
     }
 

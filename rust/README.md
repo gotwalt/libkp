@@ -22,7 +22,8 @@ use libkp::model::DeviceModel;
 let reply = libkp::find_first(std::time::Duration::from_secs(3)).await?;
 let ip = reply.and_then(|r| r.ipv4()).unwrap_or(Ipv4Addr::new(192, 168, 1, 50));
 
-// Connect: opens the streaming session and runs a read-only initial rig sync.
+// Connect: opens the stream, runs the read-only sync burst in the background,
+// and opens the control link (the morph position's only source) after it.
 let model = DeviceModel::connect(ip).await?;
 
 // The store: a fresh snapshot every time snapshot-visible state changes.
@@ -57,14 +58,14 @@ let replies = port.poll(&libkp::Options::default()).await?;
 | `discovery` | Async UDP broadcast discovery (`DiscoveryPort`, `discover`, `find_first`). |
 | `session` | TCP connect, the protocol-list handshake, and the stream preamble. Every open passes the process-wide connection ledger, which waits out `CONNECTION_COOLDOWN` since the last open or close to the same device. |
 | `midi3` | The 4-byte stream framing (`Unframer`, `frame`). |
-| `cbor` | The native CBOR channel: codec, `StateSnapshot::fetch` (a one-shot read of the current bank/rig/morph) and `CborSession` (a live session streaming what MIDI3 omits). |
+| `cbor` | The native CBOR channel: codec, and the one open-and-ingest path the model's control link is built on. `StateSnapshot::fetch` (a one-shot read of the current bank/rig/morph) and `CborSession` (a live raw feed) are tools on the same path for reading the channel on its own. |
 | `nrpn` | Kemper SysEx/NRPN builders and parsers (14-bit values, string tags, extended strings, the beacon). |
 | `control` | The 7-bit CC / Program Change / Bank Select vocabulary (`Control`). |
 | `params` | Offline `page/number → name` lookups over the generated tables. |
 | `registry` | Typed descriptors (`ParamKind`, `format_value`) layered over `params`. |
 | `state` | The immutable `DeviceState` tree — rig, amp, cabinet, eight effect slots, tuner, output, morph, meters — and its decoders: `apply` (one MIDI3 message), `apply_cbor` / `apply_cbor_text` (one CBOR item), each a thin front on the fold. |
 | `routes` | The state routing fold: `DeviceState::apply_update`, the one funnel every value passes through whichever wire carried it, driven by the generated `STATE_ROUTES` table (`spec/state.toml`) — which addresses are tracked, which channel may write them, how they decode, whether a repeat is a no-op. |
-| `model` | `DeviceModel`, the async observable store. |
+| `model` | `DeviceModel`, the async observable store: the only object that holds a socket to the device. Owns the MIDI3 stream (ingest, writer, the request lane) and the CBOR control link, feeds both into the one funnel, and supervises connect, loss and reconnect. |
 | `error` | `DiscoverError`, `SessionError`, `ParseError`. |
 | `fmt` | Small hex/ASCII formatting helpers. |
 
@@ -81,18 +82,61 @@ let replies = port.poll(&libkp::Options::default()).await?;
 `model.events()` is the granular delta stream if you would rather have deltas
 than snapshots.
 
-### Parameters vs actions
+### Two links
+
+A `DeviceModel` holds two sockets and shows you neither:
+
+- The **stream** is the MIDI3 session — the meter frame, every parameter push,
+  the strings, and the request/reply lane. It is required: losing it is
+  losing the device.
+- The **control link** is the device's native CBOR channel, opened right after
+  the stream by default (`ControlPolicy::BestEffort`). Its state dump and its
+  live pushes fold into the same tree, which is how the morph position — a
+  value the stream never carries — reaches `state.morph`. The link is
+  read-only by construction: the one item libkp writes on it is the dump
+  trigger, and there is no queue to write anything else.
+
+`state.channels` reports each link as it really is (`Closed`, `Connecting`,
+`Open`, `Unavailable`, `Lost`) and `state.connection` summarises them:
+`Connected`, `Degraded` (the stream is up but the control link, which was
+asked for, is not — the morph has gone stale, nothing else has), `Reconnecting
+{ attempt }`, or `Disconnected`. Every transition raises
+`DeviceEvent::ConnectionChanged` / `ChannelChanged`; `Connected` and
+`Disconnected` are still raised too.
+
+`DeviceModel::connect_with(ip, ConnectOptions { .. })` chooses: whether to open
+the control link at all (`Off`), in the background (`BestEffort`), or before
+`connect` returns and failing it otherwise (`Required`); whether to run the
+sync burst (`SyncStrategy::StreamBurst`, the default — the 46 `request = true`
+rows of the routing table, answered by the device within tens of milliseconds
+and reported by `SyncCompleted { Stream }`) or nothing (`Off`); and whether to
+redial the stream after a loss (`ReconnectPolicy::stream: Some(Backoff::
+default_stream())`, 4 s doubling to 30 s) — by default a lost stream is
+reported as `Disconnected` and left there, and a lost control link as
+`Degraded` until `reopen_control()` asks for it again (never inside
+`CONTROL_REOPEN_MIN_GAP_MS` of the last attempt). Dropping the last handle,
+or `close()`, closes both links and raises `Disconnected`.
+
+### Parameters, requests and actions
 
 - **Parameters** (`set_gain`, `set_rig_volume`, `set_effect_enabled`, …) go out
   as 14-bit NRPN Single Parameter Changes. The device applies them silently and
   does not echo them, so follow a set with `request_param` when the snapshot
   should confirm the new value.
+- **Requests** (`request_param`, `request_string`, `request_ext_param`,
+  `request_ext_string`, `request_render`, and `refresh` / `refresh_rig` /
+  `refresh_bank` / `refresh_position`) are read-only questions with an answer:
+  each rides the stream's request lane and resolves with the device's reply,
+  or with `RequestError::Timeout` after `REQUEST_TIMEOUT_MS` (300 ms — never
+  retried). At most `MAX_IN_FLIGHT_REQUESTS` (16) are on the wire at once; the
+  rest queue. The morph position is `Unreadable` over the stream and is
+  refused without sending.
 - **Actions** (`tap_tempo`, `rig_up`, `select_rig`, `tuner_mode`, …) go out as
   7-bit Control Changes. They are momentary and carry no read-back, so they are
   not reflected in state.
 
-`set_param` and `send_control` are the escape hatches for any address or any
-raw control.
+`set_param`, `send_control` and `send_raw` are the escape hatches for any
+address, any raw control, or any MIDI bytes at all.
 
 ## The `meters` example
 
@@ -114,6 +158,13 @@ Ctrl-C quits and restores the terminal.
 ```sh
 cargo test
 ```
+
+`tests/model.rs` drives `DeviceModel` against the fake device in
+`tests/common/mod.rs` — a multi-connection, protocol-aware stand-in that
+answers requests from value tables, serves a CBOR dump on the trigger, and
+can hang up either link — through connect, the dump, the request lane, loss,
+reconnect, close and drop. The fake takes an ephemeral port, so the
+connection ledger only ever spaces a model's own second socket.
 
 `tests/conformance.rs` is the cross-language contract. It loads
 `spec/vectors/*.json` (synthetic builder/parser vectors, which pin every

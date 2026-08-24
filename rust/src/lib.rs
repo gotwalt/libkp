@@ -9,15 +9,16 @@
 //! - [`session`] — TCP connect + the line-based protocol handshake, behind
 //!   the process-wide connection ledger that spaces opens to one device.
 //! - [`midi3`] — the 4-byte stream framing that carries MIDI over the session.
-//! - [`cbor`] — the device's native CBOR channel and the state-dump snapshot
-//!   ([`cbor::StateSnapshot::fetch`]) that reads the current bank, rig slot and
-//!   morph, and a live [`cbor::CborSession`] that streams what MIDI3 omits.
+//! - [`cbor`] — the device's native CBOR channel: the codec, the open-and-ingest
+//!   path the model's control link is built on, and two tools on that path for
+//!   reading the channel by itself ([`cbor::StateSnapshot::fetch`],
+//!   [`cbor::CborSession`]).
 //! - [`nrpn`] — Kemper SysEx/NRPN builders and parsers.
 //! - [`control`] — the 7-bit CC / PC / Bank Select control vocabulary.
 //! - [`params`] / [`registry`] — offline name and descriptor lookups.
 //! - [`state`] / [`routes`] / [`model`] — the immutable state tree and its
 //!   decoders, the routing fold both wires pass through, and the observable
-//!   store.
+//!   store that owns both links to the device.
 //! - [`error`] — error types.
 //!
 //! Discovery and the TCP session share one port, [`PORT`] (5727).
@@ -71,7 +72,10 @@ pub use control::{Control, ModuleSlot, program_change, slot_enable_cc};
 pub use discovery::{DiscoveryPort, Options, Reply, discover, find_first};
 pub use error::{DiscoverError, ParseError, SessionError};
 pub use midi3::Unframer;
-pub use model::{ApplyOutcome, CommandError, DeviceEvent, DeviceModel, RealtimeStatus};
+pub use model::{
+    ApplyOutcome, Backoff, ChannelError, CommandError, ConnectOptions, ControlPolicy, DeviceEvent,
+    DeviceModel, RealtimeStatus, ReconnectPolicy, RequestError, SyncStrategy,
+};
 pub use nrpn::{
     NrpnHeader, beacon, control_change, ext_decode, multi_values, parse_extended_string,
     parse_rendered_string, request_multi, request_rendered_string, request_single, request_string,
@@ -85,6 +89,6 @@ pub use session::{
     PROTOCOL_REQUEST_RESPONSE, Session,
 };
 pub use state::{
-    Amp, Cabinet, Channel, Connection, Decoded, DeviceState, Effect, Output, Phase, Rig, Tuner,
-    Update,
+    Amp, Cabinet, Channel, ChannelState, Channels, Connection, Decoded, DeviceState, Effect,
+    Output, Phase, Rig, Tuner, Update,
 };

@@ -247,13 +247,13 @@ def test_closing_twice_stamps_the_ledger_once():
 def test_the_snapshot_fetch_goes_through_the_ledger():
     # `fetch_state_snapshot` opens its own socket via `Session.connect`, so a
     # fetch straight after a session closes is held back like any other open.
-    # The fake accepts whatever protocol is named and never answers the dump,
-    # so the fetch returns an empty snapshot once its short timeout passes.
+    # The fake offers the control protocol but serves no dump, so the fetch
+    # returns an empty snapshot once its short timeout passes.
     from libkp.cbor import fetch_state_snapshot
 
     async def scenario():
         loop = asyncio.get_running_loop()
-        async with FakeDevice() as device:
+        async with FakeDevice(offer_cbor=True, dump_items=[]) as device:
             session = await Session.connect("127.0.0.1", device.port)
             await session.close()
             closed_at = loop.time()
