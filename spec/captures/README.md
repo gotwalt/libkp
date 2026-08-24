@@ -16,9 +16,11 @@ All human- and device-identifying **text** — device names, owners, serials, MA
 addresses, profile authors, and timestamps — has been removed. String and
 extended-string message payloads carry neutral placeholders (`Test Rig`,
 `Test Amp`, `Test Cab`, `Author`, or empty); the discovery reply uses entirely
-synthetic field values. The **numeric and structural** content — message types,
-addresses, 14-bit values, meter frames, and the exact byte-level framing — is
-preserved unchanged. No captured identity is present in any fixture.
+synthetic field values; the control channel's `[5, addr, bytes]` blobs carry an
+empty payload. The **numeric and structural** content — message types,
+addresses, 14-bit values, meter frames, CBOR item shapes and order, and the
+exact byte-level framing — is preserved unchanged. No captured identity is
+present in any fixture.
 
 ## Format
 
@@ -27,7 +29,7 @@ preserved unchanged. No captured identity is present in any fixture.
 ```json
 {
   "name": "...",
-  "kind": "discovery" | "midi3_stream",
+  "kind": "discovery" | "midi3_stream" | "cbor_stream",
   "description": "...",
   "raw": "<lowercase hex of the bytes to feed>",
   "expected": { ... }        // kind-specific, below
@@ -57,6 +59,36 @@ assert whichever of these `expected` fields are present:
   (`"none"` for non-Kemper messages).
 - `state` — apply every message to a fresh device state, then assert these
   fields (only those present): `rig_name`, `amp_name`, `cab_name`.
+
+### kind: `cbor_stream`
+
+`raw` is a CBOR control-channel byte stream: the device's reply to one
+state-dump trigger, with the live items that arrived in the same window. Feed
+it to the CBOR decoder in a single push and assert whichever of these
+`expected` fields are present:
+
+- `item_count` — number of complete items produced.
+- `pending` — bytes left buffered (a trailing partial item); usually `0`.
+- `filler_bytes` — inter-item filler bytes the decoder skipped.
+- `numeric_count` — number of numeric `(address, value)` pairs the items carry
+  (every single, every element of every run, in document order).
+- `strings` — the exact `[address, text]` pairs the walk yields, in document
+  order. An empty string is not a value and is not listed.
+- `blob_count` — number of `[5, addr, bytes]` items. The decoder carries them
+  as opaque byte strings; the walk yields nothing for them.
+- `live_items` — `{ "<address>": count }`: how many single `[1, addr, value]`
+  items name each listed address, a leading `-1` source flag skipped. An
+  address listed with `0` must not appear.
+- `dump_end_index` — the index of the last item that is a run based at
+  `DUMP_END_ADDRESS` (100800), the run that closes the dump; the live items
+  that follow it are the window's tail.
+- `state` — fold every item into a fresh device state through the control
+  path (each numeric via `apply_cbor`, each string via `apply_cbor_text`, in
+  document order), then assert these fields (only those present): `rig_name`,
+  `amp_name`, `cab_name`, `current_bank`, `current_rig_slot`, `morph`, `bank`
+  (five `{ rig_name, amp_name, cab_name }` slots), and `status_raw` (the eleven
+  meter values — all zero, because the meter items are stream-only and must not
+  land).
 
 ## Harness
 

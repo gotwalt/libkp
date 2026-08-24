@@ -40,6 +40,7 @@ public enum Generated {
     public static let stateDumpTriggerAddress: UInt32 = 102528
     public static let stateDumpTriggerValue: Int64 = 1
     public static let dumpEndAddress: UInt32 = 100800
+    public static let dumpEndRuns: Int = 2
     public static let sensitiveAddresses: [UInt32] = [200008, 200009]
     public static let redactedPlaceholder: String = "[redacted]"
     public static let midi3TagContinuation: UInt8 = 0x14

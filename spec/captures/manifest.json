@@ -17,6 +17,10 @@
     {
       "file": "rig-load.json",
       "kind": "midi3_stream"
+    },
+    {
+      "file": "cbor-state-dump.json",
+      "kind": "cbor_stream"
     }
   ]
 }

@@ -121,6 +121,13 @@ state_dump_trigger_value = 1
 # address. Measured over repeated dumps (docs/11); the model closes the dump
 # phase when it has folded that run, and falls back to `dump_settle_ms`.
 dump_end_address = 100800
+# The dump has two sections, each closed by that run: the system section
+# (identity, global settings, the position) and then the rig section, which
+# opens with the position run again. Measured identical across repeated
+# dumps: the run sits at item 32 (~80 ms) and at item 201 (~340 ms) of 202.
+# The phase ends at the second, and `dump_settle_ms` covers a device that
+# never sends it.
+dump_end_runs = 2
 # Addresses whose string values are the device's stored WiFi credentials
 # (network name and passphrase). The state dump volunteers both in the clear; a
 # reader must never surface them. See docs/06.
