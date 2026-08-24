@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.7.0")
+        XCTAssertEqual(Generated.specVersion, "0.8.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file
@@ -374,6 +374,11 @@ final class ConformanceTests: XCTestCase {
                 XCTAssertEqual(
                     outcomes.filter(\.slowChanged).count, slowSteps.intValue,
                     "\(name): slow_steps")
+            }
+            if let positions = expect["positions"] as? [NSNumber] {
+                XCTAssertEqual(
+                    outcomes.flatMap(\.positions), positions.map(\.uint16Value),
+                    "\(name): positions")
             }
         }
     }

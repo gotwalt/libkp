@@ -914,7 +914,8 @@ async fn an_aim_past_the_end_is_dropped_after_the_window_and_may_be_sent_again()
     let stream = fake.wait_for_stream(0).await;
 
     let aimed_at = Instant::now();
-    model.navigate_to(999);
+    // 639 is the last index the wire can name (bank 127, slot 5).
+    model.navigate_to(639);
     assert!(wait_for(|| stream.received().len() == 2, PATIENCE).await);
     // The device stays put and says so; that is not a confirmation.
     push_position(&stream, 16).await;
@@ -922,7 +923,7 @@ async fn an_aim_past_the_end_is_dropped_after_the_window_and_may_be_sent_again()
         matches!(e, DeviceEvent::CurrentPosition { slot: Some(1), .. })
     })
     .await;
-    assert_eq!(model.state().navigation.aim, Some(999));
+    assert_eq!(model.state().navigation.aim, Some(639));
 
     let dropped = next_event(&mut events, |e| {
         matches!(e, DeviceEvent::NavigationDropped { .. })
@@ -931,7 +932,7 @@ async fn an_aim_past_the_end_is_dropped_after_the_window_and_may_be_sent_again()
     assert_eq!(
         dropped,
         DeviceEvent::NavigationDropped {
-            index: 999,
+            index: 639,
             reason: NavDrop::Unconfirmed
         }
     );
@@ -948,9 +949,40 @@ async fn an_aim_past_the_end_is_dropped_after_the_window_and_may_be_sent_again()
     assert_eq!(stream.received().len(), 2, "never re-sent while aimed");
 
     // A drop forgets the sent index, so the same aim goes out again.
-    model.navigate_to(999);
+    model.navigate_to(639);
     assert!(wait_for(|| stream.received().len() == 4, PATIENCE).await);
-    assert_eq!(&stream.received()[2..], &load_pair(999));
+    assert_eq!(&stream.received()[2..], &load_pair(639));
+    model.close().await;
+}
+
+#[tokio::test]
+async fn an_index_the_wire_cannot_name_is_dropped_at_once() {
+    // The bank preselect is a 7-bit CC value: an aim whose bank does not fit
+    // (index >= 128 * BANK_SLOTS) is dropped immediately with nothing on the
+    // wire — masking the bank would silently load a real but wrong rig.
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), quiet(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let stream = fake.wait_for_stream(0).await;
+
+    let index = 128 * generated::BANK_SLOTS as u16;
+    model.navigate_to(index);
+    let dropped = next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::NavigationDropped { .. })
+    })
+    .await;
+    assert_eq!(
+        dropped,
+        DeviceEvent::NavigationDropped {
+            index,
+            reason: NavDrop::Unconfirmed
+        }
+    );
+    assert_eq!(model.state().navigation, Navigation::default());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(stream.received().is_empty(), "nothing goes on the wire");
     model.close().await;
 }
 

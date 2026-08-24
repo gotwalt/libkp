@@ -182,8 +182,9 @@ unavailable or lost never learns it; `state.channels.control` says which, and
 
 The dump also volunteers the device's stored WiFi credentials in the clear — the
 network name at address 200008 and its passphrase at 200009
-(`sensitive_addresses`). Every reader in `libkp` — the fold, the snapshot
-tooling — replaces a string at these addresses with `[redacted]`
+(`sensitive_addresses`). Every reader in `libkp` — the fold, the request
+lane's replies, the snapshot tooling — replaces a string at these addresses
+with `[redacted]`
 (`redacted_placeholder`) before it is exposed, and nothing surfaces them. A
 reader built on the raw codec must do the same. (The tree tracks neither
 address, so in practice the fold stores nothing at either.)

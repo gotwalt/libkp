@@ -377,6 +377,12 @@ pub struct ApplyOutcome {
     pub events: Vec<DeviceEvent>,
     /// Whether a slow (snapshot-visible) field changed.
     pub slow_changed: bool,
+    /// Every flat rig index this update reported for the Navigator: a
+    /// position row that stored — or deduped an unchanged report — with both
+    /// halves known and the index inside sixteen bits. A deduped report
+    /// raises no event, but the Navigator still needs it: re-loading the rig
+    /// already loaded is confirmed by a push that changes nothing.
+    pub positions: Vec<u16>,
 }
 
 impl ApplyOutcome {
@@ -389,15 +395,7 @@ impl ApplyOutcome {
     pub(crate) fn fast(event: DeviceEvent) -> Self {
         ApplyOutcome {
             events: vec![event],
-            slow_changed: false,
-        }
-    }
-
-    /// Events that changed a slow (snapshot-visible) field.
-    pub(crate) fn slow(events: Vec<DeviceEvent>) -> Self {
-        ApplyOutcome {
-            events,
-            slow_changed: true,
+            ..ApplyOutcome::default()
         }
     }
 }
@@ -1005,7 +1003,10 @@ impl DeviceModel {
     /// then dropped with [`DeviceEvent::NavigationDropped`]. A matching
     /// position report, from either wire, retires the aim with
     /// [`DeviceEvent::NavigationSettled`]. With the stream down the aim is
-    /// dropped at once, with the same event.
+    /// dropped at once, with the same event — and so is an index whose bank
+    /// does not fit the bank preselect's seven bits (index ≥ 128 ×
+    /// [`generated::BANK_SLOTS`]): the wire cannot name it, and masking it
+    /// would silently load a real but wrong rig.
     pub fn navigate_to(&self, index: u16) {
         nav::navigate(&self.handle.shared, index);
     }

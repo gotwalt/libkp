@@ -578,7 +578,12 @@ def build():
                        "cbor_dump_text / dump_begin / dump_end, each naming the entry point it "
                        "drives); a \"steps\" case also pins expect.events, the ordered event "
                        "names raised across all steps, and expect.slow_steps, how many steps "
-                       "returned an outcome with the snapshot flag set.",
+                       "returned an outcome with the snapshot flag set. A \"steps\" case may "
+                       "also pin expect.positions: every flat rig index the steps reported for "
+                       "the Navigator, in order. A position row reports the tree's index once "
+                       "both halves are known and it fits sixteen bits -- when it stores, and "
+                       "equally when dedupe swallows an unchanged report, because a reload of "
+                       "the loaded rig is confirmed by a report that changes nothing.",
         "cases": _state_cases() + _state_step_cases(),
     })
 
@@ -763,15 +768,18 @@ STEP_DUMP_END = {"dump_end": True}
 
 
 def _steps_case(name: str, steps: list[dict], events: list[str], slow_steps: int,
-                **tree) -> dict:
+                positions: list[int] | None = None, **tree) -> dict:
     """One transport-tagged case; the tree keys are whatever the loaders assert."""
     for s in steps:
         assert len(s) == 1 and next(iter(s)) in _STEP_KINDS, s
     unknown = set(events) - _EVENT_NAMES
     assert not unknown, f"{name}: unknown event names {sorted(unknown)}"
     assert 0 <= slow_steps <= len(steps), name
-    return {"name": name, "steps": steps,
-            "expect": {**tree, "events": events, "slow_steps": slow_steps}}
+    expect = {**tree, "events": events, "slow_steps": slow_steps}
+    if positions is not None:
+        assert all(isinstance(i, int) and 0 <= i <= 0xFFFF for i in positions), name
+        expect["positions"] = positions
+    return {"name": name, "steps": steps, "expect": expect}
 
 
 def _state_step_cases():
@@ -799,6 +807,9 @@ def _state_step_cases():
 
     def bank(value: int) -> dict:
         return step_midi3(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, value))
+
+    def rig_slot(value: int) -> dict:
+        return step_midi3(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, value))
 
     def meter_block(raw: list[int]) -> dict:
         vals = []
@@ -854,6 +865,25 @@ def _state_step_cases():
         _steps_case("rule 7: the meter frame is never deduped",
                     [meter_block(raw), meter_block(raw)],
                     ["status", "status"], 0,
+                    status_raw=raw),
+        # Dedupe silences the event, not the Navigator: re-loading the rig
+        # already loaded pushes an unchanged position, and that push is the
+        # confirmation the aim is waiting for.
+        _steps_case("rule 7: a deduped position still reports the rig index",
+                    [bank(1), rig_slot(3), bank(1), rig_slot(3)],
+                    ["current_position", "current_position"], 2,
+                    positions=[8, 8, 8],
+                    current_bank=1, current_rig_slot=3, current_rig_index=8),
+        # A `$02` at the meter base IS the frame, whatever its length: a
+        # truncated read zero-fills the tail, an extra value is ignored --
+        # never a run of bogus generic params at meter rate.
+        _steps_case("rule 1: a short meter frame zero-fills its tail",
+                    [meter_block(raw[:-1])],
+                    ["status"], 0,
+                    status_raw=raw[:-1] + [0]),
+        _steps_case("rule 1: an overlong meter frame keeps its span",
+                    [meter_block(raw + [7])],
+                    ["status"], 0,
                     status_raw=raw),
         _steps_case("rule 7: the tuner deviance is deduped on the fast lane",
                     [single(WK["page_realtime"], WK["tuner_deviance_number"], 8192),
@@ -948,6 +978,19 @@ def _state_step_cases():
                     [bank(70000)],
                     [], 0,
                     current_bank=None),
+        # The flat index is bounded like everything else: a pair of halves
+        # whose product leaves sixteen bits yields no index and reports no
+        # position, rather than trapping or wrapping into a plausible one.
+        _steps_case("rule 5: a position past sixteen bits yields no index",
+                    [bank(13107), rig_slot(3)],
+                    ["current_position", "current_position"], 2,
+                    positions=[],
+                    current_bank=13107, current_rig_slot=3, current_rig_index=None),
+        _steps_case("rule 5: the largest sixteen-bit index still reports",
+                    [bank(13106), rig_slot(4)],
+                    ["current_position", "current_position"], 2,
+                    positions=[65534],
+                    current_rig_index=65534),
         _steps_case("rule 5: a u7 row keeps the low seven bits",
                     [single(WK["page_tuner_note"], WK["tuner_note_number"], 0x80 | 9)],
                     ["tuner_note"], 1,
@@ -958,6 +1001,12 @@ def _state_step_cases():
                     [STEP_DUMP_BEGIN, bank(3), step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END],
                     ["current_position"], 1,
                     current_bank=3),
+        _steps_case("rule 6: a dump position dropped by a live push reports nothing",
+                    [STEP_DUMP_BEGIN, bank(3), rig_slot(0),
+                     step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END],
+                    ["current_position", "current_position"], 2,
+                    positions=[15],
+                    current_bank=3, current_rig_slot=0, current_rig_index=15),
         _steps_case("rule 6: after the dump ends a live position lands over the dump's",
                     [STEP_DUMP_BEGIN, step_cbor_dump(CURRENT_BANK_ADDRESS, 2), STEP_DUMP_END, bank(3)],
                     ["current_position", "current_position"], 2,

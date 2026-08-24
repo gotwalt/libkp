@@ -95,7 +95,7 @@ fn opt_str(v: &Value) -> Option<&str> {
 
 #[test]
 fn spec_version_matches() {
-    assert_eq!(generated::SPEC_VERSION, "0.7.0");
+    assert_eq!(generated::SPEC_VERSION, "0.8.0");
     assert_eq!(libkp::SPEC_VERSION, generated::SPEC_VERSION);
     assert_eq!(PORT, 5727);
 }
@@ -597,6 +597,19 @@ fn state_apply_vectors() {
         if let Some(v) = expect.get("slow_steps") {
             let got = outcomes.iter().filter(|o| o.slow_changed).count();
             assert_eq!(got, v.as_u64().unwrap() as usize, "[{name}] slow_steps");
+        }
+        if let Some(v) = expect.get("positions") {
+            let got: Vec<u16> = outcomes
+                .iter()
+                .flat_map(|o| o.positions.iter().copied())
+                .collect();
+            let want: Vec<u16> = v
+                .as_array()
+                .expect("positions is a list")
+                .iter()
+                .map(|x| x.as_u64().expect("a flat index") as u16)
+                .collect();
+            assert_eq!(got, want, "[{name}] positions");
         }
 
         if let Some(v) = expect.get("rig_name") {

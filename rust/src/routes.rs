@@ -42,7 +42,10 @@ pub fn route(address: u32) -> Option<&'static Route> {
 
 /// How many consecutive rows a `multi` row's block spans, counted from its
 /// base. The table expands one `span = N` row into `N` entries with the same
-/// field, so the span is the run of them.
+/// field, so the span is the run of them. The fold itself no longer needs it
+/// — a block at the base is the frame whatever its length — so it remains
+/// only for the tests that pin the table's shape.
+#[cfg(test)]
 fn span(base: &Route) -> usize {
     let start = STATE_ROUTES
         .binary_search_by_key(&base.address, |r| r.address)
@@ -165,10 +168,11 @@ impl DeviceState {
     ///
     /// The rules, in order:
     ///
-    /// 1. **Lookup.** Find the row for the address. A `multi` row matches only
-    ///    a [`Decoded::Block`] at its base of exactly its span, taken as one
-    ///    unit (the meter frame); any other block is folded element by element
-    ///    as [`Decoded::Num`] updates at `base + i` (the rig-load dump).
+    /// 1. **Lookup.** Find the row for the address. A `multi` row takes any
+    ///    [`Decoded::Block`] at its base as one unit (the meter frame),
+    ///    zero-filling a short block and cutting a long one at its span; a
+    ///    block anywhere else is folded element by element as
+    ///    [`Decoded::Num`] updates at `base + i` (the rig-load dump).
     /// 2. **No route.** A numeric on the stream at a page/number address is
     ///    still reported as a FAST `ParamChanged`; anything else untracked is
     ///    silent — a control-channel value, a text, an extended address.
@@ -187,15 +191,16 @@ impl DeviceState {
     ///    dump, a dump item folds like a live one.
     /// 7. **Dedupe.** A row with `dedupe` set is a no-op when it already holds
     ///    the decoded value — no event, no snapshot. The momentaries and the
-    ///    meter frame never dedupe: every arrival is the information.
+    ///    meter frame never dedupe: every arrival is the information. Dedupe
+    ///    silences the event, not the Navigator: a position row still reports
+    ///    the (unchanged) index in [`ApplyOutcome::positions`].
     /// 8. **Store and report.** Write the field, raise the row's event; a
     ///    `fast` row is event only, a `slow` row also flags the snapshot.
     pub fn apply_update(&mut self, u: &Update) -> ApplyOutcome {
         // 1. Lookup — and the block special case.
         let found = route(u.address);
         if let Decoded::Block(values) = &u.decoded {
-            let unit = found
-                .filter(|r| r.kind == Kind::Multi && r.slot == Some(0) && values.len() == span(r));
+            let unit = found.filter(|r| r.kind == Kind::Multi && r.slot == Some(0));
             if unit.is_none() {
                 return self.apply_block_elements(u, values);
             }
@@ -228,10 +233,14 @@ impl DeviceState {
                 }
             }
         }
-        // 7. Dedupe.
+        // 7. Dedupe. A silenced position update still reports the (unchanged)
+        // index: the Navigator is confirmed by pushes, not by changes.
         let slot = usize::from(route.slot.unwrap_or(0));
         if route.dedupe && self.read(route.field, slot).as_ref() == Some(&value) {
-            return ApplyOutcome::empty();
+            return ApplyOutcome {
+                positions: self.position_report(route.field),
+                ..ApplyOutcome::default()
+            };
         }
         // 8. Store and report.
         // What a generic `ParamChanged` reports: the wire's number, clamped to
@@ -245,12 +254,23 @@ impl DeviceState {
         let Some(events) = self.write(route, slot, value, raw) else {
             return ApplyOutcome::empty();
         };
-        match route.lane {
-            Lane::Fast => ApplyOutcome {
-                events,
-                slow_changed: false,
-            },
-            Lane::Slow => ApplyOutcome::slow(events),
+        let positions = self.position_report(route.field);
+        ApplyOutcome {
+            events,
+            slow_changed: route.lane == Lane::Slow,
+            positions,
+        }
+    }
+
+    /// What a position row reports for the Navigator once it has folded (or
+    /// deduped): the flat rig index, when both halves are known and it fits
+    /// sixteen bits. Every other row reports nothing.
+    fn position_report(&self, field: Field) -> Vec<u16> {
+        match field {
+            Field::CurrentBank | Field::CurrentRigSlot => {
+                self.current_rig_index().into_iter().collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -268,6 +288,7 @@ impl DeviceState {
             });
             out.events.extend(step.events);
             out.slow_changed |= step.slow_changed;
+            out.positions.extend(step.positions);
         }
         out
     }

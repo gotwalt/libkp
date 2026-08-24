@@ -150,6 +150,21 @@ def test_session_backlog_survives_a_late_subscriber():
     assert not session._backlog
 
 
+def test_the_backlog_replay_outgrows_the_broadcast_depth():
+    """A full dump buffers thousands of values before anyone can subscribe;
+    the first subscriber receives every one of them -- well past the fan-out
+    queues' 256-item bound -- rather than crashing into it."""
+    session = cbor.CborSession(None)
+    count = 600
+    session._on_items(
+        cbor.control_items([cbor.param_write(gen.MORPH_ADDRESS, v) for v in range(count)])
+    )
+    queue = session.updates()
+    values = [queue.get_nowait()[1] for _ in range(count)]
+    assert values == list(range(count))
+    assert not session._backlog
+
+
 # ---------------------------------------------------------------------------
 # The link, against the stand-in device
 # ---------------------------------------------------------------------------

@@ -125,8 +125,11 @@ public struct ConnectOptions: Sendable, Equatable {
 /// (``DeviceModel/write(_:)``), except the Navigator, whose load is dropped
 /// rather than queued behind a wedged socket (``enqueue(pair:)``).
 ///
-/// Owned by the actor and mutated only on it; `Sendable` is claimed so the
-/// actor's `deinit` may close it.
+/// The queue is shared between the model's actor (`enqueue`) and the writer
+/// task's executor (`nextCommand` / `waitForRoom`), so every mutable field
+/// of the queue is guarded by one lock, and continuations are always
+/// resumed *outside* it. `Sendable` is claimed because the synchronization
+/// is by hand.
 final class StreamLink: @unchecked Sendable {
     /// How many commands may wait for the writer at once.
     static let commandQueueDepth = 64
@@ -135,6 +138,8 @@ final class StreamLink: @unchecked Sendable {
     var unframer = Midi3.Unframer()
     var ingestTask: Task<Void, Never>?
     var writerTask: Task<Void, Never>?
+    /// Guards `commands`, `writer`, `roomWaiters` and `closed`.
+    private let lock = NSLock()
     /// The commands queued for the writer, oldest first, unframed.
     private(set) var commands: [[UInt8]] = []
     /// The writer, parked while the queue is empty.
@@ -149,10 +154,7 @@ final class StreamLink: @unchecked Sendable {
 
     /// Queue one command if there is room; `false` leaves the queue as it was.
     func enqueue(_ bytes: [UInt8]) -> Bool {
-        guard !closed, commands.count < StreamLink.commandQueueDepth else { return false }
-        commands.append(bytes)
-        wakeWriter()
-        return true
+        enqueue(batch: [bytes])
     }
 
     /// Queue two commands together, or neither: the Navigator's bank
@@ -160,53 +162,84 @@ final class StreamLink: @unchecked Sendable {
     /// them, and a queue too full for both is a socket the load should not be
     /// left waiting on.
     func enqueue(pair: ([UInt8], [UInt8])) -> Bool {
-        guard !closed, commands.count + 2 <= StreamLink.commandQueueDepth else { return false }
-        commands.append(pair.0)
-        commands.append(pair.1)
-        wakeWriter()
+        enqueue(batch: [pair.0, pair.1])
+    }
+
+    /// The batch goes on whole or not at all; a writer parked on an empty
+    /// queue is handed the first command directly.
+    private func enqueue(batch: [[UInt8]]) -> Bool {
+        lock.lock()
+        guard !closed, commands.count + batch.count <= StreamLink.commandQueueDepth else {
+            lock.unlock()
+            return false
+        }
+        commands.append(contentsOf: batch)
+        var handoff: (CheckedContinuation<[UInt8]?, Never>, [UInt8])?
+        if let writer {
+            self.writer = nil
+            handoff = (writer, commands.removeFirst())
+        }
+        lock.unlock()
+        if let (writer, next) = handoff { writer.resume(returning: next) }
         return true
     }
 
-    /// Wait until the writer has taken a command off a full queue. `false`
-    /// means the link closed while waiting.
+    /// Wait until there is room in the queue — at once if there already is.
+    /// `false` means the link closed while waiting.
     func waitForRoom() async -> Bool {
-        guard !closed else { return false }
-        return await withCheckedContinuation { roomWaiters.append($0) }
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if closed {
+                lock.unlock()
+                continuation.resume(returning: false)
+            } else if commands.count < StreamLink.commandQueueDepth {
+                lock.unlock()
+                continuation.resume(returning: true)
+            } else {
+                roomWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
     }
 
     /// The next command for the writer, waiting while the queue is empty;
-    /// `nil` once the link is closed.
+    /// `nil` once the link is closed. The check and the park happen under one
+    /// hold of the lock, so a command enqueued between them cannot be missed.
     func nextCommand() async -> [UInt8]? {
-        if !commands.isEmpty {
-            let next = commands.removeFirst()
-            if !roomWaiters.isEmpty { roomWaiters.removeFirst().resume(returning: true) }
-            return next
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if !commands.isEmpty {
+                let next = commands.removeFirst()
+                let waiter = roomWaiters.isEmpty ? nil : roomWaiters.removeFirst()
+                lock.unlock()
+                waiter?.resume(returning: true)
+                continuation.resume(returning: next)
+            } else if closed {
+                lock.unlock()
+                continuation.resume(returning: nil)
+            } else {
+                writer = continuation
+                lock.unlock()
+            }
         }
-        guard !closed else { return nil }
-        return await withCheckedContinuation { writer = $0 }
-    }
-
-    private func wakeWriter() {
-        guard let writer else { return }
-        self.writer = nil
-        writer.resume(returning: commands.removeFirst())
     }
 
     /// Close the socket, stop both tasks, and wake whoever was waiting on the
     /// queue with nothing.
     func close() {
-        closed = true
         ingestTask?.cancel()
         ingestTask = nil
         writerTask?.cancel()
         writerTask = nil
+        lock.lock()
+        closed = true
         commands.removeAll()
-        if let writer {
-            self.writer = nil
-            writer.resume(returning: nil)
-        }
+        let writer = self.writer
+        self.writer = nil
         let waiters = roomWaiters
         roomWaiters.removeAll()
+        lock.unlock()
+        writer?.resume(returning: nil)
         for waiter in waiters { waiter.resume(returning: false) }
         session.close()
     }

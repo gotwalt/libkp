@@ -41,7 +41,11 @@ class StreamLink:
     def __init__(self, session: Session, tail: bytes) -> None:
         self._session = session
         self._tail = tail
-        self._commands: asyncio.Queue[bytes] = asyncio.Queue(maxsize=COMMAND_QUEUE_DEPTH)
+        #: Each item is one or more messages written back to back as a unit,
+        #: so the Navigator's bank-preselect/slot-load pair cannot be split.
+        self._commands: asyncio.Queue[tuple[bytes, ...]] = asyncio.Queue(
+            maxsize=COMMAND_QUEUE_DEPTH
+        )
         self._tasks: list[asyncio.Task] = []
         self._closed = False
 
@@ -80,7 +84,7 @@ class StreamLink:
 
     async def send(self, message: bytes) -> None:
         """Queue one raw (pre-framing) MIDI message for the writer."""
-        await self._commands.put(message)
+        await self._commands.put((message,))
 
     def send_nowait(self, message: bytes) -> None:
         """Queue one message without waiting, for a caller that cannot -- the
@@ -88,7 +92,20 @@ class StreamLink:
         :class:`asyncio.QueueFull` when the writer is
         :data:`COMMAND_QUEUE_DEPTH` messages behind, which is a socket that
         has stopped taking bytes, not a burst of commands."""
-        self._commands.put_nowait(message)
+        self._commands.put_nowait((message,))
+
+    def send_pair_nowait(self, first: bytes, second: bytes) -> None:
+        """Queue two messages as one unit -- the Navigator's bank preselect
+        and slot load -- so both go on the wire back to back. Raises
+        :class:`asyncio.QueueFull` exactly as :meth:`send_nowait` does, and a
+        refusal queues neither: an orphaned preselect would leave the device
+        armed for a load that never followed. The pair travels as one queue
+        item but is two commands, so it is refused unless the queue has room
+        for both -- the same depth at which the other implementations refuse
+        it."""
+        if self._commands.maxsize - self._commands.qsize() < 2:
+            raise asyncio.QueueFull
+        self._commands.put_nowait((first, second))
 
     async def close(self) -> None:
         """Stop both tasks and close the socket. Idempotent."""
@@ -129,8 +146,8 @@ class StreamLink:
         """Drain the command queue to the wire, framing each message."""
         try:
             while True:
-                message = await self._commands.get()
-                await self._session.write_all(midi3.frame(message))
+                messages = await self._commands.get()
+                await self._session.write_all(b"".join(midi3.frame(m) for m in messages))
         except asyncio.CancelledError:
             raise
         except SessionError:

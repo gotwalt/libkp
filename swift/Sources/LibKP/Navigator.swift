@@ -172,7 +172,11 @@ extension DeviceModel {
     /// Nothing here assumes how many banks a device has. Aim past the end and
     /// the device simply stays where it is — and says so in the `$06` position
     /// push that follows, so ``DeviceState/currentRigIndex`` always reflects
-    /// where it actually landed; the aim is dropped after the window.
+    /// where it actually landed; the aim is dropped after the window. An
+    /// index whose bank does not fit the bank preselect's seven bits
+    /// (index ≥ 128 × ``Params/bankSlots``) is dropped at once, the same
+    /// way: the wire cannot name it, and masking it would silently load a
+    /// real but wrong rig.
     public func navigateTo(_ index: UInt16) {
         drive(navigator.navigate(index))
         publishNavigation()
@@ -232,7 +236,12 @@ extension DeviceModel {
         for action in actions {
             switch action {
             case .send(let index):
-                guard let stream, state.channels.stream == .open,
+                // The bank preselect is a 7-bit CC value: an index whose
+                // bank does not fit cannot be expressed on the wire at all,
+                // and is dropped like a send the stream refused — masking it
+                // would silently load a real but wrong rig.
+                guard index / UInt16(Params.bankSlots) <= 0x7F,
+                    let stream, state.channels.stream == .open,
                     stream.enqueue(pair: loadPair(index))
                 else {
                     cancelNavigationTimers()
@@ -279,7 +288,8 @@ extension DeviceModel {
     /// Queued as one unit on the stream link, so nothing comes between them.
     private func loadPair(_ index: UInt16) -> ([UInt8], [UInt8]) {
         let slots = UInt16(Params.bankSlots)
-        let bank = UInt8(truncatingIfNeeded: index / slots)
+        // `drive` has already refused a bank past 0x7F, so this cannot wrap.
+        let bank = UInt8(index / slots)
         let slot = UInt8(index % slots) + 1
         return (
             Control.bankPreselect(bank).message(channel: DeviceModel.ccChannel),

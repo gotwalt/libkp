@@ -1,5 +1,5 @@
 {
-  "description": "Apply a sequence of updates to a fresh DeviceState; assert fields. A case carries either \"messages\" (unframed MIDI3 hex, each through apply) or \"steps\" (midi3 / cbor / cbor_text / cbor_dump / cbor_dump_text / dump_begin / dump_end, each naming the entry point it drives); a \"steps\" case also pins expect.events, the ordered event names raised across all steps, and expect.slow_steps, how many steps returned an outcome with the snapshot flag set.",
+  "description": "Apply a sequence of updates to a fresh DeviceState; assert fields. A case carries either \"messages\" (unframed MIDI3 hex, each through apply) or \"steps\" (midi3 / cbor / cbor_text / cbor_dump / cbor_dump_text / dump_begin / dump_end, each naming the entry point it drives); a \"steps\" case also pins expect.events, the ordered event names raised across all steps, and expect.slow_steps, how many steps returned an outcome with the snapshot flag set. A \"steps\" case may also pin expect.positions: every flat rig index the steps reported for the Navigator, in order. A position row reports the tree's index once both halves are known and it fits sixteen bits -- when it stores, and equally when dedupe swallows an unchanged report, because a reload of the loaded rig is confirmed by a report that changes nothing.",
   "cases": [
     {
       "name": "rig name",
@@ -323,6 +323,92 @@
         ],
         "events": [
           "status",
+          "status"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 7: a deduped position still reports the rig index",
+      "steps": [
+        {
+          "midi3": "f000203302000600000006125d0000000001f7"
+        },
+        {
+          "midi3": "f000203302000600000006125e0000000003f7"
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000001f7"
+        },
+        {
+          "midi3": "f000203302000600000006125e0000000003f7"
+        }
+      ],
+      "expect": {
+        "current_bank": 1,
+        "current_rig_slot": 3,
+        "current_rig_index": 8,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2,
+        "positions": [
+          8,
+          8,
+          8
+        ]
+      }
+    },
+    {
+      "name": "rule 1: a short meter frame zero-fills its tail",
+      "steps": [
+        {
+          "midi3": "f0002033000002007c4e00640148022c3e405d60270846281f2000002e70f7"
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          100,
+          200,
+          300,
+          8000,
+          12000,
+          5000,
+          9000,
+          4000,
+          0,
+          6000,
+          0
+        ],
+        "events": [
+          "status"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 1: an overlong meter frame keeps its span",
+      "steps": [
+        {
+          "midi3": "f0002033000002007c4e00640148022c3e405d60270846281f2000002e7000000007f7"
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          100,
+          200,
+          300,
+          8000,
+          12000,
+          5000,
+          9000,
+          4000,
+          0,
+          6000,
+          0
+        ],
+        "events": [
           "status"
         ],
         "slow_steps": 0
@@ -804,6 +890,50 @@
       }
     },
     {
+      "name": "rule 5: a position past sixteen bits yields no index",
+      "steps": [
+        {
+          "midi3": "f000203302000600000006125d0000006633f7"
+        },
+        {
+          "midi3": "f000203302000600000006125e0000000003f7"
+        }
+      ],
+      "expect": {
+        "current_bank": 13107,
+        "current_rig_slot": 3,
+        "current_rig_index": null,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2,
+        "positions": []
+      }
+    },
+    {
+      "name": "rule 5: the largest sixteen-bit index still reports",
+      "steps": [
+        {
+          "midi3": "f000203302000600000006125d0000006632f7"
+        },
+        {
+          "midi3": "f000203302000600000006125e0000000004f7"
+        }
+      ],
+      "expect": {
+        "current_rig_index": 65534,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2,
+        "positions": [
+          65534
+        ]
+      }
+    },
+    {
       "name": "rule 5: a u7 row keeps the low seven bits",
       "steps": [
         {
@@ -843,6 +973,42 @@
           "current_position"
         ],
         "slow_steps": 1
+      }
+    },
+    {
+      "name": "rule 6: a dump position dropped by a live push reports nothing",
+      "steps": [
+        {
+          "dump_begin": true
+        },
+        {
+          "midi3": "f000203302000600000006125d0000000003f7"
+        },
+        {
+          "midi3": "f000203302000600000006125e0000000000f7"
+        },
+        {
+          "cbor_dump": [
+            100701,
+            2
+          ]
+        },
+        {
+          "dump_end": true
+        }
+      ],
+      "expect": {
+        "current_bank": 3,
+        "current_rig_slot": 0,
+        "current_rig_index": 15,
+        "events": [
+          "current_position",
+          "current_position"
+        ],
+        "slow_steps": 2,
+        "positions": [
+          15
+        ]
       }
     },
     {

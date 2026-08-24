@@ -21,8 +21,12 @@ class Broadcast:
     def __init__(self) -> None:
         self._queues: list[asyncio.Queue] = []
 
-    def subscribe(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_DEPTH)
+    def subscribe(self, maxsize: int = QUEUE_DEPTH) -> asyncio.Queue:
+        """A fresh queue fed by every future :meth:`send`. ``maxsize=0`` is
+        unbounded, for the one subscriber that must see every value -- the
+        state-dump replay in :meth:`libkp.cbor.CborSession.updates` -- rather
+        than only the latest."""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self._queues.append(queue)
         return queue
 

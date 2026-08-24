@@ -365,13 +365,25 @@ fn apply_actions(
 
 /// The two messages a load is: bank preselect, then the slot load that
 /// commits it. Exactly what a controller sends by hand, and the only place
-/// in libkp that puts a rig-load controller on the wire.
-fn send_load(shared: &Shared, index: u16) -> Result<(), super::CommandError> {
+/// in libkp that puts a rig-load controller on the wire. Queued as one unit,
+/// so with the queue one slot short of full the preselect is not left armed
+/// on the device for a load that was refused.
+///
+/// An index whose bank does not fit the preselect's seven bits cannot be
+/// expressed on the wire at all, and is refused here — the caller drops the
+/// aim with the usual event — where masking it to 7 bits would silently load
+/// a real but wrong rig.
+fn send_load(shared: &Shared, index: u16) -> Result<(), ()> {
     let slots = generated::BANK_SLOTS as u16;
-    let bank = Control::BankPreselect((index / slots) as u8);
+    let bank = index / slots;
+    if bank > 0x7F {
+        return Err(());
+    }
+    let bank = Control::BankPreselect(bank as u8);
     let slot = Control::LoadSlot((index % slots) as u8 + 1);
-    shared.try_enqueue(bank.message(CC_CHANNEL))?;
-    shared.try_enqueue(slot.message(CC_CHANNEL))
+    shared
+        .try_enqueue_pair(bank.message(CC_CHANNEL), slot.message(CC_CHANNEL))
+        .map_err(|_| ())
 }
 
 /// Arm one timer: a task that sleeps `after` and then runs `expire` with the

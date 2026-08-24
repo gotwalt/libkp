@@ -407,7 +407,10 @@ extension DeviceModel {
         case .num(let value):
             settle(address: update.address, with: .num(value))
         case .text(let text):
-            settle(address: update.address, with: .text(text))
+            // The fold redacts a secret before it stores; a request's reply
+            // must not hand out what the tree refuses to.
+            let value = Cbor.isSensitive(update.address) ? Generated.redactedPlaceholder : text
+            settle(address: update.address, with: .text(value))
         case .block(let values):
             for (i, value) in values.enumerated() {
                 settle(address: update.address + UInt32(i), with: .num(UInt64(value)))

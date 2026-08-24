@@ -132,7 +132,6 @@ from .state import (
     Connected,
     Connection,
     ConnectionChanged,
-    CurrentPosition,
     DeviceEvent,
     DeviceState,
     Disconnected,
@@ -787,7 +786,10 @@ class DeviceModel:
         (:class:`~libkp.state.NavigationDropped`). While the stream is down the
         aim is dropped at once, the same way, rather than raising: an aim is
         not a command that failed, it is a destination the model could not
-        reach.
+        reach. An index whose bank does not fit the bank preselect's seven
+        bits (index >= 128 * ``BANK_SLOTS``) is dropped the same way: the
+        wire cannot name it, and masking it would silently load a real but
+        wrong rig.
         """
         self._navigate(max(index, 0))
 
@@ -871,9 +873,17 @@ class DeviceModel:
         if self._closed or stream is None or self._state.channels.stream is not ChannelState.OPEN:
             return False
         bank, slot = divmod(index, gen.BANK_SLOTS)
+        if bank > 0x7F:
+            # The bank preselect is a 7-bit CC value: an index whose bank
+            # does not fit cannot be expressed on the wire at all. Refusing
+            # it here drops the aim with the usual event, where masking it
+            # would silently load a real but wrong rig.
+            return False
         try:
-            stream.send_nowait(control_mod.BankPreselect(bank).message(CC_CHANNEL))
-            stream.send_nowait(control_mod.LoadSlot(slot + 1).message(CC_CHANNEL))
+            stream.send_pair_nowait(
+                control_mod.BankPreselect(bank).message(CC_CHANNEL),
+                control_mod.LoadSlot(slot + 1).message(CC_CHANNEL),
+            )
         except asyncio.QueueFull:
             return False
         return True
@@ -951,6 +961,11 @@ class DeviceModel:
             self._set_channel(Channel.STREAM, ChannelState.UNAVAILABLE)
             self._publish()
             raise
+        if self._closed:
+            # close() ran while the dial was out: this life is over before it
+            # began, and the socket must not outlive it.
+            await stream.close()
+            raise SessionError("the model was closed while connecting")
         self._stream = stream
         # One snapshot for the whole transition: the channel, then the
         # connection it brings up, never the tree half-moved between them.
@@ -1047,18 +1062,24 @@ class DeviceModel:
 
     def _on_stream_lost(self, epoch: int) -> None:
         """The stream's socket ended (read error or EOF), reported from its own
-        task: hand recovery to a fresh task, since it has sockets to close."""
-        if epoch != self._epoch or self._closed:
-            return
-        previous = self._supervisor
-        self._supervisor = asyncio.get_running_loop().create_task(self._recover(epoch, previous))
+        task: hand recovery to a fresh task, since it has sockets to close.
 
-    async def _recover(self, epoch: int, previous: asyncio.Task | None) -> None:
-        """Tear the lost life down and, with a policy, dial again until the
-        stream is back or the model is closed."""
+        The epoch turns *here*, synchronously: the ingest and writer tasks
+        can both report the same loss in the same tick, and the second report
+        must find itself stale rather than spawn a second recovery --
+        ``close()`` would then await whichever task ``self._supervisor``
+        happened to point at while the other went on dialling."""
         if epoch != self._epoch or self._closed:
             return
         self._epoch += 1
+        previous = self._supervisor
+        self._supervisor = asyncio.get_running_loop().create_task(self._recover(previous))
+
+    async def _recover(self, previous: asyncio.Task | None) -> None:
+        """Tear the lost life down and, with a policy, dial again until the
+        stream is back or the model is closed."""
+        if self._closed:
+            return
         if previous is not None and not previous.done():
             previous.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1182,17 +1203,22 @@ class DeviceModel:
         slow_changed = outcome.slow_changed
         for event in outcome.events:
             self._emit(event)
-            if isinstance(event, CurrentPosition):
-                # Whichever wire carried it, and whichever half changed: the
-                # machine only cares where the device says it is now.
-                index = self._state.current_rig_index
-                if index is not None:
-                    slow_changed = self._on_position(index) or slow_changed
+        for index in outcome.positions:
+            # Whichever wire carried it, changed or deduped alike: the
+            # machine only cares where the device says it is now.
+            slow_changed = self._on_position(index) or slow_changed
         decoded = update.decoded
         if isinstance(decoded, Num):
             self._lane.resolve((update.address, Num), decoded.value)
         elif isinstance(decoded, Text):
-            self._lane.resolve((update.address, Text), decoded.text)
+            # The fold redacts a secret before it stores; a request's reply
+            # must not hand out what the tree refuses to.
+            text = (
+                gen.REDACTED_PLACEHOLDER
+                if update.address in gen.SENSITIVE_ADDRESSES
+                else decoded.text
+            )
+            self._lane.resolve((update.address, Text), text)
         elif isinstance(decoded, Block):
             for i, value in enumerate(decoded.values):
                 self._lane.resolve((update.address + i, Num), value)
@@ -1205,13 +1231,26 @@ class DeviceModel:
             return
         link, self._control = self._control, None
         if link is not None:
-            # Close the dead socket for the ledger's sake, off this callback.
-            self._spawn(link.close())
+            # Close the dead socket for the ledger's sake, off this callback
+            # -- shielded, because a stream loss in the same window cancels
+            # this life's tasks, and a cancelled close would leak the socket
+            # and skip the ledger stamp the connection cooldown counts from.
+            self._spawn(self._close_lost_control(link))
         self._finish_dump(report=False)
         self._set_channel(Channel.CONTROL, ChannelState.LOST)
         self._refresh_connection()
         self._publish()
         self._schedule_control_reopen(epoch)
+
+    async def _close_lost_control(self, link: ControlLink) -> None:
+        """Close a control socket the device already ended, to completion:
+        the shield lets the close finish (and stamp the ledger) even when the
+        task itself is cancelled by a teardown."""
+        try:
+            await asyncio.shield(link.close())
+        except asyncio.CancelledError:
+            # The shielded close is still running; the task obeys the cancel.
+            raise
 
     def _begin_dump(self, epoch: int) -> None:
         """The trigger is written: every control item folds as

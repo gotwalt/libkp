@@ -45,7 +45,10 @@
 #               text  a string (page-0 tags, the bank preview)
 #               bpm   the wire value divided by `tempo_bpm_scale`
 #               multi one element of a block the fold decodes as a unit (the
-#                     meter frame); `slot` is the element's index in the block
+#                     meter frame); `slot` is the element's index in the block.
+#                     A block at the base is the frame whatever its length: a
+#                     short one zero-fills the tail, a long one is cut at the
+#                     span -- never folded as generic per-address values
 #             Page 0 is dual-use — the same numbers are string tags via $03/$43
 #             and numerics via $01/$41 — so `kind` also says which of the two a
 #             row accepts: a numeric arriving at a `text` address (or the
@@ -70,6 +73,10 @@
 #   dedupe    true when an update carrying the value already stored is a
 #             no-op (no event, no snapshot). false for the momentaries and the
 #             periodic meter frame, whose every arrival is the information.
+#             Dedupe silences the event, not the Navigator: a position row
+#             still reports the (unchanged) flat rig index to the fold's
+#             caller, because re-loading the rig already loaded is confirmed
+#             by a position push that changes nothing.
 #
 #   request   true when the connect-time sync asks the device for this row.
 
