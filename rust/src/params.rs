@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(describe_numeric(0x00, 0x77), "Page 0: Morph Position");
         // 0x0B is a string tag, and is *not* the morph — see the state tests.
         assert_eq!(page0_numeric_name(0x0B), None);
-        assert_eq!(describe(0x00, 0x0B), "String Tags: Amp Author");
+        assert_eq!(describe(0x00, 0x11), "String Tags: Amp Author");
     }
 
     #[test]

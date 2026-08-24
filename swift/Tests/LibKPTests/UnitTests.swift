@@ -547,7 +547,7 @@ final class ParamsTests: XCTestCase {
         XCTAssertEqual(Params.describeNumeric(page: 0x00, number: 0x77), "Page 0: Morph Position")
         // 0x0B is a string tag, and is *not* the morph — see testMorphIsNotAt0x0B.
         XCTAssertNil(Params.page0NumericName(0x0B))
-        XCTAssertEqual(Params.describe(page: 0x00, number: 0x0B), "String Tags: Amp Author")
+        XCTAssertEqual(Params.describe(page: 0x00, number: 0x11), "String Tags: Amp Author")
     }
 
     func testUnknownPageFallsBackToHex() {
