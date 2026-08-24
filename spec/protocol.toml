@@ -12,6 +12,11 @@
 port = 5727
 # TCP connect timeout and socket read timeout, in seconds.
 connect_timeout_secs = 5
+# How long to wait for the first byte of the greeting, and of the reply to a
+# protocol selection, once the socket is up. Measured: normally under 30 ms,
+# but a device that has served a few sessions has taken 800 ms — and the
+# read idle that bounds the gap *between* chunks is far too short for that.
+handshake_timeout_ms = 2000
 socket_timeout_secs = 15
 # Minimum quiet gap between one TCP session closing and the next one opening, in
 # milliseconds. The device refuses to greet — or resets — a session opened too
@@ -34,6 +39,9 @@ dump_settle_ms = 1000             # the dump phase ends this long after the trig
 reconnect_delay_ms = 4000         # first retry after the stream is lost, when a client opts into reconnecting
 reconnect_max_delay_ms = 30000    # the retry delay doubles up to this
 control_reopen_min_gap_ms = 30000 # the control channel is never reopened closer than this to its last open
+rig_load_settle_ms = 500          # a rig load is in flight this long; the device pushes the landed rig on both wires within ~400 ms
+pending_window_ms = 1500          # an aim the device has not confirmed this long after its move settled is dropped
+rig_load_controllers = [48, 49, 50, 51, 52, 53, 54]   # CC numbers that load a rig (down, up, slot 1-5); CC47 bank preselect loads nothing
 
 [discovery]
 # UDP broadcast discovery. The client broadcasts a fixed 34-byte poll; Profilers

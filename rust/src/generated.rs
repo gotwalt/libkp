@@ -15,6 +15,10 @@ pub const DUMP_SETTLE_MS: u64 = 1000;
 pub const RECONNECT_DELAY_MS: u64 = 4000;
 pub const RECONNECT_MAX_DELAY_MS: u64 = 30000;
 pub const CONTROL_REOPEN_MIN_GAP_MS: u64 = 30000;
+pub const RIG_LOAD_SETTLE_MS: u64 = 500;
+pub const PENDING_WINDOW_MS: u64 = 1500;
+pub const RIG_LOAD_CONTROLLERS: [u8; 7] = [48, 49, 50, 51, 52, 53, 54];
+pub const HANDSHAKE_TIMEOUT_MS: u64 = 2000;
 
 // Discovery
 pub const DISCOVERY_HEADER: &str = "DSCV";
@@ -129,7 +133,7 @@ pub const CURRENT_RIG_SLOT_ADDRESS: u32 = 100702;
 pub const STRING_RIG_AUTHOR: u8 = 0x02;
 pub const STRING_RIG_DATE: u8 = 0x03;
 pub const STRING_RIG_COMMENT: u8 = 0x04;
-pub const STRING_AMP_NAME: u8 = 0x0a;
+pub const STRING_AMP_NAME: u8 = 0x10;
 pub const STRING_CABINET_NAME: u8 = 0x20;
 pub const CABINET_PAGE: u8 = 0x0c;
 pub const CABINET_ON_NUMBER: u8 = 0x02;
@@ -767,7 +771,7 @@ pub static STATE_ROUTES: &[Route] = &[
     Route { address: 2, field: Field::RigAuthor, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
     Route { address: 3, field: Field::RigDate, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
     Route { address: 4, field: Field::RigComment, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
-    Route { address: 10, field: Field::AmpName, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
+    Route { address: 16, field: Field::AmpName, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
     Route { address: 32, field: Field::CabinetName, slot: None, kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true },
     Route { address: 80, field: Field::MorphButton, slot: None, kind: Kind::Bool, lane: Lane::Fast, wire: Wire::Stream, dedupe: false, request: false },
     Route { address: 119, field: Field::MorphPosition, slot: None, kind: Kind::U14, lane: Lane::Slow, wire: Wire::Control, dedupe: true, request: false },

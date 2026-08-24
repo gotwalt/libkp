@@ -370,7 +370,12 @@ string_rig_name = 0x01
 string_rig_author = 0x02
 string_rig_date = 0x03
 string_rig_comment = 0x04
-string_amp_name = 0x0A
+# Measured, not assumed: the amplifier's tags start at 0x10 (name, author,
+# date, ... mirror the rig's 0x01..0x04 and the cabinet's 0x20..), and a
+# request for tag 0x0A draws no reply at all. The old value here was a guess
+# that nothing ever checked, because a fire-and-forget request cannot notice
+# an answer that never comes.
+string_amp_name = 0x10
 string_cabinet_name = 0x20
 page_realtime = 0x7C
 meter_block_number = 0x4E     # first NRPN number of the 11-value status block

@@ -221,7 +221,7 @@ def test_render_all_shows_every_raw_field():
 def test_run_renders_a_frame_and_exits_when_the_device_hangs_up(monkeypatch):
     tail = [
         sysex(0x00, 0x00, 0x03, PAGE_STRINGS, 1, b"Test Rig\x00"),
-        sysex(0x00, 0x00, 0x03, PAGE_STRINGS, 10, b"Test Amp\x00"),
+        sysex(0x00, 0x00, 0x03, PAGE_STRINGS, gen.STRING_AMP_NAME, b"Test Amp\x00"),
         sysex(0x00, 0x00, 0x03, PAGE_STRINGS, 32, b"Test Cab\x00"),
         set_single(0x00, 0x00, 0x3D, 0, 179),
         set_single(0x00, 0x00, 0x3D, 3, 1),
