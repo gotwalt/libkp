@@ -70,8 +70,6 @@ public enum SessionError: Error, Sendable {
     case closed
     /// The device answered the protocol selection with a rejection.
     case protocolRejected(name: String, detail: String?)
-    /// The device offered no usable protocol in its greeting.
-    case noProtocolOffered
 }
 
 extension SessionError: CustomStringConvertible {
@@ -83,25 +81,97 @@ extension SessionError: CustomStringConvertible {
         case .closed: return "connection closed by device"
         case let .protocolRejected(name, detail):
             return "device rejected protocol \"\(name)\"" + (detail.map { ": \($0)" } ?? "")
-        case .noProtocolOffered: return "device offered no protocol in its greeting"
         }
     }
 }
 
 /// Error returned when a `DeviceModel` command cannot be issued.
 public enum CommandError: Error, Equatable, Sendable {
-    /// The ingest task has ended, so no command can be written.
+    /// The stream link is not open, so no command can be written.
     case disconnected
     /// An effect-slot name did not match A/B/C/D/X/MOD/DLY/REV.
     case unknownSlot(String)
+    /// The command would load a rig — a slot load, rig up/down, a Program
+    /// Change or Bank Select, or raw bytes carrying one — and was refused
+    /// before any byte was written. Two loads that overlap wedge the device,
+    /// so loads go only through the Navigator: ``DeviceModel/navigateTo(_:)``,
+    /// ``DeviceModel/stepRig(by:)``, ``DeviceModel/stepBank(forward:)``,
+    /// ``DeviceModel/selectSlot(_:)``.
+    case rigLoadRequiresNavigator
 }
 
 extension CommandError: CustomStringConvertible {
     public var description: String {
         switch self {
-        case .disconnected: return "device model is disconnected; command channel closed"
+        case .disconnected: return "device model is disconnected; the stream link is closed"
         case let .unknownSlot(name):
             return "unknown effect slot \"\(name)\"; use A B C D X MOD DLY REV"
+        case .rigLoadRequiresNavigator:
+            return "rig loads go through the Navigator (navigateTo, stepRig, stepBank, selectSlot)"
+        }
+    }
+}
+
+/// Why a read-only request on the stream went unanswered.
+///
+/// Requests travel the model's request lane: each one is sent, waits for a
+/// value at its address, and is reported here rather than retried. See
+/// ``DeviceModel/requestParam(page:number:)``.
+public enum RequestError: Error, Equatable, Sendable {
+    /// The stream link is not open, so nothing could be sent.
+    case disconnected
+    /// No value landed at the address inside ``Generated/requestTimeoutMs``.
+    /// The request is never resent: the device ignores a request for an
+    /// address it does not have, and a second copy would only cost it more.
+    case timeout
+    /// The address is one the stream never answers — a `wire = "control"` row
+    /// of the routing table, which is the morph position — so nothing was
+    /// sent, whichever request form asked (a rendered string of it included).
+    /// It reaches the tree through the control link instead. Also the reply
+    /// that answered ``DeviceModel/requestParam(page:number:)`` but does not
+    /// fit the 14 bits a `$01` carries: a control-channel value at the same
+    /// address, which the request cannot return.
+    case unreadable
+}
+
+extension RequestError: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .disconnected: return "the stream link is not open; request not sent"
+        case .timeout:
+            return "no reply within \(Generated.requestTimeoutMs) ms; the request is not retried"
+        case .unreadable:
+            return "the address is only carried by the control channel; it cannot be requested"
+        }
+    }
+}
+
+/// Why ``DeviceModel/reopenControl()`` did not open the control link.
+public enum ChannelError: Error, Sendable {
+    /// The model was connected with ``ControlPolicy/off``; there is no control
+    /// link to reopen.
+    case off
+    /// The last control open was less than ``Generated/controlReopenMinGapMs``
+    /// ago. The device wedges under session churn, so the gap is never
+    /// shortened, whoever asks.
+    case tooSoon
+    /// The stream link is not open. The control link only ever runs beside a
+    /// live stream; reconnecting the stream brings it back on its own.
+    case disconnected
+    /// The open itself failed: the dial, the handshake, the preamble or the
+    /// dump trigger. The control link is ``ChannelState/unavailable``.
+    case session(SessionError)
+}
+
+extension ChannelError: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .off: return "the control link is off for this model"
+        case .tooSoon:
+            return
+                "the control link was opened less than \(Generated.controlReopenMinGapMs) ms ago"
+        case .disconnected: return "the stream link is not open; the control link needs it"
+        case let .session(error): return "control link open failed: \(error)"
         }
     }
 }

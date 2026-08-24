@@ -2,12 +2,59 @@ import Foundation
 
 // MARK: - The data shape
 
-/// Whether a live session to the Profiler is currently open.
+/// Whether the model has a live stream to the Profiler, and how whole it is.
+///
+/// The stream link is what "connected" means: without it there is no state.
+/// The control link is best-effort by default, so its absence is a lesser
+/// condition, ``degraded``, in which everything but the control channel's own
+/// addresses (the morph position) keeps working. Every transition raises
+/// ``DeviceEvent/connectionChanged(_:)``.
 public enum Connection: Sendable, Equatable {
-    /// A session is open and the stream is being ingested.
-    case connected
-    /// No session (initial state, or the device closed the connection).
+    /// No stream (initial state, the device closed it, or ``DeviceModel/close()``).
     case disconnected
+    /// The stream was lost and the model is waiting out the backoff before
+    /// dialling again — only with ``ReconnectPolicy/stream`` set. `attempt`
+    /// counts from 1 and resets once a dial succeeds.
+    case reconnecting(attempt: UInt32)
+    /// The stream is open, and the control link is either open or was never
+    /// asked for (``ControlPolicy/off``).
+    case connected
+    /// The stream is open, but the control link was asked for and is
+    /// ``ChannelState/unavailable`` or ``ChannelState/lost``. The morph position
+    /// stops moving; nothing else is affected.
+    case degraded
+}
+
+/// Where one of the model's two links is in its life.
+public enum ChannelState: Sendable, Equatable {
+    /// Not open, and not by the device's doing: before the first attempt,
+    /// after ``DeviceModel/close()``, a control link never asked for
+    /// (``ControlPolicy/off``), or one the stream took down with it.
+    case closed
+    /// Dialling, handshaking, or writing the preamble.
+    case connecting
+    /// Open and being ingested.
+    case open
+    /// The open failed — the dial, the handshake, the preamble, or (for the
+    /// control link) the dump-trigger write.
+    case unavailable
+    /// Was open, then the device ended the socket. For the stream that is the
+    /// end of the life (``Connection/disconnected``, or a reconnect); for the
+    /// control link it is ``Connection/degraded`` while the stream stays up.
+    case lost
+}
+
+/// The state of the model's two links, one per ``Channel``.
+public struct Channels: Sendable, Equatable {
+    /// The MIDI3 stream — the link ``Connection`` is about.
+    public var stream: ChannelState
+    /// The CBOR control link, which carries the state dump and the morph.
+    public var control: ChannelState
+
+    public init(stream: ChannelState = .closed, control: ChannelState = .closed) {
+        self.stream = stream
+        self.control = control
+    }
 }
 
 /// The loaded rig's metadata and rig-wide settings.
@@ -208,8 +255,18 @@ public enum DeviceEvent: Sendable, Equatable {
     case beatPulse(on: Bool)
     /// The tempo changed, in whole beats per minute.
     case tempoBpm(UInt16)
-    /// The morph position changed (0–16383).
+    /// The morph position changed (0 = base, 16383 = fully morphed).
+    ///
+    /// Only the control link carries this: the position is never sent on the
+    /// MIDI3 stream, even while a morph is ramping, so a model whose control
+    /// link is down never raises it. See ``morphButton(on:)``.
     case morphChanged(UInt16)
+    /// The morph button was pressed (`true`) or released (`false`) — momentary,
+    /// so nothing about it is stored in the snapshot.
+    ///
+    /// This is what a MIDI3 client sees of a morph: *that* one happened, and
+    /// what it did to the audio parameters, but never where the fader sits.
+    case morphButton(on: Bool)
     /// The tuner pitch deviance changed (8192 = in tune).
     case tunerDeviance(UInt16)
     /// The tuner's detected note changed.
@@ -217,14 +274,39 @@ public enum DeviceEvent: Sendable, Equatable {
     /// A rendered-string reply arrived (`$3C`), carrying a value's exact display
     /// text. Transient — not stored in the snapshot tree.
     case renderedString(page: UInt8, number: UInt8, value: UInt16, text: String)
-    /// The device's current position was learned from the CBOR state-dump
-    /// snapshot. Read ``DeviceState/currentBank`` and
-    /// ``DeviceState/currentRigSlot`` for the new values (both 0-based).
+    /// The device's current position changed, or was learned for the first
+    /// time. Read ``DeviceState/currentBank`` and ``DeviceState/currentRigSlot``
+    /// for the new values (both 0-based); a `nil` here is a half not yet known,
+    /// not a cleared one.
     case currentPosition(bank: UInt16?, slot: UInt16?)
-    /// The model connected to a device.
+    /// The stream came up: at connect, and again after a reconnect. Kept
+    /// alongside ``connectionChanged(_:)`` for callers that only care about the
+    /// two ends of the life.
     case connected
-    /// The device closed the connection.
+    /// The stream is gone and the model is not going to dial again: the device
+    /// closed it under the default ``ReconnectPolicy``, or ``DeviceModel/close()``
+    /// was called.
     case disconnected
+    /// ``DeviceState/connection`` moved — every transition, including the ones
+    /// ``connected`` and ``disconnected`` also announce.
+    case connectionChanged(Connection)
+    /// One of the two links moved. This is the only event that names a
+    /// channel; everything else is one tree, whichever wire fed it.
+    case channelChanged(channel: Channel, state: ChannelState)
+    /// A sync finished. ``Channel/stream``: the connect-time request burst's
+    /// last reply landed, or timed out. ``Channel/control``: the state dump
+    /// ended — its last run was folded, or the settle time elapsed.
+    case syncCompleted(source: Channel)
+    /// A request at `address` (`page * 128 + number`, or the extended address)
+    /// drew no reply inside ``Generated/requestTimeoutMs`` and was dropped.
+    case requestTimedOut(address: UInt32)
+    /// The device reported the rig index the Navigator was aiming at; the aim
+    /// is retired and ``DeviceState/navigation`` is empty again.
+    case navigationSettled(index: UInt16)
+    /// The Navigator gave up on an aim: the device never confirmed it inside
+    /// ``Generated/pendingWindowMs`` of its move settling (an index past the
+    /// last rig, typically), or the stream was not open to send it.
+    case navigationDropped(index: UInt16, reason: NavDrop)
 }
 
 /// The result of applying one message to a ``DeviceState``: the granular events
@@ -234,10 +316,17 @@ public struct ApplyOutcome: Sendable, Equatable {
     public var events: [DeviceEvent]
     /// Whether a slow (snapshot-visible) field changed.
     public var slowChanged: Bool
+    /// Every flat rig index this update reported for the Navigator: a
+    /// position row that stored — or deduped an unchanged report — with both
+    /// halves known and the index inside sixteen bits. A deduped report
+    /// raises no event, but the Navigator still needs it: re-loading the rig
+    /// already loaded is confirmed by a push that changes nothing.
+    public var positions: [UInt16]
 
-    public init(events: [DeviceEvent] = [], slowChanged: Bool = false) {
+    public init(events: [DeviceEvent] = [], slowChanged: Bool = false, positions: [UInt16] = []) {
         self.events = events
         self.slowChanged = slowChanged
+        self.positions = positions
     }
 
     /// Nothing happened.
@@ -252,6 +341,89 @@ public struct ApplyOutcome: Sendable, Equatable {
     static func slow(_ events: [DeviceEvent]) -> ApplyOutcome {
         ApplyOutcome(events: events, slowChanged: true)
     }
+
+    /// Fold another outcome into this one: events in order, the snapshot flag
+    /// sticky. One `$02` block is several updates but one message.
+    mutating func merge(_ other: ApplyOutcome) {
+        events.append(contentsOf: other.events)
+        slowChanged = slowChanged || other.slowChanged
+        positions.append(contentsOf: other.positions)
+    }
+}
+
+// MARK: - Updates
+
+/// Which wire carried a value: the MIDI3 stream or the CBOR control channel.
+///
+/// The two are one event universe in two wire formats, but not every row of the
+/// routing table trusts both: the control channel carries its own copies of the
+/// realtime feeds, which the tree ignores in favour of the stream's, and the
+/// morph position only ever arrives on the control channel. See the `wire`
+/// column of `spec/state.toml`.
+public enum Channel: Sendable, Equatable {
+    /// The MIDI3 SysEx stream — the model's stream link.
+    case stream
+    /// The CBOR control channel — the model's control link, which asks for the
+    /// state dump when it opens and then carries live pushes.
+    case control
+}
+
+/// Whether a value was pushed as it changed, or is one item of the CBOR state
+/// dump — a bulk read that can be stale by the time it lands.
+public enum Phase: Sendable, Equatable {
+    /// The device pushed this because it changed.
+    case live
+    /// This is one item of the state dump asked for at connect time.
+    case dump
+}
+
+/// A value decoded off either wire, before the routing table has said what it is.
+public enum Decoded: Sendable, Equatable {
+    /// A numeric: 14 bits from a `$01`, up to 35 from a `$06` or a CBOR item.
+    case num(UInt64)
+    /// A string: a `$03`/`$07` tag, or a CBOR `[4, addr, text]` item.
+    case text(String)
+    /// The values of one `$02` multi-value message, at consecutive addresses
+    /// starting from the update's own. Stream only.
+    case block([UInt16])
+}
+
+/// One value on its way into the tree, tagged with where it came from.
+///
+/// This is what ``DeviceState/applyUpdate(_:)`` consumes: every entry point —
+/// ``DeviceState/apply(_:)``, ``DeviceState/applyCbor(address:value:)``,
+/// ``DeviceState/applyCborText(address:text:)`` — is a thin decoder that builds
+/// one of these and hands it over, so the routing rules live in exactly one
+/// place. `address` is the flat address, `page * 128 + number` for a paged
+/// parameter or a bare extended address.
+public struct Update: Sendable, Equatable {
+    public var source: Channel
+    public var phase: Phase
+    public var address: UInt32
+    public var decoded: Decoded
+
+    public init(source: Channel, phase: Phase, address: UInt32, decoded: Decoded) {
+        self.source = source
+        self.phase = phase
+        self.address = address
+        self.decoded = decoded
+    }
+}
+
+/// The bookkeeping ``DeviceState`` keeps between ``DeviceState/beginDump()``
+/// and ``DeviceState/endDump()``: which addresses a live push has written while
+/// the state dump is still streaming, so a stale dump item cannot roll one
+/// back.
+///
+/// It is transient, not state: two trees that differ only here show the same
+/// snapshot, so equality deliberately ignores it.
+struct DumpGuard: Sendable, Equatable {
+    /// Between `beginDump` and `endDump`.
+    var active = false
+    /// The addresses a live update has reached since `beginDump`.
+    var touched: Set<UInt32> = []
+
+    static func == (lhs: DumpGuard, rhs: DumpGuard) -> Bool { true }
 }
 
 // MARK: - The state tree
@@ -260,11 +432,21 @@ public struct ApplyOutcome: Sendable, Equatable {
 ///
 /// A cheap-to-copy bag of plain data. Callers read fields directly
 /// (`state.rig.name`, `state.effects[0].on`, …). The decode logic in
-/// ``apply(_:)`` is pure: no IO, no clock, so tests drive it with synthesized
-/// messages.
+/// ``apply(_:)`` and ``applyUpdate(_:)`` is pure: no IO, no clock, so tests
+/// drive it with synthesized messages and hand-built updates. `connection`,
+/// `channels` and `navigation` are the one part the model writes on its own,
+/// from what its sockets and its Navigator do rather than from anything the
+/// device sent.
 public struct DeviceState: Sendable, Equatable {
-    /// Whether a live session is open.
+    /// Whether the stream is up, and whether the control link is beside it.
     public var connection: Connection
+    /// Where each of the two links is. `connection` summarises this; a client
+    /// that wants to know *which* link is down reads it here.
+    public var channels: Channels
+    /// What the Navigator has outstanding: the rig index last aimed at and not
+    /// yet confirmed by the device, and whether a load is in flight. Empty
+    /// whenever the device's own position is the whole truth.
+    public var navigation: Navigation
     /// The loaded rig's metadata and settings.
     public var rig: Rig
     /// The amplifier block.
@@ -279,33 +461,53 @@ public struct DeviceState: Sendable, Equatable {
     public var output: Output
     /// The loaded bank's five-slot name preview (page `0x96`).
     public var bank: Bank
-    /// Current bank, 0-based, once known. Seeded from the CBOR state-dump
-    /// snapshot (``StateSnapshot/fetch(host:port:timeout:)``) via
-    /// ``DeviceModel/setCurrentPosition(bank:slot:)``, then kept live by the
-    /// Bank Select / Program Change pair the device sends on every rig change.
+    /// Current bank, 0-based, once known. Kept live by the `$06` Extended
+    /// Parameter the device sends at ``Generated/currentBankAddress`` whenever
+    /// the bank changes — from the front panel as readily as from a controller —
+    /// by the reply to ``DeviceModel/refreshPosition()``, and by the control
+    /// link's copy, which the state dump carries too. Four sources, one row:
+    /// the tree dedupes, so a change is reported exactly once.
     public var currentBank: UInt16?
     /// Current rig slot within the bank, 0-based, once known. Same source as
-    /// ``currentBank``; slot 0 is rig slot 1.
+    /// ``currentBank``, at ``Generated/currentRigSlotAddress``; slot 0 is rig
+    /// slot 1.
     public var currentRigSlot: UInt16?
-    /// The high 7 bits of a rig index, held between the Bank Select that carries
-    /// them and the Program Change that completes the pair.
-    private var pendingRigIndexMsb: UInt8?
     /// The flat, 0-based rig index — `currentBank * bankSlots + currentRigSlot`
     /// — once both halves are known. This is the device's own numbering, and the
     /// only address that can name a rig outside the current bank.
     public var currentRigIndex: UInt16? {
         guard let currentBank, let currentRigSlot else { return nil }
-        return currentBank * UInt16(Params.bankSlots) + currentRigSlot
+        // Wide math, then bounds-checked: a garbled bank value off the wire
+        // must yield no index, not a trap or a wrap into a plausible one.
+        let flat = UInt32(currentBank) * UInt32(Params.bankSlots) + UInt32(currentRigSlot)
+        return UInt16(exactly: flat)
     }
-    /// Latest morph position (0–16383), once seen.
+    /// The flat rig index navigation steps *from*: the Navigator's outstanding
+    /// aim while it has one, otherwise ``currentRigIndex``. The device takes a
+    /// moment to report a move, so two taps inside that gap would both step
+    /// from the same stale index and the second would re-send the first one's
+    /// target; stepping from the aim makes them compose.
+    public var aimedRigIndex: UInt16? { navigation.aim ?? currentRigIndex }
+    /// Latest morph position (0 = base, 16383 = fully morphed), once seen.
+    ///
+    /// Filled only by the control link — from the state dump it asks for on
+    /// opening, then from live pushes — because the MIDI3 stream never carries
+    /// the position and never answers a request for it. While the control link
+    /// is down (``Connection/degraded``) this holds its last value and stops
+    /// moving; with ``ControlPolicy/off`` it stays `nil`.
     public var morph: UInt16?
     /// The most recent realtime status / meter frame (the FAST lane).
     public var status: RealtimeStatus
+    /// Dump-phase bookkeeping (``beginDump()``); never part of the snapshot.
+    var dumpGuard = DumpGuard()
 
-    /// A fresh, empty state: disconnected, no rig data, all eight effect slots
-    /// seeded in signal-chain order, zeroed meters.
+    /// A fresh, empty state: disconnected with both links closed, nothing
+    /// aimed, no rig data, all eight effect slots seeded in signal-chain
+    /// order, zeroed meters.
     public init() {
         connection = .disconnected
+        channels = Channels()
+        navigation = Navigation()
         rig = Rig()
         amp = Amp()
         cabinet = Cabinet()
@@ -327,242 +529,137 @@ public struct DeviceState: Sendable, Equatable {
     }
 }
 
-// MARK: - Decode routing
+// MARK: - Decoding
 
 extension DeviceState {
     /// Parse and apply ONE decoded MIDI message, returning the ``ApplyOutcome``.
     /// Non-Kemper or ignored messages return an empty outcome.
     ///
-    /// Routing:
-    /// - `$03` string on page 0 → rig/amp/cab name tags (SLOW).
-    /// - `$01` single-param → beat pulse / effect / amp / rig / output / morph /
-    ///   tuner / generic; FAST for the beat pulse and tuner deviance.
-    /// - `$02` multi-param → the meter block (FAST) or a rig-load dump, each
-    ///   consecutive address routed like a single-param.
-    /// - `$07` ext-string on the string page → the amp/cab/author tags the
-    ///   rig-load dump sends as extended strings.
+    /// This is a decoder, not a router: each message becomes one ``Update`` on
+    /// the stream channel (a `$02` block becomes several) and goes through
+    /// ``applyUpdate(_:)``, where the routing table decides what the tree does
+    /// with it. The one message that stays outside the table is the `$3C`
+    /// rendered-string reply, which is a transient event and never state.
+    ///
+    /// - `$01` single-param → a numeric at `page * 128 + number`.
+    /// - `$02` multi-param → a block at `page * 128 + number`: the meter frame
+    ///   when it sits exactly on the meter block, otherwise consecutive singles.
+    /// - `$03` string → a text at `page * 128 + number` (page 0's tags, and the
+    ///   bank preview pushed as a plain string).
+    /// - `$06` extended param → a numeric at the extended address (the device's
+    ///   current bank / rig slot).
+    /// - `$07` ext-string → a text at the extended address (how the rig-load
+    ///   dump delivers the amp/cab/author tags and the bank preview).
     /// - `$3C` rendered-string reply → a transient event (FAST).
-    /// - `$06` extended and any other traffic → ignored.
+    /// - Anything else → ignored.
     @discardableResult
     public mutating func apply(_ msg: [UInt8]) -> ApplyOutcome {
-        // Channel-voice messages ride the same stream as the SysEx: the device
-        // announces every rig change as a Bank Select / Program Change pair.
-        if let outcome = applyRigIndex(msg) { return outcome }
-        guard let (header, values) = NrpnHeader.parse(msg) else { return .empty }
-
-        // The extended-string ($07) address is 5×7-bit encoded and does not fit
-        // the fixed header layout, so route it off the raw message.
-        if header.function == Generated.fnExtStringParam { return applyExtString(msg) }
-
-        switch header.function {
-        case Generated.fnStringParam where header.page == Generated.pageStrings:
-            return applyString(number: header.number, values: values)
-        case Generated.fnSingleParam:
-            guard values.count >= 2 else { return .empty }
-            return routeParam(
-                page: header.page, number: header.number, value: Nrpn.u14(values[0], values[1]))
-        case Generated.fnMultiParam:
-            return applyMulti(page: header.page, number: header.number, values: values)
-        case Generated.fnRenderedStringReply:
-            return applyRenderedString(msg)
-        default:
-            return .empty  // $06 extended, and anything else, ignored.
+        switch DeviceState.decode(msg) {
+        case .update(let update)?:
+            return applyUpdate(update)
+        case let .renderedString(page, number, value, text)?:
+            return .fast(.renderedString(page: page, number: number, value: value, text: text))
+        case nil:
+            return .empty
         }
     }
 
-    /// Fold the device's position report into the tree.
-    ///
-    /// The device says where it is with two channel-voice messages: CC32 (Bank
-    /// Select LSB) carrying the high 7 bits, then a Program Change carrying the
-    /// low 7. Together they are a flat, 0-based rig index — `128 * msb + program`
-    /// — which divides by ``Params/bankSlots`` into bank and slot. Unlike the
-    /// CBOR snapshot, which is a one-shot read at connect, this arrives on every
-    /// change, from the front panel as readily as from a controller.
-    ///
-    /// Returns `nil` for anything that is not one of the two messages, so NRPN
-    /// parsing carries on. A Program Change with no Bank Select ahead of it is
-    /// ignored: half an index is not a position.
-    private mutating func applyRigIndex(_ msg: [UInt8]) -> ApplyOutcome? {
-        guard let status = msg.first else { return nil }
-        switch status & 0xF0 {
-        case Generated.controlChangeStatus:
-            guard msg.count >= 3, msg[1] == Generated.ccBankSelectLsb else { return nil }
-            pendingRigIndexMsb = msg[2] & 0x7F
-            return .empty
-        case Generated.programChangeStatus:
-            guard msg.count >= 2, let msb = pendingRigIndexMsb else { return nil }
-            pendingRigIndexMsb = nil
-            let index = UInt16(msb) * 128 + UInt16(msg[1] & 0x7F)
-            let bank = index / UInt16(Params.bankSlots)
-            let slot = index % UInt16(Params.bankSlots)
-            guard currentBank != bank || currentRigSlot != slot else { return .empty }
-            currentBank = bank
-            currentRigSlot = slot
-            return .slow([.currentPosition(bank: bank, slot: slot)])
+    /// Decode ONE unframed MIDI message as far as the funnel needs it, without
+    /// touching the tree. ``apply(_:)`` is this plus the fold; the model's
+    /// ingest uses it directly so it can see the address a message names —
+    /// that is what answers a pending request, whether or not the value
+    /// changed anything.
+    static func decode(_ msg: [UInt8]) -> StreamMessage? {
+        guard let (header, values) = NrpnHeader.parse(msg) else { return nil }
+        let flat = UInt32(header.page) * 128 + UInt32(header.number)
+
+        switch header.function {
+        case Generated.fnSingleParam:
+            guard values.count >= 2 else { return nil }
+            let value = Nrpn.u14(values[0], values[1])
+            return .update(Update.stream(flat, .num(UInt64(value))))
+        case Generated.fnMultiParam:
+            let block = Nrpn.multiValues(number: header.number, values: values).map(\.value)
+            return .update(Update.stream(flat, .block(block)))
+        case Generated.fnStringParam:
+            return .update(Update.stream(flat, .text(Fmt.textUntilNul(values[...]))))
+        case Generated.fnExtParam:
+            // The extended ($06) and extended-string ($07) addresses are 5×7-bit
+            // encoded and do not fit the fixed header layout, so both decode off
+            // the raw message. The value spans 35 bits; the row's range check
+            // decides whether it fits the field.
+            guard let (address, raw) = Nrpn.parseExtendedParam(msg) else { return nil }
+            return .update(Update.stream(address, .num(raw)))
+        case Generated.fnExtStringParam:
+            guard let (address, text) = Nrpn.parseExtendedString(msg) else { return nil }
+            return .update(Update.stream(address, .text(text)))
+        case Generated.fnRenderedStringReply:
+            guard let (page, number, value, text) = Nrpn.parseRenderedString(msg) else {
+                return nil
+            }
+            return .renderedString(page: page, number: number, value: value, text: text)
         default:
             return nil
         }
     }
 
-    /// Route a `$03` page-0 string tag into the tree.
-    private mutating func applyString(number: UInt8, values: [UInt8]) -> ApplyOutcome {
-        let tracked = applyStringTag(number: number, text: Fmt.textUntilNul(values[...]))
-        var events: [DeviceEvent] = [.stringTag(number: number)]
-        if number == Generated.stringRigName { events.append(.rigChanged) }
-        return ApplyOutcome(events: events, slowChanged: tracked)
-    }
-
-    /// Store a decoded page-0 string tag into the matching field. Returns `true`
-    /// if the tag maps to a tracked field (a slow change).
-    private mutating func applyStringTag(number: UInt8, text: String) -> Bool {
-        switch number {
-        case 1: rig.name = text
-        case 2: rig.author = text
-        case 3: rig.date = text
-        case 4: rig.comment = text
-        case 10: amp.name = text
-        case 32: cabinet.name = text
-        default: return false
-        }
-        return true
-    }
-
-    /// Route a `$07` Extended String Parameter message — how the rig-load dump
-    /// delivers the amp/cab/author metadata that plain `$03` strings omit.
+    /// Fold one **CBOR** address/value into the tree.
     ///
-    /// The extended address decodes as `page * 128 + number`; a string on the
-    /// string page carries the same tag numbers as `$03`. Other pages are
-    /// ignored.
-    private mutating func applyExtString(_ msg: [UInt8]) -> ApplyOutcome {
-        guard let (address, text) = Nrpn.parseExtendedString(msg) else { return .empty }
-        let page = UInt8(truncatingIfNeeded: address / 128)
-        let number = UInt8(truncatingIfNeeded: address % 128)
-        if page == Generated.pageBankPreview {
-            return applyBankPreview(number: number, text: text)
-        }
-        guard page == Generated.pageStrings else { return .empty }
-        let tracked = applyStringTag(number: number, text: text)
-        var events: [DeviceEvent] = [.stringTag(number: number)]
-        if number == Generated.stringRigName { events.append(.rigChanged) }
-        return ApplyOutcome(events: events, slowChanged: tracked)
+    /// The CBOR channel and the MIDI3 stream are two wire formats over one event
+    /// universe, so a value arriving either way lands in the same field and
+    /// raises the same event. This is what a live push off the control channel
+    /// becomes; the state dump's items go through ``applyUpdate(_:)`` tagged
+    /// ``Phase/dump`` so a live push can outrank them (``beginDump()``).
+    ///
+    /// A negative value is nothing the tree stores and is dropped; a value too
+    /// wide for its row is dropped by the row rather than truncated into a
+    /// bogus reading.
+    @discardableResult
+    public mutating func applyCbor(address: UInt32, value: Int64) -> ApplyOutcome {
+        guard let value = UInt64(exactly: value) else { return .empty }
+        return applyUpdate(
+            Update(source: .control, phase: .live, address: address, decoded: .num(value)))
     }
 
-    /// Store one bank-preview name (page `0x96`) into ``bank``. The number selects
-    /// the field (rig / amp / cabinet) and slot; an out-of-range number is
-    /// ignored. A stored value is a SLOW change.
-    private mutating func applyBankPreview(number: UInt8, text: String) -> ApplyOutcome {
-        guard let (field, slot) = Params.bankPreviewSlotField(number) else { return .empty }
-        switch field {
-        case .rigName: bank.slots[slot].rigName = text
-        case .ampName: bank.slots[slot].ampName = text
-        case .cabinetName: bank.slots[slot].cabinetName = text
-        }
-        return .slow([.bankPreview(number: number)])
+    /// Fold one **CBOR** string item into the tree — the rig name and the other
+    /// page-0 tags, or a bank-preview name, as the control channel carries them.
+    @discardableResult
+    public mutating func applyCborText(address: UInt32, text: String) -> ApplyOutcome {
+        applyUpdate(Update(source: .control, phase: .live, address: address, decoded: .text(text)))
     }
 
-    /// Route one decoded numeric address/value pair into the tree. Shared by
-    /// `$01` single-param and each address of a `$02` rig-load dump.
-    private mutating func routeParam(page: UInt8, number: UInt8, value: UInt16) -> ApplyOutcome {
-        // Beat pulse: volatile, not stored (FAST lane).
-        if page == Generated.pageRealtime && number == Generated.beatPulseNumber {
-            return .fast(.beatPulse(on: value != 0))
-        }
-        // Tuner pitch deviance: volatile (FAST lane).
-        if page == Generated.pageRealtime && number == Generated.tunerDevianceNumber {
-            tuner.deviance = value
-            return .fast(.tunerDeviance(value))
-        }
-        // Effect Type / On-Off / Mix: fold into the slot (SLOW).
-        if Params.isEffectPage(page),
-            number == Generated.effectParamType
-                || number == Generated.effectParamState
-                || number == Generated.effectParamMix
-        {
-            guard let slot = applyEffect(page: page, number: number, value: value) else {
-                return .empty
-            }
-            return .slow([.effectChanged(slot: slot)])
-        }
-        // Amplifier On/Off and Gain (SLOW).
-        if page == Generated.ampPage && number == Generated.ampOnNumber {
-            amp.on = value != 0
-            return .slow([.paramChanged(page: page, number: number, value: value)])
-        }
-        if page == Generated.ampPage && number == Generated.gainNumber {
-            amp.gain = value
-            return .slow([.paramChanged(page: page, number: number, value: value)])
-        }
-        // Tempo bpm (the wire value is bpm × 64) and Rig Volume (SLOW).
-        if page == Generated.pageRigSettings && number == Generated.tempoNumber {
-            let bpm = value / Generated.tempoBpmScale
-            rig.tempoBpm = bpm
-            return .slow([.tempoBpm(bpm)])
-        }
-        if page == Generated.pageRigSettings && number == Generated.rigVolumeNumber {
-            rig.volume = value
-            return .slow([.paramChanged(page: page, number: number, value: value)])
-        }
-        // System output volumes (SLOW).
-        if page == Generated.systemPage && number == Generated.mainVolumeNumber {
-            output.mainVolume = value
-            return .slow([.paramChanged(page: page, number: number, value: value)])
-        }
-        if page == Generated.systemPage && number == Generated.headphoneVolumeNumber {
-            output.headphoneVolume = value
-            return .slow([.paramChanged(page: page, number: number, value: value)])
-        }
-        if page == Generated.systemPage && number == Generated.monitorVolumeNumber {
-            output.monitorVolume = value
-            return .slow([.paramChanged(page: page, number: number, value: value)])
-        }
-        // Morph position (page 0 is dual-use with the string page) (SLOW).
-        if page == Generated.pageMorph && number == Generated.morphNumber {
-            morph = value
-            return .slow([.morphChanged(value)])
-        }
-        // Tuner detected note (SLOW).
-        if page == Generated.pageTunerNote && number == Generated.tunerNoteNumber {
-            let note = UInt8(value & 0x7F)
-            tuner.note = note
-            return .slow([.tunerNote(note)])
-        }
-        // Untracked generic parameter: the snapshot is unchanged, so this is not
-        // a slow change — only the granular event stream sees it.
-        return .fast(.paramChanged(page: page, number: number, value: value))
+    /// Mark the start of a CBOR state dump.
+    ///
+    /// The dump is a bulk read of a couple of thousand values, and the device
+    /// keeps pushing live changes on both channels while it streams. Until
+    /// ``endDump()``, a live update remembers its address, and a dump item for an
+    /// address a live update has already reached is dropped — the dump's copy is
+    /// older than the push, so it must not roll the field back.
+    public mutating func beginDump() {
+        dumpGuard = DumpGuard(active: true)
     }
 
-    /// Store a decoded effect-slot parameter into the matching slot. Returns the
-    /// slot index if the page is an effect slot.
-    private mutating func applyEffect(page: UInt8, number: UInt8, value: UInt16) -> Int? {
-        guard let index = Params.effectSlotIndex(page: page) else { return nil }
-        switch number {
-        case Generated.effectParamType: effects[index].kind = value
-        case Generated.effectParamState: effects[index].on = value != 0
-        case Generated.effectParamMix: effects[index].mix = value
-        default: break
-        }
-        return index
+    /// Mark the end of a CBOR state dump and forget which addresses live updates
+    /// reached during it. After this, dump-tagged items fold exactly like live
+    /// ones.
+    public mutating func endDump() {
+        dumpGuard = DumpGuard()
     }
 
-    /// Route a `$3C` Rendered String reply. It carries a value's exact display
-    /// text but is *not* stored in the snapshot tree.
-    private func applyRenderedString(_ msg: [UInt8]) -> ApplyOutcome {
-        guard let (page, number, value, text) = Nrpn.parseRenderedString(msg) else { return .empty }
-        return .fast(.renderedString(page: page, number: number, value: value, text: text))
-    }
+}
 
-    /// Route a `$02` multi-param message: the meter block, or a rig-load dump.
-    private mutating func applyMulti(page: UInt8, number: UInt8, values: [UInt8]) -> ApplyOutcome {
-        if page == Generated.pageRealtime && number == Generated.meterBlockNumber {
-            status = RealtimeStatus(values: values)
-            return .fast(.status(status))
-        }
-        var out = ApplyOutcome.empty
-        for (num, value) in Nrpn.multiValues(number: number, values: values) {
-            let step = routeParam(page: page, number: num, value: value)
-            out.events.append(contentsOf: step.events)
-            out.slowChanged = out.slowChanged || step.slowChanged
-        }
-        return out
+/// One MIDI3 message decoded as far as the funnel needs it: an ``Update`` on
+/// the stream channel, or the one message that stays outside the routing table
+/// — the `$3C` rendered-string reply, which is a transient event and never
+/// state.
+enum StreamMessage: Sendable, Equatable {
+    case update(Update)
+    case renderedString(page: UInt8, number: UInt8, value: UInt16, text: String)
+}
+
+extension Update {
+    /// A live update off the MIDI3 stream — what every decoded message becomes.
+    static func stream(_ address: UInt32, _ decoded: Decoded) -> Update {
+        Update(source: .stream, phase: .live, address: address, decoded: decoded)
     }
 }

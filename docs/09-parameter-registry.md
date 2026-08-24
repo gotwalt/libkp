@@ -213,8 +213,54 @@ string_tag_name(99)  →  null
 ```
 
 The string tags cover rig, amp and cabinet metadata: name, author, creation
-date, comment, manufacturer, model, microphone, speaker. The numeric side of
-page 0 is sparse — the notable member is number `$0B`, **Morph State**.
+date, comment, manufacturer, model, microphone, speaker. The state tree reads
+the three names at the `[well_known]` keys — the rig's at `$01`, the amp's at
+`$10`, the cabinet's at `$20`; see [the string tags](05-sysex-nrpn.md#the-string-tags).
+The numeric side of page 0 is sparse — its members are number `$50`, the
+**Morph Button**, and number `$77`, the **Morph Position**. Number `$0B` is
+*not* the morph: it reads a constant 0 whether the rig is morphed or at base.
+See [the morph](05-sysex-nrpn.md#the-morph).
+
+## State routing
+
+The registry names addresses; a second, much smaller table says what the
+[device model](11-channels-and-data-paths.md) *does* with the handful of them it
+stores. [`../spec/state.toml`](../spec/state.toml) declares one `[[route]]` row
+per tracked field, and the generator flattens it into `STATE_ROUTES`: a list of
+records sorted by flat address (`page × 128 + number`, or a bare extended
+address), one per address, each carrying:
+
+| Column | Meaning |
+|---|---|
+| `field` | which tree field the address writes — `rig_name`, `amp_gain`, `effect_on`, `current_bank`, … (the `Field` enum) |
+| `slot` | the index for rows expanded per effect slot, per bank-preview slot, or per element of a spanned block; absent otherwise |
+| `kind` | how the value decodes: `u14`, `u16`, `u7`, `bool`, `text`, `bpm`, or `multi` for one element of a block folded as a unit |
+| `lane` | `fast` (event only — the meter frame, beat pulse, tuner deviance, morph button) or `slow` (republishes the snapshot) |
+| `wire` | which channel may write it: `stream` for the realtime page and the momentaries, `control` for the morph position, `both` elsewhere |
+| `dedupe` | whether an update repeating the stored value is a no-op |
+| `request` | whether the connect-time sync asks the device for it |
+
+Both wires feed the same rows: a `$01` at `0x0A/4` and a CBOR `[1, 1284, v]`
+land in the same `amp_gain`, because both are address 1284. Rows reference
+addresses by their `[well_known]` key rather than by number — `page =
+"amp_page", number = "gain_number"` — so `parameters.toml` remains the only
+place an address is written, and `state.toml` only adds routing. The eight
+effect slots and the three bank-preview groups are written once and expanded
+by the generator (`effect_param = "type"` becomes eight rows, one per slot in
+signal-chain order; `bank_preview = "bank_rig_name_base"` becomes five).
+
+Untracked addresses have no row: the stream still reports them as a generic
+`ParamChanged`, and the snapshot is untouched. Page 0 being dual-use, a row's
+`kind` also says which face of the page it accepts — a numeric arriving at a
+`text` address is untracked.
+
+Like everything else the generator emits, the table is data only. The fold that
+turns a route into a store write is hand-written per language — its eight
+rules are set out in [Channels and data paths](11-channels-and-data-paths.md#the-fold)
+— and held to [`../spec/vectors/state.json`](../spec/vectors/state.json), whose
+`steps` cases drive it with transport-tagged updates from both wires,
+[`../spec/vectors/cbor.json`](../spec/vectors/cbor.json), and the sanitized
+CBOR state dump replayed from [`../spec/captures`](../spec/captures).
 
 ## Where the data comes from
 
@@ -228,6 +274,7 @@ from [`../spec/`](../spec):
 | `controls.toml` | the CC vocabulary and the per-slot enable CCs |
 | `meters.toml` | the realtime status block's field identities |
 | `protocol.toml` | transport, handshake, framing and SysEx constants |
+| `state.toml` | the state routing table: which addresses the device model stores, and how |
 
 `codegen/generate.py` serializes those into a data-only module per language —
 `rust/src/generated.rs`, `python/src/libkp/_generated.py`,
@@ -237,8 +284,8 @@ and Swift, and the helpers are held to
 [`../spec/vectors/params.json`](../spec/vectors/params.json) by all three test
 suites.
 
-**To add or correct a parameter, an effect type, or a CC, edit the spec** and
-regenerate. Never edit a generated module, and never define a constant in an
+**To add or correct a parameter, an effect type, a CC, or a tracked field, edit
+the spec** and regenerate. Never edit a generated module, and never define a constant in an
 implementation's own source. The full mechanism, and what a spec change obliges
 you to do, is in
 [Versioning & compatibility](10-versioning-and-compatibility.md).
@@ -249,7 +296,9 @@ The page/number map, the shared effect-module parameter list, the string tags,
 and the effect-type table are transcribed from the
 [Kemper MIDI Parameter Documentation](https://www.kemper-amps.com/downloads/5/User-Manuals);
 the effect-type category blocks are inferred from the value-range structure of
-its Appendix B and the device's type-knob grouping. The Fixed-FX page, several tuner and tempo addresses, and the numeric morph-state
-parameter are credited to [PySwitch](https://github.com/Tunetown/PySwitch). The
-page `$7C` meter-field identities were established by observed experimentation.
+its Appendix B and the device's type-knob grouping. The Fixed-FX page and
+several tuner and tempo addresses are credited to
+[PySwitch](https://github.com/Tunetown/PySwitch). The page `$7C` meter-field
+identities and the page-0 morph addresses were established by observed
+experimentation.
 See [../CREDITS.md](../CREDITS.md).

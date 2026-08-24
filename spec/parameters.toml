@@ -2,14 +2,14 @@
 #
 # Provenance: transcribed from the official Kemper MIDI Parameter Documentation
 # (page/number → name, effect types, string tags, SysEx functions), plus a few
-# addresses credited to PySwitch: the Fixed-FX page (0x05), the tuner / tempo /
-# meter addresses on pages 0x7C / 0x7D / 0x7F, and the numeric morph-state
-# parameter on page 0. Meter-field identities (page 0x7C, numbers 78–88) were
-# established by observed experimentation (see docs/07-realtime-status.md).
+# addresses credited to PySwitch: the Fixed-FX page (0x05), and the tuner /
+# tempo / meter addresses on pages 0x7C / 0x7D / 0x7F. Meter-field identities
+# (page 0x7C, numbers 78–88) and the morph addresses on page 0 were established
+# by observed experimentation (see docs/07-realtime-status.md and docs/05).
 #
 # Addressing: a parameter is (page, number). Effect modules A..REV share one
 # parameter map. Page 0 is dual-use: string tags via $03/$43, numeric params
-# (morph) via $01/$41.
+# (the morph button and position) via $01.
 
 # SysEx function code → short name (Kemper MIDI doc, Table 5).
 functions = [
@@ -319,21 +319,28 @@ param_ranges = [
   { page = 0x96, start = 10, end = 14, name = "Bank Cabinet Name" },
 ]
 
-# Page-0 string tags (function $03 / $43), Appendix C.
+# Page-0 string tags (function $03 / $43), Appendix C — with the amplifier
+# block where the device actually keeps it. The published list places the amp
+# tags from 10; a Profiler Player on firmware 14.2.1 answers none of those and
+# carries the same fields, in the same order, from 16 (name 16, author 17,
+# creation date 18, time 19, location 20, manufacturer 21, comment 22, model
+# 24, channel 25, pickup 26), which is also where the state dump lists them.
+# The cabinet block is where the list says.
 string_tags = [
   { number = 1,  name = "Rig Name" },
   { number = 2,  name = "Rig Author" },
   { number = 3,  name = "Rig Creation Date" },
   { number = 4,  name = "Rig Comment" },
-  { number = 10, name = "Amp Name" },
-  { number = 11, name = "Amp Author" },
-  { number = 14, name = "Amp Location" },
-  { number = 15, name = "Amp Manufacturer" },
-  { number = 16, name = "Amp Comment" },
-  { number = 18, name = "Amp Model" },
-  { number = 19, name = "Amp Channel" },
-  { number = 20, name = "Pickup Type" },
-  { number = 21, name = "Year of Production" },
+  { number = 16, name = "Amp Name" },
+  { number = 17, name = "Amp Author" },
+  { number = 18, name = "Amp Creation Date" },
+  { number = 20, name = "Amp Location" },
+  { number = 21, name = "Amp Manufacturer" },
+  { number = 22, name = "Amp Comment" },
+  { number = 24, name = "Amp Model" },
+  { number = 25, name = "Amp Channel" },
+  { number = 26, name = "Pickup Type" },
+  { number = 27, name = "Year of Production" },
   { number = 32, name = "Cabinet Name" },
   { number = 33, name = "Cabinet Author" },
   { number = 36, name = "Cabinet Location" },
@@ -349,7 +356,8 @@ string_tags = [
 
 # Page 0 is dual-use: numeric params (function $01 / $41) instead of string tags.
 page0_numeric = [
-  { number = 0x0B, name = "Morph State" },  # PySwitch
+  { number = 0x50, name = "Morph Button" },
+  { number = 0x77, name = "Morph Position" },
 ]
 
 # Common effect-slot parameter numbers (within any effect page).
@@ -363,7 +371,19 @@ volume = 6   # Volume
 # name the constants each implementation's state layer keys on.
 [well_known]
 page_strings = 0x00
+# The page-0 string tags the state tree stores (function $03 / $43, and the same
+# numbers again as $07 extended strings on the rig-load dump).
 string_rig_name = 0x01
+string_rig_author = 0x02
+string_rig_date = 0x03
+string_rig_comment = 0x04
+# Measured, not assumed: the amplifier's tags start at 0x10 (name, author,
+# date, ... mirror the rig's 0x01..0x04 and the cabinet's 0x20..), and a
+# request for tag 0x0A draws no reply at all. The old value here was a guess
+# that nothing ever checked, because a fire-and-forget request cannot notice
+# an answer that never comes.
+string_amp_name = 0x10
+string_cabinet_name = 0x20
 page_realtime = 0x7C
 meter_block_number = 0x4E     # first NRPN number of the 11-value status block
 beat_pulse_number = 0x00
@@ -375,6 +395,8 @@ rig_volume_number = 0x01
 amp_page = 0x0A
 amp_on_number = 0x02
 gain_number = 0x04
+cabinet_page = 0x0C
+cabinet_on_number = 0x02
 system_page = 0x7F
 main_volume_number = 0x00
 headphone_volume_number = 0x01
@@ -384,8 +406,21 @@ monitor_volume_number = 0x02
 # under the default output routing. It has no soft-takeover, so a written value
 # is authoritative only until the pot next moves; treat master volume as a
 # read-only readout. Main Output (0x7F/0) is independent of the knob.
+# Morph lives on page 0 (dual-use with the string page). The button is a
+# momentary the device reports on press and release; the position is the fader
+# it drives, 0 = base .. 16383 = fully morphed.
+#
+# The position is **push-only and CBOR-only**: neither a $41 nor a $46 request
+# draws any reply, and it never appears on the MIDI3 stream even while a morph
+# is ramping. The CBOR state dump carries it, and a CBOR session sees it move.
+# So a MIDI3 client learns *that* a morph happened, and hears what it did to the
+# audio parameters, but never where the fader sits. See docs/05.
 page_morph = 0x00
-morph_number = 0x0B
+morph_number = 0x77
+morph_button_number = 0x50
+# The morph position as a single CBOR address (page_morph * 128 + morph_number),
+# which is how the state dump names it.
+morph_address = 119
 page_tuner_note = 0x7D
 tuner_note_number = 0x54
 tuner_in_tune_center = 8192
@@ -398,10 +433,11 @@ bank_slots = 5
 bank_rig_name_base = 0x00
 bank_amp_name_base = 0x05
 bank_cabinet_name_base = 0x0A
-# The device's current position, as single extended addresses that appear in the
-# CBOR state dump (docs/06). Both are 0-based: bank 0 slot 0 is the first rig of
-# the first bank. The MIDI3 stream never reports these — the read-only name-match
-# (loaded rig name vs. the bank preview) is the stream-only fallback for the slot,
-# and cannot recover the bank number at all.
+# The device's current position, as single extended addresses. Both are 0-based:
+# bank 0 slot 0 is the first rig of the first bank. They are readable on the
+# streaming session with a `$46` request (reply `$06`), and the device pushes an
+# unsolicited `$06` for whichever of the two changed on every rig change — from
+# the front panel as readily as from a controller. They also appear in the CBOR
+# state dump (docs/06), which is how a client learns them before a session opens.
 current_bank_address = 100701      # 0x1895D
 current_rig_slot_address = 100702  # 0x1895E

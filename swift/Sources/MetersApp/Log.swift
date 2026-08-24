@@ -71,19 +71,33 @@ enum Log {
         case let .renderedString(page, number, value, text):
             return verbose ? "rendered \(hex(page))/\(number) \(value) = \"\(text)\"" : nil
         case .rigChanged:
-            // The store logs this one itself, with how long it has been since
-            // our own last navigation — the part that says who caused it.
+            // The store logs this one itself, beside the Navigator's aim — the
+            // part that says who caused it.
             return nil
         case let .tempoBpm(bpm):
             return "tempoBpm \(bpm)"
         case let .morphChanged(value):
             return "morph \(value)"
+        case let .morphButton(on):
+            return "morphButton \(on ? "press" : "release")"
         case let .currentPosition(bank, slot):
             return "currentPosition bank \(opt(bank)) slot \(opt(slot))"
         case .connected:
             return "connected"
         case .disconnected:
             return "disconnected"
+        case let .connectionChanged(connection):
+            return "connection \(connection)"
+        case let .channelChanged(channel, state):
+            return "channel \(channel) \(state)"
+        case let .syncCompleted(source):
+            return "sync completed (\(source))"
+        case let .requestTimedOut(address):
+            return "request timed out at \(address)"
+        case let .navigationSettled(index):
+            return "navigation settled at \(index)"
+        case let .navigationDropped(index, reason):
+            return "navigation dropped \(index) (\(reason))"
         }
     }
 
@@ -120,6 +134,8 @@ extension Phase {
             return "connecting(\(host))"
         case let .connected(host, name):
             return "connected(\(host)\(name.map { " · \($0)" } ?? ""))"
+        case let .reconnecting(host, attempt):
+            return "reconnecting(\(host) #\(attempt))"
         case let .failed(message):
             return "failed(\(message))"
         }

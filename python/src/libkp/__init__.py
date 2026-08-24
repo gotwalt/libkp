@@ -9,8 +9,12 @@ Layers, lowest to highest:
 - :mod:`libkp.nrpn` — Kemper NRPN-over-SysEx builders and parsers.
 - :mod:`libkp.control` — the 7-bit CC/PC control vocabulary.
 - :mod:`libkp.params` / :mod:`libkp.registry` — offline name and type lookups.
+- :mod:`libkp.cbor` — the native CBOR control channel: codec and control link.
 - :mod:`libkp.state` — the device-state tree and its pure decode routing.
-- :mod:`libkp.model` — :class:`~libkp.model.DeviceModel`, the async store.
+- :mod:`libkp.nav` — the Navigator's pure state machine, the one way a rig is
+  loaded.
+- :mod:`libkp.model` — :class:`~libkp.model.DeviceModel`, the async store over
+  the stream and the control link.
 
 Constants and lookup tables come from :mod:`libkp._generated`, which is emitted
 from the shared spec; the protocol logic is hand-written here and held to the
@@ -36,9 +40,11 @@ from __future__ import annotations
 
 from ._generated import SPEC_VERSION
 from .cbor import (
+    CborSession,
     StateSnapshot,
     extract_snapshot,
     fetch_state_snapshot,
+    numeric_values,
     param_write,
     state_dump_request,
 )
@@ -51,6 +57,11 @@ from .control import (
 )
 from .discovery import DiscoveryOptions, DiscoveryPort, Reply, discover, find_first
 from .errors import (
+    ChannelDisconnectedError,
+    ChannelError,
+    ChannelOffError,
+    ChannelSessionError,
+    ChannelTooSoonError,
     CommandError,
     ConnectError,
     ConnectionClosedError,
@@ -61,13 +72,34 @@ from .errors import (
     ParseError,
     PortUnavailableError,
     ProtocolRejectedError,
+    RequestDisconnectedError,
+    RequestError,
+    RequestTimeoutError,
+    RequestUnreadableError,
+    RigLoadRequiresNavigatorError,
     SessionError,
     TimeoutErrorLibKP,
     TooShortError,
     UnknownSlotError,
 )
 from .midi3 import Unframer, frame, is_kemper_sysex
-from .model import DeviceModel
+from .model import (
+    Backoff,
+    ConnectOptions,
+    ControlPolicy,
+    DeviceModel,
+    ReconnectPolicy,
+    SyncStrategy,
+)
+from .nav import (
+    Dropped,
+    NavAction,
+    NavigatorState,
+    Send,
+    Settled,
+    StartSettle,
+    StartWindow,
+)
 from .nrpn import (
     NrpnHeader,
     beacon,
@@ -114,28 +146,46 @@ from .state import (
     BankPreview,
     BankSlot,
     BeatPulse,
+    Block,
     Cabinet,
+    Channel,
+    ChannelChanged,
+    Channels,
+    ChannelState,
     Connected,
     Connection,
+    ConnectionChanged,
     CurrentPosition,
+    Decoded,
     DeviceEvent,
     DeviceState,
     Disconnected,
     Effect,
     EffectChanged,
+    MorphButton,
     MorphChanged,
+    NavDrop,
+    Navigation,
+    NavigationDropped,
+    NavigationSettled,
+    Num,
     Output,
     ParamChanged,
+    Phase,
     RealtimeStatus,
     RenderedString,
+    RequestTimedOut,
     Rig,
     RigChanged,
     Status,
     StringTag,
+    SyncCompleted,
     TempoBpm,
+    Text,
     Tuner,
     TunerDeviance,
     TunerNote,
+    Update,
 )
 
 __version__ = "0.1.0"
@@ -200,6 +250,10 @@ __all__ = [
     "format_value",
     # state + model
     "Connection",
+    "ChannelState",
+    "Channels",
+    "Navigation",
+    "NavDrop",
     "DeviceState",
     "RealtimeStatus",
     "Rig",
@@ -220,17 +274,46 @@ __all__ = [
     "Status",
     "BeatPulse",
     "TempoBpm",
+    "MorphButton",
     "MorphChanged",
     "TunerDeviance",
     "TunerNote",
     "RenderedString",
     "CurrentPosition",
+    "NavigationSettled",
+    "NavigationDropped",
     "Connected",
     "Disconnected",
+    "ConnectionChanged",
+    "ChannelChanged",
+    "SyncCompleted",
+    "RequestTimedOut",
+    "Update",
+    "Decoded",
+    "Num",
+    "Text",
+    "Block",
+    "Channel",
+    "Phase",
     "DeviceModel",
+    "ConnectOptions",
+    "ControlPolicy",
+    "SyncStrategy",
+    "ReconnectPolicy",
+    "Backoff",
+    # the Navigator's state machine
+    "NavigatorState",
+    "NavAction",
+    "Send",
+    "StartSettle",
+    "StartWindow",
+    "Settled",
+    "Dropped",
     # cbor state-dump snapshot
+    "CborSession",
     "StateSnapshot",
     "extract_snapshot",
+    "numeric_values",
     "fetch_state_snapshot",
     "param_write",
     "state_dump_request",
@@ -249,4 +332,14 @@ __all__ = [
     "CommandError",
     "DisconnectedError",
     "UnknownSlotError",
+    "RigLoadRequiresNavigatorError",
+    "RequestError",
+    "RequestDisconnectedError",
+    "RequestTimeoutError",
+    "RequestUnreadableError",
+    "ChannelError",
+    "ChannelOffError",
+    "ChannelTooSoonError",
+    "ChannelDisconnectedError",
+    "ChannelSessionError",
 ]

@@ -6,12 +6,24 @@ outputs every implementation of the protocol is held to.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from conftest import VECTORS_DIR, vector
 
 from libkp import _generated as gen
 from libkp import cbor, control, midi3, nrpn, params, protocol
-from libkp.state import DeviceState
+from libkp.nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
+from libkp.state import (
+    ApplyOutcome,
+    Channel,
+    DeviceEvent,
+    DeviceState,
+    Num,
+    Phase,
+    Text,
+    Update,
+)
 
 # ---------------------------------------------------------------------------
 # The vector set itself
@@ -19,13 +31,23 @@ from libkp.state import DeviceState
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.5.0"
+    assert gen.SPEC_VERSION == "0.8.0"
 
 
 def test_every_vector_file_is_covered():
     """Guard against a new vector file landing without a test for it."""
     present = {p.stem for p in VECTORS_DIR.glob("*.json")}
-    covered = {"u14", "discovery", "midi3", "nrpn", "controls", "params", "state", "cbor"}
+    covered = {
+        "u14",
+        "discovery",
+        "midi3",
+        "nrpn",
+        "controls",
+        "params",
+        "state",
+        "cbor",
+        "navigation",
+    }
     assert present == covered, f"uncovered vector files: {sorted(present - covered)}"
 
 
@@ -193,6 +215,22 @@ def test_ext_decode(case):
     assert nrpn.ext_encode(case["value"], len(data)) == data
 
 
+@pytest.mark.parametrize("case", _NRPN["request_extended_param"], ids=_ids(["address"]))
+def test_request_extended_param(case):
+    built = nrpn.request_extended_param(case["product"], case["device"], case["address"])
+    assert built.hex() == case["hex"]
+
+
+@pytest.mark.parametrize("case", _NRPN["parse_extended_param"], ids=lambda c: c["hex"][:24])
+def test_parse_extended_param(case):
+    got = nrpn.parse_extended_param(bytes.fromhex(case["hex"]))
+    expected = case["expected"]
+    if expected is None:
+        assert got is None
+    else:
+        assert got == (expected["address"], expected["value"])
+
+
 @pytest.mark.parametrize("case", _NRPN["parse_extended_string"], ids=lambda c: c["hex"][:24])
 def test_parse_extended_string(case):
     got = nrpn.parse_extended_string(bytes.fromhex(case["hex"]))
@@ -333,12 +371,59 @@ def _assert_state_expectations(state: DeviceState, expect: dict) -> None:
             assert effect.type_name == want["type_name"]
 
 
+def _event_name(event: DeviceEvent) -> str:
+    """The vectors name events in snake_case (``current_position``); the classes
+    are CamelCase (``CurrentPosition``)."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", type(event).__name__).lower()
+
+
+def _run_step(state: DeviceState, step: dict) -> ApplyOutcome:
+    """Drive one ``steps`` entry through the entry point it names.
+
+    ``midi3`` / ``cbor`` / ``cbor_text`` are the decoders a live session uses;
+    ``cbor_dump*`` build a :class:`Update` tagged :attr:`Phase.DUMP` directly,
+    because the harness, not a timer, decides what counts as the dump.
+    """
+    ((kind, arg),) = step.items()
+    if kind == "midi3":
+        return state.apply(bytes.fromhex(arg))
+    if kind == "cbor":
+        return state.apply_cbor(arg[0], arg[1])
+    if kind == "cbor_text":
+        return state.apply_cbor_text(arg[0], arg[1])
+    if kind == "cbor_dump":
+        return state.apply_update(Update(Channel.CONTROL, Phase.DUMP, arg[0], Num(arg[1])))
+    if kind == "cbor_dump_text":
+        return state.apply_update(Update(Channel.CONTROL, Phase.DUMP, arg[0], Text(arg[1])))
+    if kind == "dump_begin":
+        state.begin_dump()
+        return ApplyOutcome.empty()
+    if kind == "dump_end":
+        state.end_dump()
+        return ApplyOutcome.empty()
+    raise AssertionError(f"unknown step kind {kind!r}")
+
+
 @pytest.mark.parametrize("case", vector("state")["cases"], ids=lambda c: c["name"])
 def test_state_apply(case):
+    """A case is either ``messages`` (unframed MIDI3 hex, each through ``apply``)
+    or ``steps`` (each naming the entry point it drives). Both fold into one
+    fresh tree; a ``steps`` case also pins the ordered event names and how many
+    steps flagged the snapshot."""
+    if "messages" in case:
+        steps = [{"midi3": hex_message} for hex_message in case["messages"]]
+    else:
+        steps = case["steps"]
     state = DeviceState()
-    for hex_message in case["messages"]:
-        state.apply(bytes.fromhex(hex_message))
-    _assert_state_expectations(state, case["expect"])
+    outcomes = [_run_step(state, step) for step in steps]
+    expect = case["expect"]
+    _assert_state_expectations(state, expect)
+    if "events" in expect:
+        assert [_event_name(e) for o in outcomes for e in o.events] == expect["events"]
+    if "slow_steps" in expect:
+        assert sum(o.slow_changed for o in outcomes) == expect["slow_steps"]
+    if "positions" in expect:
+        assert [p for o in outcomes for p in o.positions] == expect["positions"]
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +450,56 @@ def test_cbor_extract_snapshot(case):
     expect = case["expect"]
     assert snap.current_bank == expect["current_bank"]
     assert snap.current_rig_slot == expect["current_rig_slot"]
+    assert snap.morph == expect["morph"]
     if "strings" in expect:
         want = [(s["addr"], s["text"]) for s in expect["strings"]]
         assert snap.strings == want
+
+
+# ---------------------------------------------------------------------------
+# navigation.json
+# ---------------------------------------------------------------------------
+
+
+def _nav_action_name(action: NavAction) -> str:
+    """The vectors name actions ``send:14`` / ``start_settle`` / ``start_window``
+    / ``settled:14`` / ``dropped:99``."""
+    if isinstance(action, Send):
+        return f"send:{action.index}"
+    if isinstance(action, StartSettle):
+        return "start_settle"
+    if isinstance(action, StartWindow):
+        return "start_window"
+    if isinstance(action, Settled):
+        return f"settled:{action.index}"
+    if isinstance(action, Dropped):
+        return f"dropped:{action.index}"
+    raise AssertionError(f"unknown action {action!r}")
+
+
+def _nav_step(machine: NavigatorState, step: dict) -> list[NavAction]:
+    """Drive one ``steps`` entry: an aim, a timer expiry, or a position report."""
+    ((kind, arg),) = step.items()
+    if kind == "navigate":
+        return machine.navigate(arg)
+    if kind == "settle":
+        return machine.settle_elapsed()
+    if kind == "window":
+        return machine.window_elapsed()
+    if kind == "position":
+        return machine.position(arg)
+    raise AssertionError(f"unknown step kind {kind!r}")
+
+
+@pytest.mark.parametrize("case", vector("navigation")["cases"], ids=lambda c: c["name"])
+def test_navigation_state_machine(case):
+    """A fresh machine through the steps: the actions are exact and ordered,
+    the sent list is the wire log, and the final state is pinned."""
+    machine = NavigatorState()
+    actions = [action for step in case["steps"] for action in _nav_step(machine, step)]
+    expect = case["expect"]
+    assert [_nav_action_name(a) for a in actions] == expect["actions"]
+    assert [a.index for a in actions if isinstance(a, Send)] == expect["sent"]
+    assert machine.aim == expect["aim"]
+    assert machine.in_flight is expect["in_flight"]
+    assert machine.awaiting is expect["awaiting"]

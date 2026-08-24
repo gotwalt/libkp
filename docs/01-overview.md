@@ -17,10 +17,21 @@ the interest is in how they stack.
 
 Discovery and the session share the same port number; the client broadcasts its
 poll from UDP 5727 and reads replies there, then opens a TCP connection to the
-discovered address on the same port. Only one controller may hold a session at a
-time — a Profiler that is already connected refuses new sessions.
+discovered address on the same port.
 
-Source: [`../spec/protocol.toml`](../spec/protocol.toml), `[transport]`.
+**Several sessions may be open at once.** Concurrency is fine: the device
+serves several sessions together, and `libkp`'s `DeviceModel` holds two — the
+MIDI3 stream and the CBOR control link — because neither carries everything;
+see [Channels and data paths](11-channels-and-data-paths.md). What the device
+will not survive is connection *churn*: a socket opened too soon after another
+one opened or closed is not greeted, and enough of them stop it accepting TCP
+until it is power-cycled. Every `Session` in the library therefore passes a
+process-wide connection ledger that spaces opens to one device by
+`connection_cooldown_ms` (1 s), so no caller spaces its own; the model adds no
+sleeps, and no code path in the library can churn. Leave sessions open.
+
+Source: [`../spec/protocol.toml`](../spec/protocol.toml), `[transport]` and
+`[safety]`.
 
 ## The layers
 
@@ -30,6 +41,8 @@ Source: [`../spec/protocol.toml`](../spec/protocol.toml), `[transport]`.
   ├───────────────────────────────────────────────────────────┤
   │  Message universe       Kemper SysEx  F0 00 20 33 … F7     │  docs 05, 07
   │                         + raw MIDI CC / Program Change     │
+  │                         (the CBOR channel replaces these   │  docs 06, 11
+  │                          two layers with CBOR items)       │
   ├───────────────────────────────────────────────────────────┤
   │  Framing                MIDI3  4-byte frames [tag][b0b1b2] │  doc 04
   ├───────────────────────────────────────────────────────────┤
@@ -66,14 +79,14 @@ socket, replying inline.
 
 ## The four protocol GUIDs
 
-The device offers four dialects at step 4. `libkp` speaks the first fully and
-the third for one purpose.
+The device offers four dialects at step 4. `libkp` speaks two of them, as the
+two links of one model.
 
 | GUID | Role | In `libkp` |
 |---|---|---|
-| `{369F50E7-750B-459A-BAEE-85ADD3F3798D}` | MIDI3 stream — meters, requests, replies, control | **implemented** |
-| `{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}` | request/response channel; emits an 11-byte token on open | not implemented |
-| `{774CDB9E-74ED-4740-AF09-AC96B3A69A11}` | native CBOR control channel | [the state-dump snapshot only](06-cbor-channel.md) |
+| `{369F50E7-750B-459A-BAEE-85ADD3F3798D}` | MIDI3 stream — meters, requests, replies, control | **the model's stream link**, required |
+| `{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}` | request/response channel; emits an 11-byte token on open | not opened |
+| `{774CDB9E-74ED-4740-AF09-AC96B3A69A11}` | native CBOR control channel | **the model's control link**: the state dump and the live pushes are read, one item is written ([06](06-cbor-channel.md)) |
 | `{77DB6B28-785E-4641-B840-42F0F06A11FC}` | reserved — offered, but rejects the handshake with `-NO` | n/a |
 
 See [Handshake](03-handshake.md).
@@ -98,6 +111,7 @@ Once framing is stripped, the payload is ordinary MIDI. Two families matter.
 | `$41` | Request Single Parameter | client → device | reply is `$01` |
 | `$42` | Request Multi Parameters | client → device | reply is `$02` |
 | `$43` | Request String Parameter | client → device | reply is `$03` |
+| `$46` | Request Extended Parameter | client → device | reply is `$06` — how the position is read |
 | `$47` | Request Extended String | client → device | reply is `$07` (or `$03`) |
 | `$7C` | Request Rendered String | client → device | reply is `$3C` |
 | `$7E` | Beacon / sense | both | keep-alive and push subscription |
@@ -105,7 +119,8 @@ Once framing is stripped, the payload is ordinary MIDI. Two families matter.
 **Channel-voice MIDI** — 7-bit Control Change (`$B0 | channel`) and Program
 Change (`$C0 | channel`), the Profiler's performance-control surface: pedals,
 tap tempo, tuner, effect buttons, rig navigation. Fire-and-forget; nothing is
-read back. See [Control model](08-control-model.md).
+read back. The rig-loading controllers among them are the one thing the model
+sends only on its own terms. See [Control model](08-control-model.md).
 
 Everything a controller does is one of those. Full grammar in
 [SysEx / NRPN dialect](05-sysex-nrpn.md).
@@ -139,6 +154,39 @@ The `meters` example in each language (`rust/examples`,
 `python/src/libkp/examples`, `swift/Sources/meters`) does exactly this and
 nothing more: connect, subscribe, and render what arrives.
 
+## The model
+
+`DeviceModel` is the curated surface, and the only object in `libkp` that holds
+a socket to the device. It owns the two links — the MIDI3 **stream**, required,
+and the CBOR **control link**, opened after it by default — and feeds both
+through one fold into one immutable `DeviceState` tree, so an application sees
+one handle, one snapshot stream, one event stream, and never a channel name
+except in the `ChannelChanged` event. Its state fills from a 46-request sync
+burst the device answers within ~50 ms, from the control link's state dump,
+and from everything both wires push thereafter. A rig is loaded only through
+its Navigator, which aims rather than sends, so two loads can never overlap.
+The design, and the measurements behind it, are in
+[Channels and data paths](11-channels-and-data-paths.md).
+
+The same surface, in each language:
+
+| | Rust | Python | Swift |
+|---|---|---|---|
+| Connect, defaults | `DeviceModel::connect(ip)` | `await DeviceModel.connect(ip)` | `try await DeviceModel.connect(host:)` |
+| Connect, options | `connect_with(ip, ConnectOptions { control, sync, reconnect, port })` | `connect(ip, options=ConnectOptions(...))` | `connect(host:port:options:)` |
+| Close | `close()` (or drop the last handle) | `close()` / `async with` | `close()` |
+| Snapshot | `state()` | `state()` | `snapshot()` |
+| Store | `subscribe()` | `subscribe()` | `snapshots()` |
+| Deltas | `events()` | `events()` / `add_event_listener` | `events()` |
+| Fast lane | `status()` | `status()` | `status()` |
+| Where it stands | `state.connection`, `state.channels` | same | same |
+| Parameters | `set_gain`, `set_effect_enabled`, `set_param`, … | same, snake_case | `setGain`, `setEffectEnabled`, `setParam`, … |
+| Requests, with their answer | `request_param(page, number) -> u16`, `request_string`, `request_ext_param`, `request_ext_string`, `request_render`, `refresh*` | same | `requestParam(page:number:) -> UInt16`, … |
+| Actions | `tap_tempo`, `bank`, `morph_pedal`, `send_control`, `send_raw`, … | same | `tapTempo`, `bank`, `send(control:)`, `sendRaw`, … |
+| Navigation | `navigate_to`, `step_rig`, `step_bank`, `select_slot` | same | `navigateTo`, `stepRig(by:)`, `stepBank(forward:)`, `selectSlot` |
+| Control link, explicitly | `reopen_control()` | `reopen_control()` | `reopenControl()` |
+| Tooling on the CBOR channel | `StateSnapshot::fetch`, `CborSession` | `fetch_state_snapshot`, `CborSession` | `StateSnapshot.fetch`, `CborSession` |
+
 ## How this documentation is held to the wire
 
 Every constant quoted in these documents comes from
@@ -146,10 +194,10 @@ Every constant quoted in these documents comes from
 conformance vectors in [`../spec/vectors`](../spec/vectors), which all three
 implementations execute. Beyond those synthetic vectors,
 [`../spec/captures`](../spec/captures) holds sanitized recordings of real
-protocol traffic — a discovery reply, live status and meter streams, and a
-rig-load dump, gathered through observed experimentation — that each
-implementation replays end to end to prove its decode path against genuine wire
-data. See [Versioning & compatibility](10-versioning-and-compatibility.md).
+protocol traffic — a discovery reply, live status and meter streams, a
+rig-load dump, and a CBOR state dump, gathered through observed experimentation
+— that each implementation replays end to end to prove its decode path against
+genuine wire data. See [Versioning & compatibility](10-versioning-and-compatibility.md).
 
 ## Where to go next
 
@@ -160,8 +208,10 @@ data. See [Versioning & compatibility](10-versioning-and-compatibility.md).
 | get bytes on and off the stream | [MIDI3 framing](04-midi3-framing.md) |
 | read or write a parameter | [SysEx / NRPN dialect](05-sysex-nrpn.md) |
 | draw meters or a tuner | [Realtime status & meters](07-realtime-status.md) |
-| pick CC vs NRPN for a control | [Control model](08-control-model.md) |
+| pick CC vs NRPN for a control, or load a rig | [Control model](08-control-model.md) |
+| know where the morph position comes from | [The CBOR channel](06-cbor-channel.md) |
 | name an address | [Parameter registry](09-parameter-registry.md) |
+| understand why the model is shaped as it is | [Channels and data paths](11-channels-and-data-paths.md) |
 
 ## Sources
 

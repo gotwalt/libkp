@@ -1,7 +1,8 @@
 //! `meters` — a live full-screen **ratatui** view of a Profiler.
 //!
-//! Connects (discovering the device if no `--ip` is given), performs the
-//! read-only initial rig sync, then drives a full-screen terminal UI from the
+//! Connects (discovering the device if no `--ip` is given) with the default
+//! options — the stream, its read-only sync burst, and the control link that
+//! carries the morph position — then drives a full-screen terminal UI from the
 //! library's [`DeviceModel`]:
 //!
 //! - the **slow lane** — rig name / author / tempo / morph, amp and cabinet, and
@@ -87,8 +88,10 @@ async fn run(cli: Cli) -> Result<(), BoxErr> {
     };
 
     eprintln!("Connecting to {ip}:{PORT} ...");
-    // `connect` opens the stream and issues the read-only initial rig sync
-    // (rig/amp/cab names plus every effect slot's Type and On/Off).
+    // `connect` opens the stream, starts the read-only sync burst (strings,
+    // effect slots, bank preview, position, the requested numerics) and opens
+    // the control link in the background; the morph shows up once its dump
+    // folds, and `connection` reads Degraded if it could not be opened.
     let model = DeviceModel::connect(ip).await?;
     let mut snapshots = model.subscribe();
     let mut events = model.events();
@@ -113,6 +116,10 @@ async fn run(cli: Cli) -> Result<(), BoxErr> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('a') => view.all = !view.all,
+                    // Rig loads go through the Navigator: each tap moves the
+                    // aim, and the model sends one load at a time.
+                    KeyCode::Left => model.step_rig(-1),
+                    KeyCode::Right => model.step_rig(1),
                     _ => {}
                 },
                 Event::Resize(_, _) => {}
@@ -307,6 +314,12 @@ impl View {
             DeviceEvent::RenderedString { text, .. } => {
                 self.last_param = Some(format!("rendered \"{text}\""))
             }
+            DeviceEvent::NavigationSettled { index } => {
+                self.last_param = Some(format!("rig {index} loaded"))
+            }
+            DeviceEvent::NavigationDropped { index, .. } => {
+                self.last_param = Some(format!("rig {index} not reached"))
+            }
             _ => {}
         }
     }
@@ -436,11 +449,19 @@ impl View {
             ));
         }
 
-        let conn = self.snapshot.connection == libkp::Connection::Connected;
-        let (dot, dot_style, label) = if conn {
-            ("●", Style::default().fg(Color::Green), "connected")
-        } else {
-            ("○", Style::default().dim(), "disconnected")
+        // Degraded is the stream without the control link: everything here
+        // still flows, only the morph has gone stale.
+        let (dot, dot_style, label) = match self.snapshot.connection {
+            libkp::Connection::Connected => ("●", Style::default().fg(Color::Green), "connected"),
+            libkp::Connection::Degraded => (
+                "●",
+                Style::default().fg(Color::Yellow),
+                "connected (no morph)",
+            ),
+            libkp::Connection::Reconnecting { .. } => {
+                ("○", Style::default().fg(Color::Yellow), "reconnecting")
+            }
+            libkp::Connection::Disconnected => ("○", Style::default().dim(), "disconnected"),
         };
         let status_line = Line::from(vec![
             Span::styled(dot, dot_style),
@@ -703,7 +724,7 @@ impl View {
         ]);
 
         let help = Line::from(Span::styled(
-            "q / Ctrl-C quit    a toggle raw fields    play into the device to see meters move",
+            "q / Ctrl-C quit    a toggle raw fields    ←/→ previous/next rig    play into the device to see meters move",
             Style::default().dim(),
         ));
 

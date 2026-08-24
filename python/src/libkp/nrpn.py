@@ -46,6 +46,7 @@ __all__ = [
     "request_string",
     "request_single",
     "request_multi",
+    "request_extended_param",
     "request_extended_string",
     "request_rendered_string",
     "set_single",
@@ -54,6 +55,7 @@ __all__ = [
     "multi_values",
     "ext_decode",
     "ext_encode",
+    "parse_extended_param",
     "parse_extended_string",
     "parse_rendered_string",
 ]
@@ -85,6 +87,7 @@ FUNCTION_RENDERED_STRING_REPLY: int = gen.FN_RENDERED_STRING_REPLY
 FUNCTION_REQUEST_SINGLE: int = gen.FN_REQUEST_SINGLE
 FUNCTION_REQUEST_MULTI: int = gen.FN_REQUEST_MULTI
 FUNCTION_REQUEST_STRING: int = gen.FN_REQUEST_STRING
+FUNCTION_REQUEST_EXT_PARAM: int = gen.FN_REQUEST_EXT_PARAM
 FUNCTION_REQUEST_EXT_STRING: int = gen.FN_REQUEST_EXT_STRING
 FUNCTION_REQUEST_RENDERED_STRING: int = gen.FN_REQUEST_RENDERED_STRING
 FUNCTION_BEACON: int = gen.FN_BEACON
@@ -202,6 +205,26 @@ def request_multi(product: int, device: int, page: int, number: int) -> bytes:
     number of the unit or the device ignores it.
     """
     return sysex(product, device, FUNCTION_REQUEST_MULTI, page, number)
+
+
+def request_extended_param(product: int, device: int, address: int) -> bytes:
+    """Request an extended-address numeric parameter (function ``$46``) at a flat
+    address (``page * 128 + number``, or an extended address at or above 16384);
+    the device replies with ``$06`` -- or a plain ``$01`` when the address fits in
+    14 bits. Read-only.
+
+    Layout mirrors ``$06`` minus the value:
+    ``F0 00 20 33 <prod> <dev> 46 <inst=00> <5-byte address> F7``. This is how the
+    device's current bank and rig slot are read on the streaming session -- the
+    addresses are :data:`libkp._generated.CURRENT_BANK_ADDRESS` and
+    :data:`libkp._generated.CURRENT_RIG_SLOT_ADDRESS`.
+    """
+    out = bytearray([0xF0])
+    out.extend(MANUFACTURER_ID)
+    out.extend([product, device, FUNCTION_REQUEST_EXT_PARAM, 0x00])
+    out.extend(ext_encode(address, 5))
+    out.append(0xF7)
+    return bytes(out)
 
 
 def request_extended_string(product: int, device: int, address: int) -> bytes:
@@ -324,6 +347,32 @@ def _ascii_until_nul(data: bytes) -> str:
     return "".join(chr(b) for b in data)
 
 
+def parse_extended_param(msg: bytes) -> tuple[int, int] | None:
+    """Parse a function-``$06`` Extended Parameter message:
+    ``F0 00 20 33 <prod> <dev> 06 <inst> <5-byte address> <5-byte value> F7``.
+
+    Both fields use the 5x7 extended scheme, so the value spans 35 bits rather
+    than the 14 a ``$01`` carries. The device sends these unasked when an
+    extended-address parameter changes, and in reply to
+    :func:`request_extended_param`. Returns ``(address, value)``.
+    """
+    # F0 + mfr(3) + prod + dev + fn + inst + addr(5) + value(5) + F7 = 19.
+    if (
+        len(msg) < 19
+        or msg[0] != 0xF0
+        or bytes(msg[1:4]) != MANUFACTURER_ID
+        or msg[6] != FUNCTION_EXT_PARAM
+        or msg[-1] != 0xF7
+    ):
+        return None
+    address = ext_decode(msg[8:13])
+    # The scheme can carry 35 bits; an address past 32 is malformed, not an
+    # address to wrap onto some other parameter. The value keeps its 35.
+    if address > 0xFFFF_FFFF:
+        return None
+    return address, ext_decode(msg[13:18])
+
+
 def parse_extended_string(msg: bytes) -> tuple[int, str] | None:
     """Parse a function-``$07`` Extended String Parameter message.
 
@@ -343,6 +392,9 @@ def parse_extended_string(msg: bytes) -> tuple[int, str] | None:
     ):
         return None
     address = ext_decode(msg[8:13])
+    # As for the $06: 35 encodable bits, 32 addressable ones.
+    if address > 0xFFFF_FFFF:
+        return None
     return address, _ascii_until_nul(msg[13 : len(msg) - 1])
 
 

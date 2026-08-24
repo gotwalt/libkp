@@ -70,10 +70,14 @@ def test_undocumented_addresses():
 
 
 def test_page_zero_is_dual_use():
-    assert params.page0_numeric_name(0x0B) == "Morph State"
-    assert params.describe_numeric(0x00, 0x0B) == "Page 0: Morph State"
-    assert params.describe(0x00, 0x0B) == "String Tags: Amp Author"
-    assert params.describe_numeric(0x00, 0x77) == "Page 0: #119 (0x77)"
+    assert params.page0_numeric_name(0x77) == "Morph Position"
+    assert params.page0_numeric_name(0x50) == "Morph Button"
+    assert params.describe_numeric(0x00, 0x77) == "Page 0: Morph Position"
+    # 0x0B is a string tag, and is *not* the morph -- see test_morph_is_not_at_0x0b.
+    assert params.page0_numeric_name(0x0B) is None
+    assert params.describe(0x00, 0x11) == "String Tags: Amp Author"
+    # An unnamed page-0 number still describes, by number.
+    assert params.describe_numeric(0x00, 0x60) == "Page 0: #96 (0x60)"
     # Off page 0 the two describes agree.
     assert params.describe_numeric(0x0A, 4) == params.describe(0x0A, 4)
 

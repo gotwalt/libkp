@@ -43,7 +43,7 @@ struct DashboardView: View {
         case let .connected(host, name):
             if let name = name?.trimmed.nonEmpty { return "KP Meters - \(name) · \(host)" }
             return "KP Meters - \(host)"
-        case let .connecting(host):
+        case let .connecting(host), let .reconnecting(host, _):
             return "KP Meters - \(host)"
         default:
             return "KP Meters"
@@ -124,16 +124,17 @@ struct DashboardView: View {
 /// device is actually on.
 ///
 /// The position readout is the device's own, never this app's arithmetic: the
-/// CBOR snapshot seeds it at connect and the Bank Select / Program Change pair
-/// keeps it live, so it follows front-panel changes as readily as taps here.
-/// It reads `—` only before the first report has arrived.
+/// `$06` it pushes at the current-bank and current-rig-slot addresses keeps it
+/// live, so it follows front-panel changes as readily as taps here. It reads `—`
+/// only before the first report has arrived.
 ///
 /// Every move is computed in the flat rig index and sent as an absolute bank
 /// preselect plus a slot load, so any rig is one hop away and bank boundaries
 /// are not special. Nothing assumes how many rigs the device holds.
 ///
-/// The highlighted slot prefers this app's last tap, then the device's reported
-/// slot, then matching the loaded rig name against the five preview names
+/// The highlighted slot prefers the model's outstanding aim — the last tap,
+/// until the device reports where it landed — then the device's own slot,
+/// then matching the loaded rig name against the five preview names
 /// (`DeviceStore.deviceSlot`).
 struct RigNavigationView: View {
     @EnvironmentObject private var store: DeviceStore
@@ -262,10 +263,15 @@ struct RigNavigationView: View {
 
 // MARK: - Header
 
-/// The loaded rig: its name and author, with the morph position and the rig
+/// The loaded rig: its name and author, with the morph control and the rig
 /// tempo — whose metronome icon flashes on the beat pulse — at the trailing
 /// edge.
+///
+/// The morph position is CBOR-only, so it reads `—` until that channel is up.
+/// The toggle works either way: it is a Control Change, which the streaming
+/// session carries.
 struct RigHeaderView: View {
+    @EnvironmentObject private var store: DeviceStore
     /// The latest snapshot.
     let state: DeviceState
     /// True during the brief window after an "on" beat pulse.
@@ -282,11 +288,8 @@ struct RigHeaderView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if let morph = state.morph {
-                Label("Morph \(Format.percent(morph))", systemImage: "arrow.left.and.right")
-                    .font(.callout)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+            MorphControl(morph: state.morph, isMorphed: store.isMorphed) {
+                store.setMorphed($0)
             }
             if let tempo = state.rig.tempoBpm {
                 Label {
@@ -331,6 +334,15 @@ struct ConnectionPlaceholderView: View {
                 Text("Connecting to \(host)…")
                     .font(.title3)
                     .fontWeight(.medium)
+            case let .reconnecting(host, attempt):
+                ProgressView()
+                    .controlSize(.large)
+                Text("Reconnecting to \(host)…")
+                    .font(.title3)
+                    .fontWeight(.medium)
+                Text("The device closed the connection. Attempt \(attempt).")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             case let .failed(message):
                 Image(systemName: "antenna.radiowaves.left.and.right.slash")
                     .font(.system(size: 36))

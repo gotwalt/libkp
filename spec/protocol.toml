@@ -12,6 +12,11 @@
 port = 5727
 # TCP connect timeout and socket read timeout, in seconds.
 connect_timeout_secs = 5
+# How long to wait for the first byte of the greeting, and of the reply to a
+# protocol selection, once the socket is up. Measured: normally under 30 ms,
+# but a device that has served a few sessions has taken 800 ms — and the
+# read idle that bounds the gap *between* chunks is far too short for that.
+handshake_timeout_ms = 2000
 socket_timeout_secs = 15
 # Minimum quiet gap between one TCP session closing and the next one opening, in
 # milliseconds. The device refuses to greet — or resets — a session opened too
@@ -21,6 +26,22 @@ socket_timeout_secs = 15
 # state-dump snapshot followed by a MIDI3 stream — must space them by at least
 # this, and never run them concurrently. See docs/06.
 connection_cooldown_ms = 1000
+
+[safety]
+# Pacing the model applies on the device's behalf. Every value here is measured
+# (docs/11): a SysEx request of any kind answers in under 50 ms even with the
+# whole 46-request connect burst in flight, and the CBOR state dump lands in
+# about 350 ms. The reconnect and reopen floors are the spacing MetersApp used
+# for a year without wedging a device; nothing faster has been tried.
+request_timeout_ms = 300          # a request unanswered this long is reported as timed out and never retried
+max_in_flight_requests = 16       # requests on the wire at once; the rest queue
+dump_settle_ms = 1000             # the dump phase ends this long after the trigger if the end marker never comes
+reconnect_delay_ms = 4000         # first retry after the stream is lost, when a client opts into reconnecting
+reconnect_max_delay_ms = 30000    # the retry delay doubles up to this
+control_reopen_min_gap_ms = 30000 # the control channel is never reopened closer than this to its last open
+rig_load_settle_ms = 500          # a rig load is in flight this long; the device pushes the landed rig on both wires within ~400 ms
+pending_window_ms = 1500          # an aim the device has not confirmed this long after its move settled is dropped
+rig_load_controllers = [48, 49, 50, 51, 52, 53, 54]   # CC numbers that load a rig (down, up, slot 1-5); CC47 bank preselect loads nothing
 
 [discovery]
 # UDP broadcast discovery. The client broadcasts a fixed 34-byte poll; Profilers
@@ -66,8 +87,9 @@ reject_prefix = "-"
 session_preamble_len = 8
 
 [protocols]
-# The protocol GUIDs the device offers. Only the MIDI3 stream is implemented in
-# libkp; the CBOR channel is documented (docs/06) but not implemented.
+# The protocol GUIDs the device offers. libkp speaks two of them — the MIDI3
+# stream and the CBOR control channel, as the model's two links (docs/11); the
+# other two are named and never opened.
 midi3_stream    = "{369F50E7-750B-459A-BAEE-85ADD3F3798D}"  # bidirectional MIDI3: meters + request/reply/control
 request_response = "{2490272E-CD92-4DBA-AE32-E8AF37ED3B0A}" # accepts; sends an 11-byte token on open
 cbor_control    = "{774CDB9E-74ED-4740-AF09-AC96B3A69A11}"  # native CBOR (Protocol3): the state-dump snapshot route
@@ -96,6 +118,17 @@ filler_byte = 0xC0
 # device already carries) and applies to address 102528 = 1.
 state_dump_trigger_address = 102528
 state_dump_trigger_value = 1
+# The item that always ends a state dump: a consecutive run whose base is this
+# address. Measured over repeated dumps (docs/11); the model closes the dump
+# phase when it has folded that run, and falls back to `dump_settle_ms`.
+dump_end_address = 100800
+# The dump has two sections, each closed by that run: the system section
+# (identity, global settings, the position) and then the rig section, which
+# opens with the position run again. Measured identical across repeated
+# dumps: the run sits at item 32 (~80 ms) and at item 201 (~340 ms) of 202.
+# The phase ends at the second, and `dump_settle_ms` covers a device that
+# never sends it.
+dump_end_runs = 2
 # Addresses whose string values are the device's stored WiFi credentials
 # (network name and passphrase). The state dump volunteers both in the clear; a
 # reader must never surface them. See docs/06.
@@ -134,6 +167,7 @@ rendered_string_reply = 0x3C     # reply to a rendered-string request
 request_single = 0x41            # request a single numeric parameter (reply $01)
 request_multi = 0x42             # request all params of a unit (reply $02)
 request_string = 0x43            # request a string parameter (reply $03)
+request_ext_param = 0x46         # request an extended-address parameter (reply $06)
 request_ext_string = 0x47        # request an extended string
 request_rendered_string = 0x7C   # request a value rendered to display text (reply $3C)
 beacon = 0x7E                    # bidirectional beacon (PySwitch; undocumented in the PDF)

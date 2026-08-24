@@ -27,6 +27,8 @@ pub const FUNCTION_SINGLE_PARAM: u8 = generated::FN_SINGLE_PARAM;
 pub const FUNCTION_MULTI_PARAM: u8 = generated::FN_MULTI_PARAM;
 /// String Parameter (set / response).
 pub const FUNCTION_STRING_PARAM: u8 = generated::FN_STRING_PARAM;
+/// Extended Parameter Change (function $06): 5-byte encoded address and value.
+pub const FUNCTION_EXT_PARAM: u8 = generated::FN_EXT_PARAM;
 /// Extended String Parameter Change (function $07): 5-byte encoded address.
 pub const FUNCTION_EXT_STRING_PARAM: u8 = generated::FN_EXT_STRING_PARAM;
 /// Request a single numeric parameter value (reply arrives as $01).
@@ -35,6 +37,9 @@ pub const FUNCTION_REQUEST_SINGLE: u8 = generated::FN_REQUEST_SINGLE;
 pub const FUNCTION_REQUEST_MULTI: u8 = generated::FN_REQUEST_MULTI;
 /// Request a string parameter (reply arrives as $03).
 pub const FUNCTION_REQUEST_STRING: u8 = generated::FN_REQUEST_STRING;
+/// Request an extended-address numeric parameter (function $46): 5-byte encoded
+/// address, reply arrives as $06.
+pub const FUNCTION_REQUEST_EXT_PARAM: u8 = generated::FN_REQUEST_EXT_PARAM;
 /// Request an extended string parameter (function $47): 5-byte encoded address,
 /// reply arrives as $07 (or $03 below the 14-bit range).
 pub const FUNCTION_REQUEST_EXT_STRING: u8 = generated::FN_REQUEST_EXT_STRING;
@@ -248,13 +253,57 @@ pub fn parse_extended_string(msg: &[u8]) -> Option<(u32, String)> {
     {
         return None;
     }
-    let address = ext_decode(&msg[8..13]) as u32;
+    // The scheme can carry 35 bits; an address past 32 is malformed, not an
+    // address to wrap onto some other parameter.
+    let address = u32::try_from(ext_decode(&msg[8..13])).ok()?;
     let text: String = msg[13..msg.len() - 1]
         .iter()
         .take_while(|&&b| b != 0)
         .map(|&b| b as char)
         .collect();
     Some((address, text))
+}
+
+/// Parse a function-$06 Extended Parameter message:
+/// `F0 00 20 33 <prod> <dev> 06 <inst> <5-byte address> <5-byte value> F7`.
+///
+/// Both fields use the 5×7 extended scheme ([`ext_decode`]), so the value spans
+/// 35 bits rather than the 14 a $01 carries — hence the 64-bit value. The device sends these unasked when
+/// an extended-address parameter changes, and in reply to
+/// [`request_extended_param`]. Returns `(address, value)`.
+pub fn parse_extended_param(msg: &[u8]) -> Option<(u32, u64)> {
+    // F0 + mfr(3) + prod + dev + fn + inst + addr(5) + value(5) + F7 = 19.
+    if msg.len() < 19
+        || msg[0] != 0xF0
+        || msg[1..4] != MANUFACTURER_ID
+        || msg[6] != FUNCTION_EXT_PARAM
+        || *msg.last()? != 0xF7
+    {
+        return None;
+    }
+    // The scheme can carry 35 bits; an address past 32 is malformed, not an
+    // address to wrap onto some other parameter. The value keeps its 35.
+    let address = u32::try_from(ext_decode(&msg[8..13])).ok()?;
+    Some((address, ext_decode(&msg[13..18])))
+}
+
+/// Request an extended-address numeric parameter (function $46) at a flat
+/// address (`page * 128 + number`, or an extended address at or above 16384).
+/// The device replies with a $06 Extended Parameter — or a plain $01 when the
+/// address fits in 14 bits. Read-only.
+///
+/// Layout mirrors $06 minus the value:
+/// `F0 00 20 33 <prod> <dev> 46 <inst=00> <5-byte address> F7`. This is how the
+/// device's current bank and rig slot are read on the streaming session — the
+/// addresses are [`generated::CURRENT_BANK_ADDRESS`] and
+/// [`generated::CURRENT_RIG_SLOT_ADDRESS`].
+pub fn request_extended_param(product: u8, device: u8, address: u32) -> Vec<u8> {
+    let mut msg = vec![0xF0];
+    msg.extend_from_slice(&MANUFACTURER_ID);
+    msg.extend_from_slice(&[product, device, FUNCTION_REQUEST_EXT_PARAM, 0x00]);
+    msg.extend_from_slice(&ext_encode(address as u64, 5));
+    msg.push(0xF7);
+    msg
 }
 
 /// Request an extended string parameter (function $47) at a flat address

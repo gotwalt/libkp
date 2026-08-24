@@ -448,6 +448,68 @@ struct MeterListView: View {
     }
 }
 
+// MARK: - Morph
+
+/// The morph: where the fader sits, and a button to send it to either end.
+///
+/// The two halves come from different places, which is why they degrade
+/// separately. The **position** is read from the CBOR channel — the streaming
+/// session never carries it — so it shows `—` until that channel is up, and the
+/// button then reads "Morph" as its best guess at what to do next. The
+/// **button** sends a Control Change, which the streaming session does carry, so
+/// it works regardless.
+///
+/// Nothing here is optimistic: the label follows the position the device
+/// reports, so a morph from the front panel moves it exactly as a tap here does.
+struct MorphControl: View {
+    /// The morph position, 0…16383, or `nil` if the CBOR channel is not up.
+    let morph: UInt16?
+    /// Whether the device is past halfway, or `nil` when the position is unknown.
+    let isMorphed: Bool?
+    /// Send the rig to the morphed sound (`true`) or back to base (`false`).
+    let setMorphed: (Bool) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button {
+                // With no position to go on, assume base and offer to morph.
+                setMorphed(!(isMorphed ?? false))
+            } label: {
+                Label(title, systemImage: "arrow.left.and.right")
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+            .tint(isMorphed == true ? .accentColor : .secondary)
+            .help(help)
+
+            Text(morph.map(Format.percent) ?? "—")
+                .font(.callout)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 40, alignment: .trailing)
+        }
+    }
+
+    private var title: String {
+        // Explicit optional patterns: older compilers do not promote the
+        // bare literals over the optional and refuse the switch as
+        // non-exhaustive, so CI's toolchain needs them spelled out.
+        switch isMorphed {
+        case .some(true): return "Base"
+        case .some(false), .none: return "Morph"
+        }
+    }
+
+    private var help: String {
+        guard isMorphed != nil else {
+            return "Morph this rig. The position is read over the CBOR channel, which is not up."
+        }
+        return isMorphed == true
+            ? "Return the rig to its base sound"
+            : "Morph the rig to its morphed sound"
+    }
+}
+
 // MARK: - Formatting
 
 /// The value formatting the dashboard shares with the terminal example.

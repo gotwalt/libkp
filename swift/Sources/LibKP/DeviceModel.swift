@@ -1,34 +1,56 @@
 import Foundation
 
-/// A live store over a Profiler's stream: a typed ``DeviceState`` snapshot the
-/// UI binds to, plus commands for writes.
+/// A live store over a Profiler: a typed ``DeviceState`` snapshot the UI binds
+/// to, plus commands for writes and requests for reads.
 ///
 /// Two layers:
 ///
 /// - ``DeviceState`` is the **pure, network-free core**: a plain-data tree that
-///   decodes one already-unframed MIDI message at a time via
-///   ``DeviceState/apply(_:)``. It does no IO, so tests drive it with
+///   folds one value at a time, whichever wire carried it, via
+///   ``DeviceState/applyUpdate(_:)``. It does no IO, so tests drive it with
 ///   synthesized messages.
-/// - `DeviceModel` is the **async handle**: an actor that owns the ``Session``,
-///   runs an ingest loop, keeps the shared snapshot, and publishes both a
-///   coalesced snapshot stream and a granular event stream.
+/// - `DeviceModel` is the **async handle**: an actor that owns every socket to
+///   the device, keeps the shared snapshot, and publishes both a coalesced
+///   snapshot stream and a granular event stream.
+///
+/// The model is the only thing in this library that holds a socket to the
+/// device. It owns two links: the MIDI3 **stream**, which is required and is
+/// what ``Connection/connected`` means, and — by default — the CBOR
+/// **control** link, which asks for the device's state dump when it opens and
+/// then carries the values the stream never does, the morph position above
+/// all. Both feed one funnel, the single writer of the state tree, so a client
+/// sees one handle, one tree and one event stream, and never a channel name
+/// except in ``DeviceEvent/channelChanged(channel:state:)``. What the control
+/// link may and may not do is decided at connect time by ``ConnectOptions``.
 ///
 /// State is classified FAST vs SLOW. **FAST** = the meter ``RealtimeStatus``
 /// block, the beat pulse and tuner deviance — high-rate, poll them via
 /// ``status()``. **SLOW** = everything else (rig / amp / cab / effect / output /
 /// tempo / morph / tuner-note / connection); those drive the coalesced
-/// ``snapshots()`` stream.
+/// ``snapshots()`` stream, at most one snapshot per ingested chunk from either
+/// link.
 ///
-/// Commands split into two groups:
+/// Commands split into three groups:
 ///
 /// - **Parameters** (`set*`) — settable values the device stores. They go out as
 ///   14-bit NRPN `$01` Single Parameter Changes; the device applies the write
 ///   silently and does *not* echo it back on the stream, so follow a set with
 ///   ``requestParam(page:number:)`` when the snapshot should confirm the new
-///   value — the `$41` reply flows through normal ingest.
+///   value.
+/// - **Requests** (`request*`, `refresh*`) — read-only. Each one travels the
+///   request lane: it is sent, waits for a value at its address, and returns
+///   that value or ``RequestError/timeout``. The reply folds into the tree on
+///   the way through.
 /// - **Actions** (verbs) — momentary presses and live expression that carry no
 ///   stored value. They go out as 7-bit Control Change messages via ``Control``
 ///   and are *not* reflected in state.
+/// - **Navigation** (``navigateTo(_:)``, ``stepRig(by:)``, ``stepBank(forward:)``,
+///   ``selectSlot(_:)``) — the one way to load a rig. Every load goes through
+///   the model's Navigator (see Navigator.swift), which serialises them so two
+///   can never overlap on the wire; the direct routes — ``Control/loadSlot(_:)``,
+///   ``Control/up``, ``Control/down``, a Program Change — are refused with
+///   ``CommandError/rigLoadRequiresNavigator``. The outstanding aim is
+///   ``DeviceState/navigation``.
 public actor DeviceModel {
     /// Product byte addressed in outbound SysEx (0x00 = Profiler).
     public static let product: UInt8 = Generated.productProfiler
@@ -39,90 +61,97 @@ public actor DeviceModel {
     /// The maximum 14-bit NRPN value.
     public static let nrpnMax: UInt16 = Generated.fullScale
 
-    /// Read idle gap driving the ingest loop; short so it reacts per packet.
-    private static let readIdle: TimeInterval = 0.03
+    /// Read idle gap driving the stream's ingest loop; short so it reacts per
+    /// packet.
+    static let readIdle: TimeInterval = 0.03
 
-    private let session: Session
-    private var state = DeviceState()
-    private var unframer = Midi3.Unframer()
-    private var ingestTask: Task<Void, Never>?
-    private var eventContinuations: [UUID: AsyncStream<DeviceEvent>.Continuation] = [:]
-    private var snapshotContinuations: [UUID: AsyncStream<DeviceState>.Continuation] = [:]
-
-    /// The address this model is connected to.
+    /// The address this model is connected to, as `host:port`.
     public nonisolated let peer: String
+    /// The options this model was connected with. They cannot change: a
+    /// different policy is a different model.
+    public nonisolated let options: ConnectOptions
+    nonisolated let host: String
+    /// The port the model dials, resolved at connect: what
+    /// ``connect(host:port:options:)`` was given, else ``ConnectOptions/port``.
+    nonisolated let port: UInt16
 
-    private init(session: Session) {
-        self.session = session
-        peer = session.peer
+    var state = DeviceState()
+    var eventContinuations: [UUID: AsyncStream<DeviceEvent>.Continuation] = [:]
+    var snapshotContinuations: [UUID: AsyncStream<DeviceState>.Continuation] = [:]
+
+    /// Set by ``close()``; nothing reopens after it.
+    var closed = false
+    /// Bumped whenever a life starts or ends, so a task from a previous life
+    /// cannot touch the state of its successor. Every task captures the epoch
+    /// it was started under and is refused if it no longer matches.
+    var epoch = 0
+
+    /// The stream link of the current life, or `nil` between lives.
+    var stream: StreamLink?
+    /// The control link, while it is open.
+    var control: ControlLink?
+    /// The best-effort or scheduled open of the control link while it is
+    /// under way — parked in the ledger, dialling, handshaking. Held so a
+    /// teardown can cancel it: an open left to run would dial the device
+    /// after the life it belonged to had ended.
+    var controlOpenTask: Task<Void, Never>?
+    var controlIngestTask: Task<Void, Never>?
+    var syncTask: Task<Void, Never>?
+    var settleTask: Task<Void, Never>?
+    var reopenTask: Task<Void, Never>?
+    var reconnectTask: Task<Void, Never>?
+    /// When the control link was last dialled — the moment the device saw the
+    /// attempt, whether or not it succeeded — which is what the reopen gap
+    /// is measured from.
+    var lastControlAttempt: ContinuousClock.Instant?
+    /// How many reconnect attempts the current outage has cost; 0 while up.
+    var reconnectAttempt: UInt32 = 0
+    /// Between the dump trigger and the dump's end (or its settle time).
+    var dumpActive = false
+    /// Runs based at ``Generated/dumpEndAddress`` folded since the trigger. A
+    /// dump has two sections, each closed by one, and the
+    /// ``Generated/dumpEndRuns``-th ends it.
+    var dumpEndRuns = 0
+
+    // The request lane (see Lane.swift).
+    var pending: [UInt32: [PendingRequest]] = [:]
+    var pendingRenders: [RenderKey: [PendingRequest]] = [:]
+    var nextRequestID: UInt64 = 0
+    var inFlight = 0
+    var laneWaiters: [CheckedContinuation<Bool, Never>] = []
+
+    // The Navigator (see Navigator.swift): the machine, and its two timers,
+    // each armed under a serial so a superseded one cannot call back in.
+    var navigator = NavigatorState()
+    var navSettleTask: Task<Void, Never>?
+    var navSettleSerial = 0
+    var navWindowTask: Task<Void, Never>?
+    var navWindowSerial = 0
+
+    init(host: String, port: UInt16?, options: ConnectOptions) {
+        var options = options
+        if let port { options.port = port }
+        self.host = host
+        self.port = options.port
+        self.options = options
+        peer = "\(host):\(options.port)"
     }
 
-    // MARK: - Lifecycle
-
-    /// Connect to `host:5727`, open the streaming protocol, start the ingest
-    /// loop, and kick off a read-only initial sync (rig strings + effect slots).
-    ///
-    /// Returns once the session is established; the state fills in as the
-    /// device's replies stream back. Subscribe *before* awaiting fresh events.
-    public static func connect(
-        host: String,
-        port: UInt16 = Generated.port,
-        preferredProtocols: [String] = [Generated.protocolMidi3Stream]
-    ) async throws -> DeviceModel {
-        let session = try await Session.connect(host: host, port: port)
-        let outcome = try await session.handshake(preferred: preferredProtocols, idle: readIdle)
-        try await session.writeSessionPreamble()
-
-        let model = DeviceModel(session: session)
-        await model.start(tail: outcome.responseTail)
-        try? await model.refreshRig()
-        try? await model.refreshBank()
-        return model
-    }
-
-    /// Mark the session live and start ingesting, priming with any burst that
-    /// rode in on the handshake acceptance.
-    private func start(tail: [UInt8]) {
-        state.connection = .connected
-        emit(.connected)
-        publishSnapshot()
-        applyChunk(unframer.push(tail))
-        ingestTask = Task { [weak self] in
-            await self?.ingestLoop()
+    /// Dropping the last handle closes both sockets and finishes the streams —
+    /// the same as ``close()`` minus the events, which nobody is left to hear.
+    /// The ingest loops hold this actor weakly, so a model nobody references
+    /// does reach here even while the device is still sending.
+    deinit {
+        stream?.close()
+        control?.close()
+        for task in [
+            controlOpenTask, controlIngestTask, syncTask, settleTask, reopenTask, reconnectTask,
+            navSettleTask, navWindowTask,
+        ] {
+            task?.cancel()
         }
-    }
-
-    /// Read, unframe and apply, until the device closes the connection.
-    private func ingestLoop() async {
-        while !Task.isCancelled {
-            do {
-                let chunk = try await session.readOnce(wait: DeviceModel.readIdle)
-                if chunk.isEmpty { continue }
-                applyChunk(unframer.push(chunk))
-            } catch {
-                markDisconnected()
-                return
-            }
-        }
-    }
-
-    /// Close the session and finish both streams.
-    public func close() {
-        ingestTask?.cancel()
-        ingestTask = nil
-        session.close()
-        markDisconnected()
-    }
-
-    private func markDisconnected() {
-        guard state.connection == .connected else { return }
-        state.connection = .disconnected
-        emit(.disconnected)
-        publishSnapshot()
         for (_, continuation) in eventContinuations { continuation.finish() }
         for (_, continuation) in snapshotContinuations { continuation.finish() }
-        eventContinuations.removeAll()
-        snapshotContinuations.removeAll()
     }
 
     // MARK: - Store access
@@ -134,8 +163,13 @@ public actor DeviceModel {
     /// Equals `snapshot().status`, but skips copying the whole tree.
     public func status() -> RealtimeStatus { state.status }
 
-    /// The **store**: a fresh snapshot each time *slow* state changes, coalesced
-    /// to at most one per ingested stream chunk.
+    /// The **store**: the current state first, then a fresh snapshot each time
+    /// *slow* state changes, coalesced to at most one per ingested chunk.
+    ///
+    /// The stream finishes only on ``close()``. Losing the device does not end
+    /// it: the snapshot then shows ``Connection/disconnected`` — or
+    /// ``Connection/reconnecting(attempt:)`` and, in time, ``Connection/connected``
+    /// again, on this same stream — so a subscriber never has to resubscribe.
     public func snapshots() -> AsyncStream<DeviceState> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<DeviceState>.makeStream(
@@ -151,6 +185,7 @@ public actor DeviceModel {
 
     /// The granular delta stream — every ``DeviceEvent``, including the FAST
     /// ones. For callers that want per-message deltas rather than snapshots.
+    /// Finishes only on ``close()``, like ``snapshots()``.
     public func events() -> AsyncStream<DeviceEvent> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<DeviceEvent>.makeStream(
@@ -166,24 +201,62 @@ public actor DeviceModel {
     private func dropEventContinuation(_ id: UUID) { eventContinuations[id] = nil }
     private func dropSnapshotContinuation(_ id: UUID) { snapshotContinuations[id] = nil }
 
-    private func emit(_ event: DeviceEvent) {
+    func emit(_ event: DeviceEvent) {
         for (_, continuation) in eventContinuations { continuation.yield(event) }
     }
 
-    private func publishSnapshot() {
+    func publishSnapshot() {
         for (_, continuation) in snapshotContinuations { continuation.yield(state) }
     }
 
-    /// Apply every message in one ingested chunk: publish each granular event,
-    /// and — if any message changed a slow field — emit exactly one snapshot.
-    private func applyChunk(_ messages: [[UInt8]]) {
-        var slowChanged = false
-        for message in messages {
-            let outcome = state.apply(message)
-            for event in outcome.events { emit(event) }
-            slowChanged = slowChanged || outcome.slowChanged
+    /// Fold one value from the CBOR channel into this model's tree, as a live
+    /// push off the control channel — through the same funnel the model's
+    /// own control link uses, so a request waiting at the address is answered
+    /// by it and a position it carries reaches the Navigator, exactly as if
+    /// the link had read it.
+    ///
+    /// The model's own control link does this for every value it reads; this
+    /// remains only for a client still holding its own ``CborSession`` beside
+    /// a model, and goes with the next step.
+    @available(*, deprecated, message: "the model's control link folds the CBOR channel itself")
+    public func applyCbor(address: UInt32, value: Int64) {
+        // A negative value is nothing the tree stores.
+        guard let value = UInt64(exactly: value) else { return }
+        let update = Update(source: .control, phase: .live, address: address, decoded: .num(value))
+        if fold(update) { publishSnapshot() }
+    }
+
+    /// Fold one update from either link — the funnel: every event it raises,
+    /// the replies the request lane is waiting on, and the Navigator's
+    /// position — and say whether a slow field moved. The caller owns the
+    /// chunk's one snapshot, so a value that settles an aim rides in it.
+    func fold(_ update: Update) -> Bool {
+        let outcome = state.applyUpdate(update)
+        for event in outcome.events { emit(event) }
+        resolve(update)
+        return forwardPosition(outcome) || outcome.slowChanged
+    }
+
+    /// A folded update reported the device's position: hand each flat index
+    /// to the Navigator, whichever wire carried it — changed or deduped
+    /// alike, since re-loading the rig already loaded is confirmed by a push
+    /// that changes nothing. Returns whether the snapshot's navigation
+    /// changed.
+    private func forwardPosition(_ outcome: ApplyOutcome) -> Bool {
+        var changed = false
+        for index in outcome.positions {
+            changed = navigationPosition(index) || changed
         }
-        if slowChanged { publishSnapshot() }
+        return changed
+    }
+
+    /// Test hook: forget when the control link was last attempted, so
+    /// ``reopenControl()`` is not refused with ``ChannelError/tooSoon``. The
+    /// reopen gap is ``Generated/controlReopenMinGapMs`` — far longer than a
+    /// test may wait — and there is no other way to reach the reopen's
+    /// success path against a fake.
+    func clearControlAttemptForTests() {
+        lastControlAttempt = nil
     }
 
     // MARK: - Parameters (NRPN `$01`, 14-bit, state-tracked)
@@ -191,7 +264,7 @@ public actor DeviceModel {
     /// Set an arbitrary numeric parameter — the escape hatch behind every
     /// parameter setter below.
     public func setParam(page: UInt8, number: UInt8, value: UInt16) async throws {
-        try await send(
+        try await write(
             Nrpn.setSingle(
                 product: DeviceModel.product, device: DeviceModel.device,
                 page: page, number: number, value: value
@@ -242,107 +315,12 @@ public actor DeviceModel {
             page: Generated.pageRigSettings, number: Generated.tempoNumber, value: value)
     }
 
-    // MARK: - Read-only requests
-
-    /// Re-request the rig strings and every effect slot's Type/State. Also the
-    /// initial sync run at connect time: it only issues value *requests* and
-    /// changes nothing on the device.
-    public func refreshRig() async throws {
-        // Rig Name, Author, Comment, Date, Amp Name, Cabinet Name.
-        for tag in [1, 2, 4, 3, 10, 32] as [UInt8] {
-            try await send(
-                Nrpn.requestString(
-                    product: DeviceModel.product, device: DeviceModel.device,
-                    page: Generated.pageStrings, number: tag
-                ))
-        }
-        for slot in Params.effectSlots {
-            try await send(
-                Nrpn.requestSingle(
-                    product: DeviceModel.product, device: DeviceModel.device,
-                    page: slot.page, number: Generated.effectParamType
-                ))
-            try await send(
-                Nrpn.requestSingle(
-                    product: DeviceModel.product, device: DeviceModel.device,
-                    page: slot.page, number: Generated.effectParamState
-                ))
-        }
-    }
-
-    /// Request the current bank's five-slot name preview (rig / amp / cabinet
-    /// names) as extended strings (`$47`). The `$07` replies fold into
-    /// ``DeviceState/bank``. Read-only: it changes nothing on the device. The
-    /// device also pushes this block unasked on a bank change, so a controller
-    /// need only call this once at connect.
-    public func refreshBank() async throws {
-        for field in Params.BankPreviewField.allCases {
-            for slot in 1...Params.bankSlots {
-                try await send(
-                    Nrpn.requestExtendedString(
-                        product: DeviceModel.product, device: DeviceModel.device,
-                        address: Params.bankPreviewAddress(field, slot: slot)
-                    ))
-            }
-        }
-    }
-
-    /// Fold a ``StateSnapshot``'s current bank and rig slot into the state tree,
-    /// emitting a ``DeviceEvent/currentPosition(bank:slot:)`` and broadcasting a
-    /// fresh snapshot.
-    ///
-    /// The MIDI3 stream never reports these indices; a controller learns them by
-    /// running ``StateSnapshot/fetch(host:port:timeout:)`` over a separate CBOR
-    /// session — which the device wants done *before* this streaming session
-    /// opens, not concurrently — and applying the result here. Only the non-`nil`
-    /// fields overwrite; a `nil` leaves the current value untouched.
-    public func setCurrentPosition(bank: UInt16?, slot: UInt16?) {
-        if bank != nil { state.currentBank = bank }
-        if slot != nil { state.currentRigSlot = slot }
-        emit(.currentPosition(bank: bank, slot: slot))
-        publishSnapshot()
-    }
-
-    /// Request one numeric parameter's current value (function `$41`). The
-    /// device answers with a `$01` message on the same stream, which the ingest
-    /// loop folds into the snapshot. Read-only.
-    public func requestParam(page: UInt8, number: UInt8) async throws {
-        try await send(
-            Nrpn.requestSingle(
-                product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
-            ))
-    }
-
-    /// Request one string parameter (function `$43`), e.g. a page-0 string tag.
-    /// Read-only.
-    public func requestString(page: UInt8 = Generated.pageStrings, number: UInt8) async throws {
-        try await send(
-            Nrpn.requestString(
-                product: DeviceModel.product, device: DeviceModel.device, page: page, number: number
-            ))
-    }
-
-    /// Request a parameter value rendered to its exact display text (function
-    /// `$7C`) — e.g. `"5.2"`, `"120 BPM"`, `"<0.0>"` instead of a generic
-    /// percentage. Read-only.
-    ///
-    /// This is a streaming request/response: it enqueues the request and returns
-    /// immediately. Watch ``events()`` for the matching
-    /// ``DeviceEvent/renderedString(page:number:value:text:)``.
-    public func requestRender(page: UInt8, number: UInt8, value: UInt16) async throws {
-        try await send(
-            Nrpn.requestRenderedString(
-                product: DeviceModel.product, device: DeviceModel.device,
-                page: page, number: number, value: value
-            ))
-    }
-
     /// Send the bidirectional beacon so the device starts streaming its selected
     /// parameter set. Re-send within half the lease to keep it alive.
     public func sendBeacon(
         init isInit: Bool = true, tuner: Bool = true, leaseSecs: UInt8 = 30
     ) async throws {
-        try await send(
+        try await write(
             Nrpn.beacon(
                 init: isInit, tuner: tuner, leaseSecs: leaseSecs, product: DeviceModel.product
             ))
@@ -351,37 +329,57 @@ public actor DeviceModel {
     // MARK: - Actions (CC, momentary, NOT stored in state)
 
     /// Send an arbitrary ``Control`` on the command channel.
+    ///
+    /// The ones that load a rig — ``Control/loadSlot(_:)``, ``Control/up``,
+    /// ``Control/down``, ``Control/programChange(_:)`` and
+    /// ``Control/bankSelect(msb:lsb:)`` — are refused with
+    /// ``CommandError/rigLoadRequiresNavigator`` before anything is written:
+    /// a load that overlaps another wedges the device, and only the
+    /// Navigator (``navigateTo(_:)`` and its steppers) can keep them apart.
     public func send(control: Control) async throws {
-        try await send(control.message(channel: DeviceModel.ccChannel))
+        switch control {
+        case .loadSlot, .up, .down, .programChange, .bankSelect:
+            throw CommandError.rigLoadRequiresNavigator
+        default:
+            try await write(control.message(channel: DeviceModel.ccChannel))
+        }
     }
 
-    /// Select rig slot 1–5 in the current bank (CC50–54).
-    public func selectRig(_ slot: UInt8) async throws { try await send(control: .loadSlot(slot)) }
+    /// Frame and write raw (pre-framing) MIDI bytes to the device, exactly as
+    /// given — the escape hatch under every command here, with one refusal: a
+    /// Program Change (status `0xC0`–`0xCF`), or a Control Change whose
+    /// controller is one of ``Generated/rigLoadControllers``, is a rig load
+    /// and throws ``CommandError/rigLoadRequiresNavigator`` before any byte
+    /// is written. The bank preselect (CC47) loads nothing and passes.
+    public func sendRaw(_ midi: [UInt8]) async throws {
+        guard !DeviceModel.loadsARig(midi) else { throw CommandError.rigLoadRequiresNavigator }
+        try await write(midi)
+    }
 
-    /// Step to the next rig (CC48).
-    public func rigUp() async throws { try await send(control: .up) }
-    /// Step to the previous rig (CC49).
-    public func rigDown() async throws { try await send(control: .down) }
-    /// Preselect bank `n` (1-based; CC47).
+    /// Whether raw MIDI carries a rig load anywhere in it. Data bytes are
+    /// below `0x80`, so every byte at or above it is a status byte, and a
+    /// Control Change's controller is the byte after its status.
+    static func loadsARig(_ midi: [UInt8]) -> Bool {
+        for (i, byte) in midi.enumerated() where byte >= 0x80 {
+            switch byte & 0xF0 {
+            case Generated.programChangeStatus:
+                return true
+            case Generated.controlChangeStatus:
+                if i + 1 < midi.count, Generated.rigLoadControllers.contains(midi[i + 1]) {
+                    return true
+                }
+            default:
+                continue
+            }
+        }
+        return false
+    }
+
+    /// Preselect bank `n` (1-based; CC47). A preselect alone loads nothing —
+    /// the device waits for the slot load that commits it, which only the
+    /// Navigator sends — so this is the one bank control that passes.
     public func bank(_ n: UInt16) async throws {
         try await send(control: .bankPreselect(UInt8(truncatingIfNeeded: max(n, 1) - 1)))
-    }
-
-    /// Load a rig by its flat, 0-based index — the device's own numbering, and
-    /// the only address that reaches a rig outside the current bank.
-    ///
-    /// Sent as the documented pair: the absolute bank preselect (CC47) followed
-    /// by the slot load (CC50–54) that commits it. The index divides by
-    /// ``Params/bankSlots``, so index 123 is bank 25, slot 4.
-    ///
-    /// Nothing here assumes how many banks a device has. Aim past the end and
-    /// the device simply stays where it is — and says so in the Bank Select /
-    /// Program Change report that follows, so ``DeviceState/currentRigIndex``
-    /// always reflects where it actually landed, not where this aimed.
-    public func selectRigIndex(_ index: UInt16) async throws {
-        let slots = UInt16(Params.bankSlots)
-        try await bank(index / slots + 1)
-        try await selectRig(UInt8(index % slots) + 1)
     }
     /// Tap the tempo (CC30).
     public func tapTempo() async throws { try await send(control: .tapTempo) }
@@ -422,14 +420,21 @@ public actor DeviceModel {
 
     // MARK: - Wire
 
-    /// Frame and write raw (pre-framing) MIDI bytes to the device.
-    private func send(_ bytes: [UInt8]) async throws {
-        guard state.connection == .connected else { throw CommandError.disconnected }
-        do {
-            try await session.writeAll(Midi3.frame(bytes))
-        } catch {
-            markDisconnected()
-            throw CommandError.disconnected
+    /// Queue raw (pre-framing) MIDI bytes on the stream link's command queue,
+    /// waiting for room while it is full. Returns once queued; the link's
+    /// writer frames and writes commands in the order they were queued.
+    ///
+    /// A failed write is the stream ending: the writer hands it to the
+    /// supervisor, which closes both links and either reports the loss or
+    /// starts the reconnect, exactly as a read error would — so a command
+    /// queued onto a stream that then goes is simply never written.
+    func write(_ bytes: [UInt8]) async throws {
+        while true {
+            guard let stream, state.channels.stream == .open else {
+                throw CommandError.disconnected
+            }
+            if stream.enqueue(bytes) { return }
+            guard await stream.waitForRoom() else { throw CommandError.disconnected }
         }
     }
 }

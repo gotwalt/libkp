@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.5.0")
+        XCTAssertEqual(Generated.specVersion, "0.8.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file
@@ -17,7 +17,7 @@ final class ConformanceTests: XCTestCase {
     func testEveryVectorFileIsCovered() throws {
         let covered: Set<String> = [
             "u14.json", "discovery.json", "midi3.json", "nrpn.json",
-            "controls.json", "params.json", "state.json", "cbor.json",
+            "controls.json", "params.json", "state.json", "cbor.json", "navigation.json",
         ]
         let present = Set(try Fixtures.vectorFiles().map(\.lastPathComponent))
         XCTAssertEqual(present, covered, "spec/vectors changed; update the conformance suite")
@@ -186,6 +186,24 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(Nrpn.extEncode(expected, count: bytes.count), bytes)
         }
 
+        for entry in vector.cases("request_extended_param") {
+            let built = Nrpn.requestExtendedParam(
+                product: UInt8(entry.int("product")), device: UInt8(entry.int("device")),
+                address: UInt32(entry.int("address")))
+            XCTAssertEqual(Fmt.hex(built), entry.string("hex"), "request_extended_param")
+        }
+
+        for entry in vector.cases("parse_extended_param") {
+            let message = try hex(entry.string("hex"))
+            let parsed = Nrpn.parseExtendedParam(message)
+            guard let expected = entry["expected"] as? [String: Any] else {
+                XCTAssertNil(parsed, "parse_extended_param should reject \(entry.string("hex"))")
+                continue
+            }
+            XCTAssertEqual(parsed?.address, UInt32(expected.int("address")))
+            XCTAssertEqual(parsed?.value, UInt64(expected.int("value")))
+        }
+
         for entry in vector.cases("parse_extended_string") {
             let message = try hex(entry.string("hex"))
             let parsed = Nrpn.parseExtendedString(message)
@@ -324,6 +342,11 @@ final class ConformanceTests: XCTestCase {
 
     // MARK: - state.json
 
+    /// A case carries either `"messages"` (unframed MIDI3 hex, each through
+    /// `apply`) or `"steps"` (each naming the entry point it drives). The steps
+    /// form also pins the ordered event names every step raised and how many
+    /// steps flagged the snapshot, so the fold's reporting is held to the
+    /// vectors and not only its tree.
     func testStateVectors() throws {
         let vector = try Fixtures.vector("state")
         let cases = vector.cases("cases")
@@ -331,14 +354,120 @@ final class ConformanceTests: XCTestCase {
         for entry in cases {
             let name = entry.string("name")
             var state = DeviceState()
+            var outcomes: [ApplyOutcome] = []
             for messageHex in (entry["messages"] as? [String]) ?? [] {
-                state.apply(try hex(messageHex))
+                outcomes.append(state.apply(try hex(messageHex)))
+            }
+            for step in (entry["steps"] as? [[String: Any]]) ?? [] {
+                outcomes.append(try run(step, on: &state, caseName: name))
             }
             guard let expect = entry["expect"] as? [String: Any] else {
                 XCTFail("case \"\(name)\" has no expect block")
                 continue
             }
             assertState(state, matches: expect, caseName: name)
+            if let events = expect["events"] as? [String] {
+                XCTAssertEqual(
+                    outcomes.flatMap(\.events).map(eventName), events, "\(name): events")
+            }
+            if let slowSteps = expect["slow_steps"] as? NSNumber {
+                XCTAssertEqual(
+                    outcomes.filter(\.slowChanged).count, slowSteps.intValue,
+                    "\(name): slow_steps")
+            }
+            if let positions = expect["positions"] as? [NSNumber] {
+                XCTAssertEqual(
+                    outcomes.flatMap(\.positions), positions.map(\.uint16Value),
+                    "\(name): positions")
+            }
+        }
+    }
+
+    /// Drive one `"steps"` entry — exactly one key naming the entry point —
+    /// against `state`, returning what it reported.
+    private func run(
+        _ step: [String: Any], on state: inout DeviceState, caseName: String
+    ) throws -> ApplyOutcome {
+        guard step.count == 1, let (kind, payload) = step.first else {
+            throw Fixtures.Failure("\(caseName): a step must have exactly one key")
+        }
+        func pair() throws -> (UInt32, Any) {
+            guard let list = payload as? [Any], list.count == 2, let addr = list[0] as? NSNumber
+            else { throw Fixtures.Failure("\(caseName): bad \(kind) step") }
+            return (addr.uint32Value, list[1])
+        }
+        func number(_ value: Any) throws -> UInt64 {
+            guard let n = value as? NSNumber, let u = UInt64(exactly: n.int64Value) else {
+                throw Fixtures.Failure("\(caseName): \(kind) value is not a whole number")
+            }
+            return u
+        }
+        func text(_ value: Any) throws -> String {
+            guard let t = value as? String else {
+                throw Fixtures.Failure("\(caseName): \(kind) value is not a string")
+            }
+            return t
+        }
+        switch kind {
+        case "midi3":
+            return state.apply(try hex(try text(payload)))
+        case "cbor":
+            let (address, value) = try pair()
+            return state.applyCbor(address: address, value: Int64(try number(value)))
+        case "cbor_text":
+            let (address, value) = try pair()
+            return state.applyCborText(address: address, text: try text(value))
+        case "cbor_dump":
+            let (address, value) = try pair()
+            return state.applyUpdate(
+                Update(
+                    source: .control, phase: .dump, address: address,
+                    decoded: .num(try number(value))))
+        case "cbor_dump_text":
+            let (address, value) = try pair()
+            return state.applyUpdate(
+                Update(
+                    source: .control, phase: .dump, address: address,
+                    decoded: .text(try text(value))))
+        case "dump_begin":
+            state.beginDump()
+            return ApplyOutcome()
+        case "dump_end":
+            state.endDump()
+            return ApplyOutcome()
+        default:
+            throw Fixtures.Failure("\(caseName): unknown step kind \"\(kind)\"")
+        }
+    }
+
+    /// The vectors' snake_case name for an event, as `spec/state.toml` spells
+    /// the `event` column.
+    private func eventName(_ event: DeviceEvent) -> String {
+        switch event {
+        case .rigChanged: return "rig_changed"
+        case .stringTag: return "string_tag"
+        case .bankPreview: return "bank_preview"
+        case .effectChanged: return "effect_changed"
+        case .paramChanged: return "param_changed"
+        case .status: return "status"
+        case .beatPulse: return "beat_pulse"
+        case .tempoBpm: return "tempo_bpm"
+        case .morphChanged: return "morph_changed"
+        case .morphButton: return "morph_button"
+        case .tunerDeviance: return "tuner_deviance"
+        case .tunerNote: return "tuner_note"
+        case .renderedString: return "rendered_string"
+        case .currentPosition: return "current_position"
+        case .connected: return "connected"
+        case .disconnected: return "disconnected"
+        // The model raises these from what its sockets do; no vector step
+        // drives them, so they have no wire name to check.
+        case .connectionChanged: return "connection_changed"
+        case .channelChanged: return "channel_changed"
+        case .syncCompleted: return "sync_completed"
+        case .requestTimedOut: return "request_timed_out"
+        case .navigationSettled: return "navigation_settled"
+        case .navigationDropped: return "navigation_dropped"
         }
     }
 
@@ -368,8 +497,10 @@ final class ConformanceTests: XCTestCase {
         if let gain = expect["amp_gain"] as? NSNumber {
             XCTAssertEqual(state.amp.gain, gain.uint16Value, "\(caseName): amp_gain")
         }
-        if let morph = expect["morph"] as? NSNumber {
-            XCTAssertEqual(state.morph, morph.uint16Value, "\(caseName): morph")
+        // A JSON null asserts the morph is still unset — the MIDI3 stream never
+        // carries the position, so most messages must leave it alone.
+        if let morph = expect["morph"] {
+            XCTAssertEqual(state.morph, (morph as? NSNumber)?.uint16Value, "\(caseName): morph")
         }
         if let note = expect["tuner_note"] as? NSNumber {
             XCTAssertEqual(state.tuner.note, note.uint8Value, "\(caseName): tuner_note")
@@ -378,15 +509,21 @@ final class ConformanceTests: XCTestCase {
             XCTAssertEqual(
                 state.tuner.deviance, deviance.uint16Value, "\(caseName): tuner_deviance")
         }
-        if let bank = expect["current_bank"] as? NSNumber {
-            XCTAssertEqual(state.currentBank, bank.uint16Value, "\(caseName): current_bank")
-        }
-        if let slot = expect["current_rig_slot"] as? NSNumber {
-            XCTAssertEqual(state.currentRigSlot, slot.uint16Value, "\(caseName): current_rig_slot")
-        }
-        if let index = expect["current_rig_index"] as? NSNumber {
+        // A JSON null here asserts the half is still unknown — the device pushes
+        // only the index that changed.
+        if let bank = expect["current_bank"] {
             XCTAssertEqual(
-                state.currentRigIndex, index.uint16Value, "\(caseName): current_rig_index")
+                state.currentBank, (bank as? NSNumber)?.uint16Value, "\(caseName): current_bank")
+        }
+        if let slot = expect["current_rig_slot"] {
+            XCTAssertEqual(
+                state.currentRigSlot, (slot as? NSNumber)?.uint16Value,
+                "\(caseName): current_rig_slot")
+        }
+        if let index = expect["current_rig_index"] {
+            XCTAssertEqual(
+                state.currentRigIndex, (index as? NSNumber)?.uint16Value,
+                "\(caseName): current_rig_index")
         }
         if let mainVolume = expect["main_volume"] as? NSNumber {
             XCTAssertEqual(
@@ -483,6 +620,8 @@ final class ConformanceTests: XCTestCase {
             } else {
                 XCTAssertNil(snap.currentRigSlot, "\(name): current_rig_slot")
             }
+            XCTAssertEqual(
+                snap.morph, (expect["morph"] as? NSNumber)?.uint16Value, "\(name): morph")
             if let strings = expect["strings"] as? [[String: Any]] {
                 XCTAssertEqual(snap.strings.count, strings.count, "\(name): strings count")
                 for (i, expected) in strings.enumerated() where i < snap.strings.count {
@@ -494,6 +633,59 @@ final class ConformanceTests: XCTestCase {
                     )
                 }
             }
+        }
+    }
+
+    // MARK: - navigation.json
+
+    /// The Navigator's state machine, replayed step by step from a fresh
+    /// machine: the actions must match exactly and in order, the wire log
+    /// must be every `send`, and the final state must be the one expected.
+    func testNavigationVectors() throws {
+        let vector = try Fixtures.vector("navigation")
+        let cases = vector.cases("cases")
+        XCTAssertFalse(cases.isEmpty)
+        for entry in cases {
+            let name = entry.string("name")
+            var machine = NavigatorState()
+            var actions: [String] = []
+            var sent: [Int] = []
+            for step in entry.cases("steps") {
+                let produced: [NavAction]
+                if let target = step["navigate"] as? NSNumber {
+                    produced = machine.navigate(target.uint16Value)
+                } else if step["settle"] as? NSNumber != nil {
+                    produced = machine.settleElapsed()
+                } else if step["window"] as? NSNumber != nil {
+                    produced = machine.windowElapsed()
+                } else if let index = step["position"] as? NSNumber {
+                    produced = machine.position(index.uint16Value)
+                } else {
+                    XCTFail("\(name): unknown step \(step)")
+                    continue
+                }
+                for action in produced {
+                    switch action {
+                    case .send(let index):
+                        actions.append("send:\(index)")
+                        sent.append(Int(index))
+                    case .startSettle: actions.append("start_settle")
+                    case .startWindow: actions.append("start_window")
+                    case .settled(let index): actions.append("settled:\(index)")
+                    case .dropped(let index): actions.append("dropped:\(index)")
+                    }
+                }
+            }
+            guard let expect = entry["expect"] as? [String: Any] else {
+                XCTFail("case \"\(name)\" has no expect block")
+                continue
+            }
+            XCTAssertEqual(actions, expect["actions"] as? [String] ?? [], "\(name): actions")
+            XCTAssertEqual(
+                sent, (expect["sent"] as? [NSNumber])?.map(\.intValue) ?? [], "\(name): sent")
+            XCTAssertEqual(machine.aim, (expect["aim"] as? NSNumber)?.uint16Value, "\(name): aim")
+            XCTAssertEqual(machine.inFlight, expect.bool("in_flight"), "\(name): in_flight")
+            XCTAssertEqual(machine.awaiting, expect.bool("awaiting"), "\(name): awaiting")
         }
     }
 

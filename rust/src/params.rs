@@ -259,9 +259,12 @@ mod tests {
         assert_eq!(param_name(0x05, 6), Some("Fixed Noise Gate On/Off"));
         assert_eq!(param_name(0x7D, 84), Some("Tuner Note"));
         assert_eq!(param_name(0x7F, 126), Some("Tuner Mode State"));
-        assert_eq!(page0_numeric_name(0x0B), Some("Morph State"));
-        assert_eq!(describe_numeric(0x00, 0x0B), "Page 0: Morph State");
-        assert_eq!(describe(0x00, 0x0B), "String Tags: Amp Author");
+        assert_eq!(page0_numeric_name(0x77), Some("Morph Position"));
+        assert_eq!(page0_numeric_name(0x50), Some("Morph Button"));
+        assert_eq!(describe_numeric(0x00, 0x77), "Page 0: Morph Position");
+        // 0x0B is a string tag, and is *not* the morph — see the state tests.
+        assert_eq!(page0_numeric_name(0x0B), None);
+        assert_eq!(describe(0x00, 0x11), "String Tags: Amp Author");
     }
 
     #[test]

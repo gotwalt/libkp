@@ -9,6 +9,24 @@ Sequence (documented from observed experimentation):
 4. The device replies with a line beginning ``+`` (accept) or ``-`` (reject).
 5. For the streaming protocol the client then writes an 8-byte zero preamble and
    the framed stream begins.
+
+The two device replies in that sequence -- the greeting and the answer to the
+selection -- are each read at two speeds. A fresh device greets within a few
+milliseconds, but one that has served a few sessions has been measured taking
+most of a second (777 ms on one occasion) before its first greeting byte, so
+that first byte is waited for up to :data:`HANDSHAKE_TIMEOUT`. Once a reply has
+begun, its lines arrive back to back, and the short inter-chunk ``idle`` gap
+callers pass is enough to know it has ended.
+
+Connection spacing is enforced here, not by callers. The device tolerates
+concurrent sessions but not connection *churn*: it refuses to greet, or resets,
+a session opened too soon after another socket to it was opened or closed
+(``docs/06``, ``docs/11``). A module-level ledger remembers, per ``(ip, port)``,
+when a socket to that peer was last opened and last closed, and
+:meth:`Session.connect` waits out :data:`CONNECTION_COOLDOWN` from the later of
+the two before dialing. Every path that opens a socket -- the model, the CBOR
+session, the one-shot snapshot fetch, a test against the real port -- goes
+through it, so none of them can churn the device by accident.
 """
 
 from __future__ import annotations
@@ -35,6 +53,7 @@ __all__ = [
     "HANDSHAKE_TERMINATOR",
     "SESSION_PREAMBLE",
     "CONNECTION_COOLDOWN",
+    "HANDSHAKE_TIMEOUT",
     "HandshakeOutcome",
     "Session",
     "parse_protocol_list",
@@ -59,15 +78,81 @@ SESSION_PREAMBLE: bytes = b"\x00" * gen.SESSION_PREAMBLE_LEN
 #: Default connect timeout.
 CONNECT_TIMEOUT: float = float(gen.CONNECT_TIMEOUT_SECS)
 
-#: Minimum quiet gap, in seconds, between one session closing and the next
-#: opening. The device refuses to greet — or resets — a session opened too soon
-#: after a prior socket closed, so an orchestrator that opens more than one
-#: session (the CBOR :func:`~libkp.cbor.fetch_state_snapshot` then a MIDI3
-#: :class:`~libkp.model.DeviceModel`) must space them by at least this and never
-#: overlap them. See ``docs/06``.
+#: How long, in seconds, :meth:`Session.handshake` waits for the *first* byte
+#: of the greeting, and :meth:`Session.select_protocol` for the first byte of
+#: the device's answer. This is a different wait from the ``idle`` gap those
+#: methods also take: the gap only decides when a reply that has started is
+#: over, while this bounds how long the device may take to start one. A device
+#: that has served a few sessions can sit for most of a second before greeting,
+#: far longer than any inter-chunk gap, and connecting must not fail on that.
+HANDSHAKE_TIMEOUT: float = gen.HANDSHAKE_TIMEOUT_MS / 1000.0
+
+#: Minimum quiet gap, in seconds, between any two sockets to the same peer:
+#: one closing and the next opening, or one opening and another opening beside
+#: it. The device refuses to greet — or resets — a session opened too soon after
+#: either, so :meth:`Session.connect` holds every open until this much has
+#: passed since the peer was last touched (see :data:`_LAST_TOUCH`). Callers
+#: that open more than one session — the CBOR
+#: :func:`~libkp.cbor.fetch_state_snapshot` then a MIDI3
+#: :class:`~libkp.model.DeviceModel` — need not space them themselves; the
+#: ledger does it. See ``docs/06``.
 CONNECTION_COOLDOWN: float = gen.CONNECTION_COOLDOWN_MS / 1000.0
 
 _GREETING_MAX = 256
+
+
+@dataclass(slots=True)
+class _PeerTouch:
+    """When a socket to one peer was last opened and last closed, in event-loop
+    time (:meth:`asyncio.AbstractEventLoop.time`, the monotonic clock, so the
+    stamps stay meaningful across loops)."""
+
+    last_open: float = float("-inf")
+    last_close: float = float("-inf")
+
+    @property
+    def clear_at(self) -> float:
+        """The earliest moment a new socket to this peer may be dialed."""
+        return max(self.last_open, self.last_close) + CONNECTION_COOLDOWN
+
+
+#: The connection ledger: ``(ip, port)`` → the last open and close of a socket
+#: to that peer. Module-level on purpose: the hazard is the *device* seeing two
+#: sockets too close together, whoever opened them, so the record has to be
+#: shared by every :class:`Session` in the process rather than held per caller.
+#: Keyed by port as well as host so that tests against ephemeral-port fakes do
+#: not pay a cooldown for each other; only a reused port costs one.
+_LAST_TOUCH: dict[tuple[str, int], _PeerTouch] = {}
+
+
+async def _wait_turn(peer: tuple[str, int]) -> None:
+    """Sleep until ``peer`` is clear of its cooldown, then claim it.
+
+    The claim — stamping ``last_open`` — is made when the dial *begins*, not when
+    it succeeds: two callers racing for the same peer must be serialised, and
+    stamping only on success would let one expired cooldown release both. A dial
+    that then fails keeps its stamp, since the device saw the attempt either
+    way. Sleeping and re-checking in a loop is what makes the claim exclusive:
+    a waiter that wakes to find another caller stamped in the meantime simply
+    waits out that caller's cooldown too. The entry is looked up afresh on every
+    pass rather than held across the sleep, because a peer quiet for a whole
+    cooldown may be pruned and re-created underneath a sleeper.
+    """
+    loop = asyncio.get_running_loop()
+    # Forget peers that have been quiet for a cooldown; nothing about them is
+    # still useful, and tests open a great many one-off fakes.
+    now = loop.time()
+    for stale in [key for key, touch in _LAST_TOUCH.items() if touch.clear_at <= now]:
+        del _LAST_TOUCH[stale]
+    while True:
+        touch = _LAST_TOUCH.setdefault(peer, _PeerTouch())
+        remaining = touch.clear_at - loop.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(remaining)
+    # No await between the check above and this stamp, so the claim is atomic
+    # within the loop.
+    touch.last_open = loop.time()
 
 
 def parse_protocol_list(data: bytes) -> list[str]:
@@ -116,9 +201,16 @@ class HandshakeOutcome:
 
 
 class Session:
-    """An open TCP session with a Profiler."""
+    """An open TCP session with a Profiler.
 
-    __slots__ = ("_reader", "_writer", "_peer")
+    Opening one is paced by the connection ledger (:data:`_LAST_TOUCH`):
+    :meth:`connect` will not dial a peer until :data:`CONNECTION_COOLDOWN` has
+    passed since a socket to that peer was last opened or closed, and
+    :meth:`close` stamps the ledger so the next open waits its turn. Sessions to
+    *different* peers never wait on each other.
+    """
+
+    __slots__ = ("_reader", "_writer", "_peer", "_closed")
 
     def __init__(
         self,
@@ -129,13 +221,19 @@ class Session:
         self._reader = reader
         self._writer = writer
         self._peer = peer
+        self._closed = False
 
     # -- lifecycle ---------------------------------------------------------
 
     @classmethod
     async def connect(cls, ip: str, port: int = PORT, timeout: float = CONNECT_TIMEOUT) -> Session:
-        """Connect to ``ip:port`` with an explicit connect timeout."""
+        """Connect to ``ip:port`` with an explicit connect timeout.
+
+        Waits first, if it must, for the peer's :data:`CONNECTION_COOLDOWN` to
+        clear; ``timeout`` covers only the dial itself, not that wait.
+        """
         peer = (ip, port)
+        await _wait_turn(peer)
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
         except TimeoutError as exc:
@@ -158,12 +256,23 @@ class Session:
         return self._peer
 
     async def close(self) -> None:
-        """Close the socket, ignoring an already-broken connection."""
+        """Close the socket, ignoring an already-broken connection, and stamp the
+        ledger so the next open to this peer waits out the cooldown.
+
+        Closing twice is harmless and stamps only once; the cooldown runs from
+        the moment the socket actually went away.
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._writer.close()
             await self._writer.wait_closed()
         except (OSError, ConnectionError):  # pragma: no cover - teardown races
             pass
+        finally:
+            touch = _LAST_TOUCH.setdefault(self._peer, _PeerTouch())
+            touch.last_close = asyncio.get_running_loop().time()
 
     async def __aenter__(self) -> Session:
         return self
@@ -230,32 +339,82 @@ class Session:
 
     # -- handshake ---------------------------------------------------------
 
-    async def select_protocol(self, name: str, resp_idle: float) -> bytes:
+    async def _read_reply(self, phase: str, timeout: float, idle: float) -> bytes:
+        """Read one handshake reply: wait up to ``timeout`` for its first byte,
+        then keep collecting until an ``idle`` gap with no data.
+
+        Built from the two read primitives rather than a third: :meth:`read_once`
+        is the wait for the device to *start* answering, and :meth:`read_available`
+        then gathers the rest of a reply that is already under way. Raises
+        :class:`TimeoutErrorLibKP` for ``phase``, reporting the full ``timeout``,
+        if the first byte never comes; a peer that hangs up instead raises
+        :class:`ConnectionClosedError` from the first read, while a hang-up after
+        the reply began just ends it, as it would any read.
+        """
+        first = await self.read_once(timeout, _GREETING_MAX)
+        if not first:
+            raise TimeoutErrorLibKP(phase, timeout)
+        if len(first) >= _GREETING_MAX:
+            return first
+        try:
+            rest = await self.read_available(idle, _GREETING_MAX - len(first))
+        except ConnectionClosedError:
+            rest = b""
+        return first + rest
+
+    async def select_protocol(
+        self, name: str, resp_idle: float, timeout: float = HANDSHAKE_TIMEOUT
+    ) -> bytes:
         """Send ``name`` + ``"\\r\\n"`` and read the device's response line.
 
-        Raises :class:`ProtocolRejectedError` if the response begins with ``-``.
+        Waits up to ``timeout`` for the response to begin and then until a
+        ``resp_idle`` gap for it to end. Raises :class:`ProtocolRejectedError`
+        if the response begins with ``-`` and :class:`TimeoutErrorLibKP` for the
+        ``"protocol selection"`` phase if no response comes at all.
         """
         await self.write_all(name.encode("ascii") + HANDSHAKE_TERMINATOR)
-        resp = await self.read_available(resp_idle, _GREETING_MAX)
+        resp = await self._read_reply("protocol selection", timeout, resp_idle)
         if resp[:1] == gen.HANDSHAKE_REJECT_PREFIX.encode("ascii"):
             raise ProtocolRejectedError(name, resp.decode("utf-8", "replace").strip())
         return resp
 
+    async def read_greeting(self, idle: float, timeout: float = HANDSHAKE_TIMEOUT) -> bytes:
+        """Read the device's greeting -- the protocol list it sends first -- as
+        raw bytes, for :func:`parse_protocol_list`.
+
+        The first half of :meth:`handshake`, on its own for a caller that must
+        see what is offered before it selects: the control link, which takes
+        one protocol or none. Waits up to ``timeout`` for the first byte and
+        then until an ``idle`` gap. Raises :class:`TimeoutErrorLibKP` for the
+        ``"greeting"`` phase if the device never greets.
+        """
+        return await self._read_reply("greeting", timeout, idle)
+
     async def handshake(
-        self, preferred: list[str] | tuple[str, ...] = (PROTOCOL_MIDI3_STREAM,), idle: float = 0.03
+        self,
+        preferred: list[str] | tuple[str, ...] = (PROTOCOL_MIDI3_STREAM,),
+        idle: float = 0.03,
+        timeout: float = HANDSHAKE_TIMEOUT,
     ) -> HandshakeOutcome:
         """Full handshake: read the greeting, pick the first ``preferred`` protocol
-        the device offers (falling back to its first offered), and select it."""
-        greeting = await self.read_available(idle, _GREETING_MAX)
+        the device offers (falling back to its first offered), and select it.
+
+        ``timeout`` bounds the wait for the first byte of the greeting, and again
+        of the selection response; ``idle`` is the quiet gap that ends each once
+        it has begun. Raises :class:`TimeoutErrorLibKP` for the ``"greeting"``
+        phase -- reporting ``timeout``, the wait actually made -- when the device
+        never greets, or greets with no protocol to choose.
+        """
+        greeting = await self.read_greeting(idle, timeout)
         offered = parse_protocol_list(greeting)
 
         selected = next((p for p in preferred if p in offered), None)
         if selected is None:
             selected = offered[0] if offered else None
         if selected is None:
-            raise TimeoutErrorLibKP("greeting", idle)
+            raise TimeoutErrorLibKP("greeting", timeout)
 
-        response = await self.select_protocol(selected, idle)
+        response = await self.select_protocol(selected, idle, timeout)
         return HandshakeOutcome(
             greeting=greeting, offered=offered, selected=selected, response=response
         )

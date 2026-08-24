@@ -20,6 +20,16 @@ __all__ = [
     "CommandError",
     "DisconnectedError",
     "UnknownSlotError",
+    "RigLoadRequiresNavigatorError",
+    "RequestError",
+    "RequestDisconnectedError",
+    "RequestTimeoutError",
+    "RequestUnreadableError",
+    "ChannelError",
+    "ChannelOffError",
+    "ChannelTooSoonError",
+    "ChannelDisconnectedError",
+    "ChannelSessionError",
 ]
 
 
@@ -160,3 +170,117 @@ class UnknownSlotError(CommandError):
     def __init__(self, slot: str) -> None:
         super().__init__(f"unknown effect slot {slot!r}; use A B C D X MOD DLY REV")
         self.slot = slot
+
+
+class RigLoadRequiresNavigatorError(CommandError):
+    """A command that would load a rig was refused before any byte was written.
+
+    Rig loads -- the up/down and slot-load Control Changes
+    (:data:`libkp._generated.RIG_LOAD_CONTROLLERS`), a Program Change, and the
+    Bank Select pair that only exists to qualify one -- go through the model's
+    Navigator alone (:meth:`~libkp.model.DeviceModel.navigate_to`,
+    :meth:`~libkp.model.DeviceModel.step_rig`,
+    :meth:`~libkp.model.DeviceModel.step_bank`,
+    :meth:`~libkp.model.DeviceModel.select_slot`), which serialises them so two
+    can never overlap on the wire: an overlapping load leaves the device on a
+    delayed fuse that only a power cycle clears. The bank preselect (CC47) loads
+    nothing and is not refused.
+    """
+
+    def __init__(self, what: str) -> None:
+        super().__init__(
+            f"{what} would load a rig; use the model's Navigator (navigate_to, "
+            f"step_rig, step_bank, select_slot) so loads cannot overlap"
+        )
+        #: What was refused, for the message.
+        self.what = what
+
+
+# ---------------------------------------------------------------------------
+# Requests
+# ---------------------------------------------------------------------------
+
+
+class RequestError(LibKPError):
+    """A read request (``request_param`` and its siblings) could not be answered."""
+
+
+class RequestDisconnectedError(RequestError):
+    """The stream is not open, so there is nothing to ask."""
+
+    def __init__(self) -> None:
+        super().__init__("device model is disconnected; nothing to request from")
+
+
+class RequestTimeoutError(RequestError):
+    """No reply arrived inside :data:`libkp._generated.REQUEST_TIMEOUT_MS`.
+
+    The request is abandoned, never retried: the device silently ignores an
+    address it cannot answer, and asking again costs it more than it costs the
+    caller to do without.
+    """
+
+    def __init__(self, address: int, seconds: float) -> None:
+        super().__init__(
+            f"no reply to the request at address {address} after {seconds * 1000:.0f} ms"
+        )
+        #: The flat address that was asked for.
+        self.address = address
+        self.seconds = seconds
+
+
+class RequestUnreadableError(RequestError):
+    """The address is one the stream cannot answer, so nothing was sent.
+
+    The morph position is the case: the table routes it to the control channel
+    alone, and a ``$41`` for it draws no reply -- waiting out a timeout would
+    only report the same thing later.
+    """
+
+    def __init__(self, address: int) -> None:
+        super().__init__(f"address {address} is not readable over the stream")
+        self.address = address
+
+
+# ---------------------------------------------------------------------------
+# Channels
+# ---------------------------------------------------------------------------
+
+
+class ChannelError(LibKPError):
+    """The control channel could not be (re)opened on request."""
+
+
+class ChannelOffError(ChannelError):
+    """The connect options set the control policy to off; nothing to reopen."""
+
+    def __init__(self) -> None:
+        super().__init__("the control channel is off by policy")
+
+
+class ChannelTooSoonError(ChannelError):
+    """The last control open was inside
+    :data:`libkp._generated.CONTROL_REOPEN_MIN_GAP_MS`; the device is not to be
+    asked for a second control socket that close to the first."""
+
+    def __init__(self, remaining: float) -> None:
+        super().__init__(
+            f"the control channel was opened too recently; try again in {remaining:.0f} s"
+        )
+        #: Seconds until a reopen would be allowed.
+        self.remaining = remaining
+
+
+class ChannelDisconnectedError(ChannelError):
+    """The stream is not open, and the control channel never runs without it."""
+
+    def __init__(self) -> None:
+        super().__init__("device model is disconnected; the control channel needs the stream")
+
+
+class ChannelSessionError(ChannelError):
+    """The control open itself failed; ``cause`` is the :class:`SessionError`."""
+
+    def __init__(self, cause: SessionError) -> None:
+        super().__init__(f"the control channel could not be opened: {cause}")
+        self.cause = cause

@@ -1,4 +1,11 @@
-"""The TCP session and the protocol-selection handshake."""
+"""The TCP session, the protocol-selection handshake and the connection ledger.
+
+Every ``FakeDevice`` binds a fresh ephemeral port, and the ledger is keyed by
+``(ip, port)``, so tests do not wait on one another. A test that opens a second
+socket to the *same* fake -- or lands on a port the OS handed out less than a
+second ago -- pays one ``CONNECTION_COOLDOWN``; the ledger tests below do so on
+purpose.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,8 @@ from fake_device import FakeDevice
 
 from libkp.errors import ConnectError, ProtocolRejectedError, TimeoutErrorLibKP
 from libkp.session import (
+    CONNECTION_COOLDOWN,
+    HANDSHAKE_TIMEOUT,
     PROTOCOL_MIDI3_STREAM,
     PROTOCOL_RESERVED,
     HandshakeOutcome,
@@ -83,17 +92,125 @@ def test_handshake_surfaces_a_rejection():
     assert "NO" in str(error)
 
 
-def test_handshake_without_a_greeting_times_out():
+def test_handshake_with_an_empty_greeting_fails_as_a_greeting_timeout():
+    # The device answered, but offered nothing to choose: the handshake reports
+    # it the same way as never hearing back, and names the wait it was given.
     async def scenario():
         async with FakeDevice(offered=[]) as device:
             session = await Session.connect("127.0.0.1", device.port)
             try:
-                with pytest.raises(TimeoutErrorLibKP):
-                    await session.handshake([PROTOCOL_MIDI3_STREAM], 0.05)
+                with pytest.raises(TimeoutErrorLibKP) as excinfo:
+                    await session.handshake([PROTOCOL_MIDI3_STREAM], IDLE, timeout=0.2)
+                return excinfo.value
             finally:
                 await session.close()
 
-    asyncio.run(scenario())
+    error = asyncio.run(scenario())
+    assert error.phase == "greeting"
+    assert error.seconds == 0.2
+
+
+def test_handshake_waits_out_a_slow_greeting():
+    # A device that has served a few sessions has been seen taking most of a
+    # second before its first greeting byte -- far longer than the inter-chunk
+    # idle gap. The greeting wait is bounded by HANDSHAKE_TIMEOUT, not the gap,
+    # so a greeting ten times the gap late still connects.
+    delay = 0.3
+    assert delay > IDLE
+    assert delay < HANDSHAKE_TIMEOUT
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(greeting_delay=delay) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                outcome = await session.handshake([PROTOCOL_MIDI3_STREAM], 0.03)
+                return outcome, loop.time() - started
+            finally:
+                await session.close()
+
+    outcome, elapsed = asyncio.run(scenario())
+    assert outcome.offered == [PROTOCOL_RESERVED, PROTOCOL_MIDI3_STREAM]
+    assert outcome.selected == PROTOCOL_MIDI3_STREAM
+    assert outcome.accepted
+    assert elapsed >= delay
+
+
+def test_handshake_without_a_greeting_times_out():
+    # A device that never greets fails the connect with the greeting timeout,
+    # which reports the wait actually made. The timeout is shortened so the test
+    # does not sit out the full HANDSHAKE_TIMEOUT.
+    timeout = 0.2
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(greet=False) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                with pytest.raises(TimeoutErrorLibKP) as excinfo:
+                    await session.handshake([PROTOCOL_MIDI3_STREAM], IDLE, timeout=timeout)
+                return excinfo.value, loop.time() - started
+            finally:
+                await session.close()
+
+    error, elapsed = asyncio.run(scenario())
+    assert error.phase == "greeting"
+    assert error.seconds == timeout
+    assert f"{timeout * 1000:.0f} ms" in str(error)
+    assert elapsed >= timeout
+    assert elapsed < HANDSHAKE_TIMEOUT
+
+
+def test_handshake_without_a_selection_reply_times_out():
+    # A device that greets, reads the selection and then says nothing has not
+    # opened a session: an absent verdict is a failed handshake, reported for
+    # the selection phase with the wait actually made.
+    timeout = 0.2
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(ack=False) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                with pytest.raises(TimeoutErrorLibKP) as excinfo:
+                    await session.handshake([PROTOCOL_MIDI3_STREAM], IDLE, timeout=timeout)
+                return excinfo.value, loop.time() - started, device.selected
+            finally:
+                await session.close()
+
+    error, elapsed, selected = asyncio.run(scenario())
+    assert error.phase == "protocol selection"
+    assert error.seconds == timeout
+    assert selected == PROTOCOL_MIDI3_STREAM, "the selection was written and read"
+    assert elapsed >= timeout
+    assert elapsed < HANDSHAKE_TIMEOUT
+
+
+def test_handshake_waits_out_a_slow_selection_reply():
+    # The answer to the selection is waited for like the greeting: up to
+    # HANDSHAKE_TIMEOUT for its first byte, not the inter-chunk idle gap.
+    delay = 0.3
+    assert delay > IDLE
+    assert delay < HANDSHAKE_TIMEOUT
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(selection_delay=delay) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            try:
+                started = loop.time()
+                outcome = await session.handshake([PROTOCOL_MIDI3_STREAM], 0.03)
+                return outcome, loop.time() - started
+            finally:
+                await session.close()
+
+    outcome, elapsed = asyncio.run(scenario())
+    assert outcome.selected == PROTOCOL_MIDI3_STREAM
+    assert outcome.accepted
+    assert elapsed >= delay
 
 
 def test_response_tail_carries_the_first_stream_burst():
@@ -150,3 +267,148 @@ def test_session_reports_its_peer():
 
     peer, port = asyncio.run(scenario())
     assert peer == ("127.0.0.1", port)
+
+
+# -- the connection ledger ---------------------------------------------------
+
+#: Generous bound for an open that must *not* wait: well under the cooldown,
+#: well over a localhost dial.
+PROMPT = CONNECTION_COOLDOWN / 4
+
+
+def test_reopening_the_same_peer_waits_out_the_cooldown():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+            first = await Session.connect("127.0.0.1", device.port)
+            await first.close()
+            closed_at = loop.time()
+            second = await Session.connect("127.0.0.1", device.port)
+            opened_at = loop.time()
+            await second.close()
+            return opened_at - closed_at
+
+    assert asyncio.run(scenario()) >= CONNECTION_COOLDOWN
+
+
+def test_a_second_open_beside_an_open_session_also_waits():
+    # The cooldown runs from the last *open* as well as the last close: two
+    # sockets to one peer must not be opened back to back even if neither is
+    # closed in between.
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+            first = await Session.connect("127.0.0.1", device.port)
+            opened_first = loop.time()
+            second = await Session.connect("127.0.0.1", device.port)
+            opened_second = loop.time()
+            await first.close()
+            await second.close()
+            return opened_second - opened_first
+
+    assert asyncio.run(scenario()) >= CONNECTION_COOLDOWN
+
+
+def test_different_peers_do_not_wait_on_each_other():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as one, FakeDevice() as two:
+            started = loop.time()
+            first = await Session.connect("127.0.0.1", one.port)
+            second = await Session.connect("127.0.0.1", two.port)
+            elapsed = loop.time() - started
+            await first.close()
+            await second.close()
+            # Closing `one` must not delay a fresh open to `two`'s neighbour
+            # either: only the same (ip, port) is paced.
+            async with FakeDevice() as three:
+                started = loop.time()
+                third = await Session.connect("127.0.0.1", three.port)
+                elapsed_after_close = loop.time() - started
+                await third.close()
+            return elapsed, elapsed_after_close
+
+    elapsed, elapsed_after_close = asyncio.run(scenario())
+    assert elapsed < PROMPT
+    assert elapsed_after_close < PROMPT
+
+
+def test_closing_twice_stamps_the_ledger_once():
+    # A second close must not push the cooldown out again: the model's close
+    # and an `async with` exit can both reach the session.
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            await session.close()
+            closed_at = loop.time()
+            await asyncio.sleep(CONNECTION_COOLDOWN / 2)
+            await session.close()
+            again = await Session.connect("127.0.0.1", device.port)
+            waited = loop.time() - closed_at
+            await again.close()
+            return waited
+
+    waited = asyncio.run(scenario())
+    assert CONNECTION_COOLDOWN <= waited < CONNECTION_COOLDOWN + PROMPT
+
+
+def test_a_failed_dial_still_paces_the_retry():
+    # The device saw the attempt whether or not it answered, so a retry
+    # straight after a refused dial waits out the cooldown like any reopen.
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        server.close()
+        await server.wait_closed()
+        with pytest.raises(ConnectError):
+            await Session.connect("127.0.0.1", port, timeout=1.0)
+        failed_at = loop.time()
+        with pytest.raises(ConnectError):
+            await Session.connect("127.0.0.1", port, timeout=1.0)
+        return loop.time() - failed_at
+
+    assert asyncio.run(scenario()) >= CONNECTION_COOLDOWN
+
+
+def test_concurrent_waiters_are_serialised():
+    # Three opens racing for one peer come out a cooldown apart, not together:
+    # each claims the slot as it dials, and the others wait that claim out.
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice() as device:
+
+            async def open_one() -> tuple[float, Session]:
+                session = await Session.connect("127.0.0.1", device.port)
+                return loop.time(), session
+
+            results = await asyncio.gather(*(open_one() for _ in range(3)))
+            for _, session in results:
+                await session.close()
+            return sorted(opened for opened, _ in results)
+
+    first, second, third = asyncio.run(scenario())
+    assert second - first >= CONNECTION_COOLDOWN - 0.01
+    assert third - second >= CONNECTION_COOLDOWN - 0.01
+
+
+def test_the_snapshot_fetch_goes_through_the_ledger():
+    # `fetch_state_snapshot` opens its own socket via `Session.connect`, so a
+    # fetch straight after a session closes is held back like any other open.
+    # The fake offers the control protocol but serves no dump, so the fetch
+    # returns an empty snapshot once its short timeout passes.
+    from libkp.cbor import fetch_state_snapshot
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        async with FakeDevice(offer_cbor=True, dump_items=[]) as device:
+            session = await Session.connect("127.0.0.1", device.port)
+            await session.close()
+            closed_at = loop.time()
+            snapshot = await fetch_state_snapshot("127.0.0.1", port=device.port, timeout=0.05)
+            return loop.time() - closed_at, snapshot
+
+    elapsed, snapshot = asyncio.run(scenario())
+    assert elapsed >= CONNECTION_COOLDOWN
+    assert not snapshot.is_complete()

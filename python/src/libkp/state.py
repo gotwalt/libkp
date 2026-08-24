@@ -5,19 +5,25 @@ Everything in the tree is plain data (dataclasses of scalars, strings and
 ``None``), cheap to copy for each snapshot the store emits and easy to mirror
 across an FFI boundary as value types.
 
-:class:`DeviceState` is the root. :meth:`DeviceState.apply` decodes ONE
-already-unframed MIDI message and returns an :class:`ApplyOutcome`: the granular
-:class:`DeviceEvent` list plus whether any *slow* field changed. It does no I/O,
-so tests drive it with synthesized messages. The async handle that owns a socket
-and feeds this is :class:`libkp.model.DeviceModel`.
+:class:`DeviceState` is the root. A value reaches it on one of two wires -- a
+MIDI3 SysEx message through :meth:`DeviceState.apply`, or a CBOR item through
+:meth:`DeviceState.apply_cbor` / :meth:`DeviceState.apply_cbor_text` -- and both
+are thin decoders that build an :class:`Update` and hand it to the one fold,
+:meth:`DeviceState.apply_update`. The fold consults the routing table generated
+from ``spec/state.toml`` (:data:`libkp._generated.STATE_ROUTES`) and returns an
+:class:`ApplyOutcome`: the granular :class:`DeviceEvent` list plus whether any
+*slow* field changed. It does no I/O, so tests drive it with synthesized
+messages. The async handle that owns a socket and feeds this is
+:class:`libkp.model.DeviceModel`.
 
 FAST vs SLOW
 ------------
 
-**FAST** = the meter :class:`RealtimeStatus` block, the beat pulse, and tuner
-deviance — high-rate values a UI polls per animation frame. **SLOW** =
-everything else (rig / amp / cab / effect / output / tempo / morph / tuner-note /
-connection), which drives the coalesced snapshot stream.
+**FAST** = the meter :class:`RealtimeStatus` block, the beat pulse, tuner
+deviance and the morph button — high-rate values a UI polls per animation
+frame. **SLOW** = everything else (rig / amp / cab / effect / output / tempo /
+morph / tuner-note / position / connection), which drives the coalesced snapshot
+stream. Which is which is the ``lane`` column of the table.
 """
 
 from __future__ import annotations
@@ -27,11 +33,22 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from . import _generated as gen
-from . import nrpn, params
+from . import _routes, nrpn, params
 from .nrpn import NrpnHeader, u14
 
 __all__ = [
+    "Channel",
+    "Phase",
+    "Decoded",
+    "Num",
+    "Text",
+    "Block",
+    "Update",
     "Connection",
+    "ChannelState",
+    "Channels",
+    "Navigation",
+    "NavDrop",
     "RealtimeStatus",
     "Rig",
     "Amp",
@@ -51,24 +68,105 @@ __all__ = [
     "Status",
     "BeatPulse",
     "TempoBpm",
+    "MorphButton",
     "MorphChanged",
     "TunerDeviance",
     "TunerNote",
     "RenderedString",
     "CurrentPosition",
+    "NavigationSettled",
+    "NavigationDropped",
     "Connected",
     "Disconnected",
+    "ConnectionChanged",
+    "ChannelChanged",
+    "SyncCompleted",
+    "RequestTimedOut",
     "ApplyOutcome",
 ]
 
 
 class Connection(Enum):
-    """Whether a live session to the Profiler is currently open."""
+    """The model's overall link to the Profiler, summarising its two channels.
 
-    #: A session is open and the stream is being ingested.
-    CONNECTED = "connected"
-    #: No session (initial state, or the device closed the connection).
+    The MIDI3 stream is the link that matters: without it there is no
+    connection at all. The CBOR control channel is the optional second socket
+    that carries what the stream omits (the morph position), and losing it only
+    *degrades* the connection -- everything the stream carries keeps flowing.
+    """
+
+    #: No session: the initial state, the device closed the connection and the
+    #: model was not asked to reconnect, or :meth:`~libkp.model.DeviceModel.close`
+    #: was called.
     DISCONNECTED = "disconnected"
+    #: The stream was lost and the model is waiting out a backoff before dialing
+    #: again (:attr:`DeviceState.reconnect_attempt` counts the tries). Only seen
+    #: when a :class:`~libkp.model.ReconnectPolicy` asked for it.
+    RECONNECTING = "reconnecting"
+    #: The stream is open and being ingested, and the control channel is either
+    #: open, still on its way, or was never asked for.
+    CONNECTED = "connected"
+    #: The stream is open but the control channel was asked for and is not
+    #: there: it could not be opened, or it was open and the device ended it.
+    #: The morph position is stale or unknown; nothing else is affected.
+    DEGRADED = "degraded"
+
+
+class ChannelState(Enum):
+    """Where one of the model's two sockets is in its life."""
+
+    #: Not asked for: the policy is off, or no attempt has been made yet.
+    CLOSED = "closed"
+    #: Dialing, or in the protocol handshake.
+    CONNECTING = "connecting"
+    #: Handshaken and streaming.
+    OPEN = "open"
+    #: The open failed -- the dial, the handshake, or (for the control channel)
+    #: the write that asks for the state dump.
+    UNAVAILABLE = "unavailable"
+    #: Was open, then the socket ended.
+    LOST = "lost"
+
+
+@dataclass(slots=True)
+class Channels:
+    """The state of the model's two sockets, side by side."""
+
+    #: The MIDI3 stream: the meter lane, the parameter pushes, every request.
+    stream: ChannelState = ChannelState.CLOSED
+    #: The CBOR control channel: the state dump and the morph position.
+    control: ChannelState = ChannelState.CLOSED
+
+
+@dataclass(slots=True)
+class Navigation:
+    """Where the model's Navigator is between the client's aim and the device.
+
+    The Navigator (:meth:`libkp.model.DeviceModel.navigate_to` and its
+    siblings) is the only way libkp loads a rig: it serialises loads so two
+    can never overlap on the wire, which is what wedges the device. This is
+    its public face -- enough for a UI to highlight the slot a client tapped
+    before the device confirms it.
+    """
+
+    #: The flat, 0-based rig index the client is aiming at, until the device
+    #: reports it as the current position (then ``None``) or never does and
+    #: the aim is dropped (:class:`NavigationDropped`).
+    aim: int | None = None
+    #: Whether a load is on the wire and inside its settle
+    #: (:data:`libkp._generated.RIG_LOAD_SETTLE_MS`), during which a new aim
+    #: waits.
+    in_flight: bool = False
+
+
+class NavDrop(Enum):
+    """Why the Navigator gave up on an aim."""
+
+    #: The device never reported the aim as its position inside
+    #: :data:`libkp._generated.PENDING_WINDOW_MS` of the move settling -- an
+    #: index past the last rig, typically, where the device stays put and says
+    #: so. Also the reason when the stream was down at the moment of the send.
+    UNCONFIRMED = "unconfirmed"
 
 
 # ---------------------------------------------------------------------------
@@ -365,9 +463,28 @@ class TempoBpm(DeviceEvent):
 
 @dataclass(frozen=True, slots=True)
 class MorphChanged(DeviceEvent):
-    """The morph position changed (``$01`` page 0 / number 0x0B, 0–16383)."""
+    """The morph position changed (``$01`` page 0 / number 0x77): 0 = base,
+    16383 = fully morphed.
+
+    Only the control link ever carries this: the position is never sent on the
+    MIDI3 stream, even while a morph is ramping, so a model whose control link
+    is off or lost never raises it. See :class:`MorphButton`.
+    """
 
     value: int
+
+
+@dataclass(frozen=True, slots=True)
+class MorphButton(DeviceEvent):
+    """The morph button was pressed or released (``$01`` page 0 / number 0x50) --
+    momentary, so nothing about it is stored in the snapshot.
+
+    This is what a MIDI3 client sees of a morph: *that* one happened, and what it
+    did to the audio parameters, but never where the fader sits.
+    """
+
+    #: True on press, False on release.
+    on: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,16 +517,39 @@ class RenderedString(DeviceEvent):
 
 @dataclass(frozen=True, slots=True)
 class CurrentPosition(DeviceEvent):
-    """The device's current position was learned from the CBOR state-dump snapshot.
+    """The device's current position changed, or was learned for the first time.
 
     Read :attr:`DeviceState.current_bank` and :attr:`DeviceState.current_rig_slot`
-    for the new values (both 0-based).
+    for the new values (both 0-based); a ``None`` here is a half not yet known,
+    not a cleared one.
     """
 
-    #: Current bank, 0-based, if the dump carried it.
+    #: Current bank, 0-based, if known.
     bank: int | None
-    #: Current rig slot within the bank, 0-based, if the dump carried it.
+    #: Current rig slot within the bank, 0-based, if known.
     slot: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationSettled(DeviceEvent):
+    """The device reported the Navigator's aim as its current position: the
+    load landed, and :attr:`DeviceState.navigation` has no aim."""
+
+    #: The flat, 0-based rig index that was aimed at and confirmed.
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
+class NavigationDropped(DeviceEvent):
+    """The Navigator gave up on an aim the device never confirmed.
+
+    :attr:`DeviceState.navigation` has no aim, and
+    :attr:`DeviceState.current_rig_index` is where the device actually is.
+    """
+
+    #: The flat, 0-based rig index that was aimed at.
+    index: int
+    reason: NavDrop
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,7 +559,55 @@ class Connected(DeviceEvent):
 
 @dataclass(frozen=True, slots=True)
 class Disconnected(DeviceEvent):
-    """The device closed the connection."""
+    """The device closed the connection, or the model was closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionChanged(DeviceEvent):
+    """:attr:`DeviceState.connection` moved to a new value.
+
+    Raised on *every* transition, so a client watching this one event follows
+    the whole life of the link -- reconnect attempts and degradation included.
+    :class:`Connected` and :class:`Disconnected` are still raised alongside it
+    for the two transitions they name.
+    """
+
+    connection: Connection
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelChanged(DeviceEvent):
+    """One of the model's two sockets moved to a new :class:`ChannelState`.
+
+    The only event that names a channel: everything else about the two wires
+    is folded into one tree and one event stream.
+    """
+
+    channel: Channel
+    state: ChannelState
+
+
+@dataclass(frozen=True, slots=True)
+class SyncCompleted(DeviceEvent):
+    """A channel finished filling the tree in.
+
+    For :attr:`Channel.STREAM` the connect-time request burst has had its last
+    reply (or its last timeout); for :attr:`Channel.CONTROL` the state dump
+    has ended. After either, what that channel can tell is in the snapshot.
+    """
+
+    source: Channel
+
+
+@dataclass(frozen=True, slots=True)
+class RequestTimedOut(DeviceEvent):
+    """A read request drew no reply inside its deadline and was abandoned.
+
+    Never retried: the device ignores an address it cannot answer, and asking
+    again would only cost it more. ``address`` is the flat address asked for.
+    """
+
+    address: int
 
 
 @dataclass(slots=True)
@@ -435,6 +623,12 @@ class ApplyOutcome:
 
     events: list[DeviceEvent] = field(default_factory=list)
     slow_changed: bool = False
+    #: Every flat rig index this update reported for the Navigator: a position
+    #: row that stored -- or deduped an unchanged report -- with both halves
+    #: known and the index inside sixteen bits. A deduped report raises no
+    #: event, but the Navigator still needs it: re-loading the rig already
+    #: loaded is confirmed by a push that changes nothing.
+    positions: list[int] = field(default_factory=list)
 
     @classmethod
     def empty(cls) -> ApplyOutcome:
@@ -453,18 +647,83 @@ class ApplyOutcome:
 
 
 # ---------------------------------------------------------------------------
-# The root, with the decode routing
+# Updates: what the two wires decode to before the fold
 # ---------------------------------------------------------------------------
 
-#: String tags this tree stores, keyed by tag number → (block attr, field attr).
-_STRING_TAG_FIELDS: dict[int, tuple[str, str]] = {
-    1: ("rig", "name"),
-    2: ("rig", "author"),
-    3: ("rig", "date"),
-    4: ("rig", "comment"),
-    10: ("amp", "name"),
-    32: ("cabinet", "name"),
-}
+
+class Channel(Enum):
+    """Which wire carried a value: the MIDI3 stream or the CBOR control channel."""
+
+    STREAM = "stream"
+    CONTROL = "control"
+
+
+class Phase(Enum):
+    """Whether a value was pushed live or is an item of the CBOR state dump.
+
+    The dump is a copy of the device's state taken when it was asked for, so a
+    live push that lands while it is still streaming is newer than the dump's
+    item for the same address. :meth:`DeviceState.begin_dump` and
+    :meth:`DeviceState.end_dump` bracket the window in which that matters.
+    """
+
+    LIVE = "live"
+    DUMP = "dump"
+
+
+@dataclass(frozen=True, slots=True)
+class Decoded:
+    """Base class for a wire value once its transport encoding is stripped."""
+
+
+@dataclass(frozen=True, slots=True)
+class Num(Decoded):
+    """A numeric value: a 14-bit ``$01`` pair, a 35-bit ``$06`` extended value,
+    or a CBOR integer."""
+
+    value: int
+
+
+@dataclass(frozen=True, slots=True)
+class Text(Decoded):
+    """A string: a ``$03`` / ``$07`` tag, or a CBOR ``[4, addr, text]`` item."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class Block(Decoded):
+    """The values of one ``$02`` multi-value message, starting at the update's
+    address. Stream only: the control channel has no equivalent shape."""
+
+    values: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Update:
+    """One value on its way into the tree, tagged with where it came from.
+
+    :meth:`DeviceState.apply` and :meth:`DeviceState.apply_cbor` are thin
+    decoders that build these; :meth:`DeviceState.apply_update` is the one fold
+    every value goes through, whichever wire carried it.
+    """
+
+    source: Channel
+    phase: Phase
+    #: The flat address: ``page * 128 + number``, or a bare extended address.
+    address: int
+    decoded: Decoded
+
+
+#: One past the last flat address the page/number space can name. Below it an
+#: address is a ``(page, number)`` pair the stream reports generically; at or
+#: above it an address is an extended one and has no generic report.
+_FLAT_ADDRESS_LIMIT = 128 * 128
+
+
+# ---------------------------------------------------------------------------
+# The root, with the fold
+# ---------------------------------------------------------------------------
 
 
 def _new_effects() -> list[Effect]:
@@ -480,8 +739,15 @@ class DeviceState:
     copies of this through its snapshot stream.
     """
 
-    #: Whether a live session is open.
+    #: The model's overall link to the device, summarising :attr:`channels`.
     connection: Connection = Connection.DISCONNECTED
+    #: Which reconnect attempt is pending while :attr:`connection` is
+    #: :attr:`Connection.RECONNECTING`; ``0`` at every other time.
+    reconnect_attempt: int = 0
+    #: The state of each of the model's two sockets.
+    channels: Channels = field(default_factory=Channels)
+    #: The Navigator's aim and whether a rig load is in flight.
+    navigation: Navigation = field(default_factory=Navigation)
     #: The loaded rig's metadata and settings.
     rig: Rig = field(default_factory=Rig)
     #: The amplifier block.
@@ -496,17 +762,17 @@ class DeviceState:
     output: Output = field(default_factory=Output)
     #: The loaded bank's five-slot name preview (page ``0x96``).
     bank: Bank = field(default_factory=Bank)
-    #: Current bank, 0-based, once known. Seeded from the CBOR state-dump
-    #: snapshot (:func:`libkp.cbor.fetch_state_snapshot`) via
-    #: :meth:`libkp.model.DeviceModel.set_current_position`, then kept live by
-    #: the Bank Select / Program Change pair the device sends on every rig change.
+    #: Current bank, 0-based, once known. Kept live by the ``$06`` Extended
+    #: Parameter the device sends at :data:`libkp._generated.CURRENT_BANK_ADDRESS`
+    #: whenever the bank changes -- from the front panel as readily as from a
+    #: controller -- by the reply to
+    #: :meth:`libkp.model.DeviceModel.refresh_position`, and by the control
+    #: channel's state dump and pushes, all through the one fold.
     current_bank: int | None = None
     #: Current rig slot within the bank, 0-based, once known. Same source as
-    #: :attr:`current_bank`; slot 0 is rig slot 1.
+    #: :attr:`current_bank`, at
+    #: :data:`libkp._generated.CURRENT_RIG_SLOT_ADDRESS`; slot 0 is rig slot 1.
     current_rig_slot: int | None = None
-    #: The high 7 bits of a rig index, held between the Bank Select that carries
-    #: them and the Program Change that completes the pair.
-    _pending_rig_index_msb: int | None = None
 
     @property
     def current_rig_index(self) -> int | None:
@@ -514,16 +780,40 @@ class DeviceState:
 
         ``current_bank * BANK_SLOTS + current_rig_slot`` -- the device's own
         numbering, and the only address that can name a rig outside the current
-        bank.
+        bank. ``None`` too for halves whose product leaves sixteen bits: a
+        garbled wire value must yield no index, not a plausible-looking one.
         """
         if self.current_bank is None or self.current_rig_slot is None:
             return None
-        return self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
+        flat = self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
+        return flat if flat <= 0xFFFF else None
 
-    #: Latest morph position (0–16383), once seen (NRPN ``0x00/0x0B``).
+    @property
+    def aimed_rig_index(self) -> int | None:
+        """Where the Navigator is headed: its aim while it has one, else
+        :attr:`current_rig_index`.
+
+        The index a UI's rig browser should highlight, and what
+        :meth:`libkp.model.DeviceModel.step_rig` steps from -- so a burst of
+        taps counts from the last tap, not from wherever the device has got to.
+        """
+        aim = self.navigation.aim
+        return aim if aim is not None else self.current_rig_index
+
+    #: Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
+    #: ``0x00/0x77``). Filled only from the CBOR control channel -- its state
+    #: dump when the model's control link opens, then its live pushes -- so it
+    #: stays ``None`` while :attr:`channels` says the control link never opened,
+    #: and goes stale once it is lost (:attr:`Connection.DEGRADED`).
     morph: int | None = None
     #: The most recent realtime status / meter frame (the FAST lane).
     status: RealtimeStatus = field(default_factory=RealtimeStatus)
+
+    # Dump bookkeeping (see :class:`Phase`). Internal: it is not part of the
+    # snapshot a UI reads, so it takes no part in equality, and it is what
+    # :meth:`begin_dump` / :meth:`end_dump` bracket.
+    _dump_active: bool = field(default=False, compare=False, repr=False)
+    _dump_touched: set[int] = field(default_factory=set, compare=False, repr=False)
 
     # -- accessors ---------------------------------------------------------
 
@@ -539,238 +829,340 @@ class DeviceState:
         """An independent copy of this state, safe to hand to another consumer."""
         return copy.deepcopy(self)
 
-    # -- decode ------------------------------------------------------------
+    # -- decoders ----------------------------------------------------------
 
     def apply(self, msg: bytes) -> ApplyOutcome:
-        """Parse and apply ONE decoded MIDI message.
+        """Decode and apply ONE already-unframed MIDI3 message.
 
-        Pure: no I/O and no clock. Non-Kemper or ignored messages return an empty
-        outcome. Routing:
+        Pure: no I/O and no clock. A non-Kemper or unparseable message returns an
+        empty outcome. Each message becomes one :class:`Update` (a ``$02`` block
+        is one update carrying a :class:`Block`) on the :attr:`Channel.STREAM`
+        wire and goes through :meth:`apply_update`:
 
-        - ``$03`` string on page 0 → rig/amp/cab name tags + ``StringTag`` (plus
-          ``RigChanged`` for tag 1, the Rig Name). SLOW.
-        - ``$01`` single-param → beat pulse / effect / amp / rig / output / morph
-          / tuner / generic ``ParamChanged``; FAST for the beat pulse and tuner
-          deviance, SLOW for the tracked fields.
-        - ``$02`` multi-param → the meter block (→ ``Status``, FAST) or a
-          rig-load dump (each consecutive address routed like a single-param).
-        - ``$07`` ext-string on the string page → the amp/cab/author tags the
-          rig-load dump sends as extended strings.
-        - ``$3C`` rendered-string reply → a transient ``RenderedString``. FAST.
-        - ``$06`` extended and any other traffic → ignored.
+        - ``$03`` string and ``$07`` extended string → :class:`Text` at
+          ``page * 128 + number`` (the page-0 tags, the bank preview).
+        - ``$01`` single-param → :class:`Num` at ``page * 128 + number``.
+        - ``$02`` multi-param → :class:`Block` at ``page * 128 + number``: the
+          meter frame when it sits at the meter base, otherwise one value per
+          consecutive address (a rig-load dump).
+        - ``$06`` extended param → :class:`Num` at the bare extended address
+          (the device's current bank / rig slot).
+
+        One reply stays outside the table: a ``$3C`` rendered-string reply is a
+        transient :class:`RenderedString` event and stores nothing.
         """
-        # Channel-voice messages ride the same stream as the SysEx: the device
-        # announces every rig change as a Bank Select / Program Change pair.
-        outcome = self._apply_rig_index(msg)
-        if outcome is not None:
-            return outcome
-
-        parsed = NrpnHeader.parse(msg)
-        if parsed is None:
+        decoded = _decode_stream(msg)
+        if decoded is None:
             return ApplyOutcome.empty()
-        header, vals = parsed
+        if isinstance(decoded, RenderedString):
+            return ApplyOutcome.fast(decoded)
+        return self.apply_update(decoded)
 
-        # The extended-string ($07) address is 5x7-bit encoded and does not fit
-        # the fixed header layout, so route it off the raw message.
-        if header.function == nrpn.FUNCTION_EXT_STRING_PARAM:
-            return self._apply_ext_string(msg)
+    def apply_cbor(self, address: int, value: int) -> ApplyOutcome:
+        """Fold one live **CBOR** numeric into the tree.
 
-        if header.function == nrpn.FUNCTION_STRING_PARAM and header.page == nrpn.PAGE_STRINGS:
-            return self._apply_string(header.number, vals)
-        if header.function == nrpn.FUNCTION_SINGLE_PARAM:
-            if len(vals) < 2:
+        The CBOR channel and the MIDI3 stream are two wire formats over one event
+        universe, so a value arriving either way lands in the same field and
+        raises the same event. The model's control link folds its items through
+        the same rules (with the dump phase set where it applies); this is the
+        one-value entry point for tooling and vectors. A negative value is not a
+        parameter value on this channel and is dropped before routing; anything
+        else is range-checked by the row it lands on.
+        """
+        if value < 0:
+            return ApplyOutcome.empty()
+        return self.apply_update(Update(Channel.CONTROL, Phase.LIVE, address, Num(value)))
+
+    def apply_cbor_text(self, address: int, text: str) -> ApplyOutcome:
+        """Fold one live **CBOR** string (a ``[4, addr, text]`` item) into the tree,
+        the control channel's counterpart of a ``$03`` / ``$07`` tag."""
+        return self.apply_update(Update(Channel.CONTROL, Phase.LIVE, address, Text(text)))
+
+    def begin_dump(self) -> None:
+        """Open the window in which live pushes outrank the CBOR state dump.
+
+        Until :meth:`end_dump`, a :attr:`Phase.LIVE` update marks its address, and
+        a :attr:`Phase.DUMP` item for a marked address is dropped: the dump is a
+        copy taken when it was requested, so a value pushed while it streams is
+        the newer one. Outside the window a dump item folds like a live value.
+        """
+        self._dump_active = True
+        self._dump_touched.clear()
+
+    def end_dump(self) -> None:
+        """Close the window :meth:`begin_dump` opened and forget the addresses it
+        marked."""
+        self._dump_active = False
+        self._dump_touched.clear()
+
+    # -- the fold ----------------------------------------------------------
+
+    def apply_update(self, u: Update) -> ApplyOutcome:
+        """THE funnel: fold one decoded value into the tree, whichever wire it
+        came from, by the routing table in ``spec/state.toml``.
+
+        In order:
+
+        1. Look the address up in :data:`libkp._generated.STATE_ROUTES`. A
+           :class:`Block` at a ``multi`` row's base decodes as one unit (the
+           meter frame) whatever its length -- a short block zero-fills the
+           tail, a long one is cut at the span; any other block folds element
+           by element as :class:`Num` updates at ``address + i``, merging the
+           outcomes.
+        2. No row, or a row whose ``kind`` does not take this shape (a string at a
+           numeric row, a numeric at a text row): nothing is stored. The stream
+           still reports a numeric in the page/number space as a generic
+           :class:`ParamChanged`; a control-channel value, a string, or an
+           extended address is silent.
+        3. The row's ``wire``: a ``stream`` row drops the control channel's copy
+           (its meter, beat, tuner and momentary feeds are a different, unwanted
+           stream). A ``control`` row accepts the stream anyway -- the morph
+           position never appears there, but if it did it would be real.
+        4. Decode and range-check by ``kind``: ``u14`` and ``bpm`` drop anything
+           past 16383, ``u16`` past 65535 (dropped, never truncated); ``u7``
+           keeps the low seven bits; ``bool`` is nonzero.
+        5. Dump authority (see :meth:`begin_dump`).
+        6. Dedupe: a row with ``dedupe`` set and the decoded value already stored
+           is a no-op -- no event, no snapshot. The momentaries and the meter
+           frame never dedupe; every arrival is the information. A deduped
+           position row still reports its (unchanged) flat index in
+           :attr:`ApplyOutcome.positions`.
+        7. Store, and raise the row's event: FAST rows raise the event only, SLOW
+           rows also flag the snapshot.
+        """
+        route = _routes.lookup(u.address)
+        if isinstance(u.decoded, Block):
+            if route is None or route.kind is not gen.Kind.MULTI or route.slot != 0:
+                return self._fold_elements(u, u.decoded.values)
+        elif route is None or not _accepts(route.kind, u.decoded):
+            return self._untracked(u)
+
+        if route.wire is gen.Wire.STREAM and u.source is Channel.CONTROL:
+            return ApplyOutcome.empty()
+
+        value = _decode(route.kind, u.decoded, u.address)
+        if value is None:
+            return ApplyOutcome.empty()
+
+        if self._dump_active:
+            if u.phase is Phase.LIVE:
+                self._dump_touched.add(u.address)
+            elif u.address in self._dump_touched:
                 return ApplyOutcome.empty()
-            return self._route_param(header.page, header.number, u14(vals[0], vals[1]))
-        if header.function == nrpn.FUNCTION_MULTI_PARAM:
-            return self._apply_multi(header.page, header.number, vals)
-        if header.function == nrpn.FUNCTION_RENDERED_STRING_REPLY:
-            return self._apply_rendered_string(msg)
-        return ApplyOutcome.empty()
 
-    # -- decode helpers ----------------------------------------------------
+        if route.dedupe and _routes.read(self, route) == value:
+            # A silenced position update still reports the (unchanged) index:
+            # the Navigator is confirmed by pushes, not by changes.
+            return ApplyOutcome(positions=self._position_report(route.field))
 
-    def _apply_rig_index(self, msg: bytes) -> ApplyOutcome | None:
-        """Fold the device's position report into the tree.
+        _routes.write(self, route, value)
+        events = self._events_for(route, u, value)
+        return ApplyOutcome(
+            events=events,
+            slow_changed=route.lane is gen.Lane.SLOW,
+            positions=self._position_report(route.field),
+        )
 
-        The device says where it is with two channel-voice messages: CC32 (Bank
-        Select LSB) carrying the high 7 bits, then a Program Change carrying the
-        low 7. Together they are a flat, 0-based rig index -- ``128 * msb +
-        program`` -- which divides by ``BANK_SLOTS`` into bank and slot.
-        Unlike the CBOR snapshot, a one-shot read at connect, this arrives on
-        every change, from the front panel as readily as from a controller.
+    # -- fold helpers ------------------------------------------------------
 
-        Returns ``None`` for anything that is not one of the two messages, so
-        NRPN parsing carries on. A Program Change with no Bank Select ahead of it
-        is ignored: half an index is not a position.
-        """
-        if not msg:
-            return None
-        status = msg[0] & 0xF0
-        if status == gen.CONTROL_CHANGE_STATUS:
-            if len(msg) < 3 or msg[1] != gen.CC_BANK_SELECT_LSB:
-                return None
-            self._pending_rig_index_msb = msg[2] & 0x7F
-            return ApplyOutcome.empty()
-        if status == gen.PROGRAM_CHANGE_STATUS:
-            msb = self._pending_rig_index_msb
-            if len(msg) < 2 or msb is None:
-                return None
-            self._pending_rig_index_msb = None
-            index = msb * 128 + (msg[1] & 0x7F)
-            bank, slot = divmod(index, gen.BANK_SLOTS)
-            if self.current_bank == bank and self.current_rig_slot == slot:
-                return ApplyOutcome.empty()
-            self.current_bank = bank
-            self.current_rig_slot = slot
-            return ApplyOutcome.slow([CurrentPosition(bank=bank, slot=slot)])
-        return None
-
-    def _apply_string(self, number: int, vals: bytes) -> ApplyOutcome:
-        """Route a ``$03`` page-0 string tag into the tree."""
-        return self._store_string_tag(number, _ascii_until_nul(vals))
-
-    def _apply_ext_string(self, msg: bytes) -> ApplyOutcome:
-        """Route a ``$07`` Extended String Parameter message.
-
-        This is how the rig-load dump delivers the amp/cab/author metadata that
-        plain ``$03`` strings omit. The extended address decodes as
-        ``page * 128 + number``; a string on the string page carries the same tag
-        numbers as ``$03``. Other pages are ignored.
-        """
-        parsed = nrpn.parse_extended_string(msg)
-        if parsed is None:
-            return ApplyOutcome.empty()
-        address, text = parsed
-        page, number = divmod(address, 128)
-        if page == gen.PAGE_BANK_PREVIEW:
-            return self._store_bank_preview(number, text)
-        if page != nrpn.PAGE_STRINGS:
-            return ApplyOutcome.empty()
-        return self._store_string_tag(number, text)
-
-    def _store_bank_preview(self, number: int, text: str) -> ApplyOutcome:
-        """Store one bank-preview name (page ``0x96``) into :attr:`bank`.
-
-        The number selects the field (rig / amp / cabinet) and slot; an
-        out-of-range number is ignored. A stored value is a SLOW change.
-        """
-        resolved = params.bank_preview_slot_field(number)
-        if resolved is None:
-            return ApplyOutcome.empty()
-        field_, slot = resolved
-        target = self.bank.slots[slot]
-        if field_ is params.BankPreviewField.RIG_NAME:
-            target.rig_name = text
-        elif field_ is params.BankPreviewField.AMP_NAME:
-            target.amp_name = text
-        else:
-            target.cabinet_name = text
-        return ApplyOutcome.slow([BankPreview(number=number)])
-
-    def _store_string_tag(self, number: int, text: str) -> ApplyOutcome:
-        """Store a decoded page-0 string tag into the matching field."""
-        target = _STRING_TAG_FIELDS.get(number)
-        if target is not None:
-            block, attr = target
-            setattr(getattr(self, block), attr, text)
-        events: list[DeviceEvent] = [StringTag(number=number)]
-        if number == nrpn.STRING_RIG_NAME:
-            events.append(RigChanged())
-        return ApplyOutcome(events=events, slow_changed=target is not None)
-
-    def _route_param(self, page: int, number: int, value: int) -> ApplyOutcome:
-        """Route one decoded numeric address/value pair into the tree.
-
-        Shared by ``$01`` single-param and each address of a ``$02`` dump.
-        """
-        # Beat pulse: volatile, not stored (FAST lane).
-        if page == gen.PAGE_REALTIME and number == gen.BEAT_PULSE_NUMBER:
-            return ApplyOutcome.fast(BeatPulse(on=value != 0))
-        # Tuner pitch deviance: volatile (FAST lane).
-        if page == gen.PAGE_REALTIME and number == gen.TUNER_DEVIANCE_NUMBER:
-            self.tuner.deviance = value
-            return ApplyOutcome.fast(TunerDeviance(value=value))
-        # Effect Type / On-Off / Mix: fold into the slot (SLOW).
-        if params.is_effect_page(page) and number in (
-            params.EFFECT_PARAM_TYPE,
-            params.EFFECT_PARAM_STATE,
-            params.EFFECT_PARAM_MIX,
-        ):
-            idx = self._apply_effect(page, number, value)
-            if idx is None:
-                return ApplyOutcome.empty()
-            return ApplyOutcome.slow([EffectChanged(slot=idx)])
-        # Amplifier On/Off and Gain (SLOW).
-        if page == gen.AMP_PAGE and number == gen.AMP_ON_NUMBER:
-            self.amp.on = value != 0
-            return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        if page == gen.AMP_PAGE and number == gen.GAIN_NUMBER:
-            self.amp.gain = value
-            return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        # Tempo bpm (the wire value is bpm * 64) and Rig Volume (SLOW).
-        if page == gen.PAGE_RIG_SETTINGS and number == gen.TEMPO_NUMBER:
-            bpm = value // gen.TEMPO_BPM_SCALE
-            self.rig.tempo_bpm = bpm
-            return ApplyOutcome.slow([TempoBpm(bpm=bpm)])
-        if page == gen.PAGE_RIG_SETTINGS and number == gen.RIG_VOLUME_NUMBER:
-            self.rig.volume = value
-            return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        # System output volumes (SLOW).
-        if page == gen.SYSTEM_PAGE and number == gen.MAIN_VOLUME_NUMBER:
-            self.output.main_volume = value
-            return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        if page == gen.SYSTEM_PAGE and number == gen.HEADPHONE_VOLUME_NUMBER:
-            self.output.headphone_volume = value
-            return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        if page == gen.SYSTEM_PAGE and number == gen.MONITOR_VOLUME_NUMBER:
-            self.output.monitor_volume = value
-            return ApplyOutcome.slow([ParamChanged(page, number, value)])
-        # Morph position (page 0 is dual-use with the string page) (SLOW).
-        if page == gen.PAGE_MORPH and number == gen.MORPH_NUMBER:
-            self.morph = value
-            return ApplyOutcome.slow([MorphChanged(value=value)])
-        # Tuner detected note (SLOW).
-        if page == gen.PAGE_TUNER_NOTE and number == gen.TUNER_NOTE_NUMBER:
-            note = value & 0x7F
-            self.tuner.note = note
-            return ApplyOutcome.slow([TunerNote(note=note)])
-        # Untracked generic parameter: leaves the snapshot unchanged, so it is
-        # not a slow change — only the granular event stream sees it.
-        return ApplyOutcome.fast(ParamChanged(page, number, value))
-
-    def _apply_effect(self, page: int, number: int, value: int) -> int | None:
-        """Store a decoded effect-slot parameter into the matching slot."""
-        idx = params.effect_slot_index(page)
-        if idx is None:
-            return None
-        slot = self.effects[idx]
-        if number == params.EFFECT_PARAM_TYPE:
-            slot.kind = value
-        elif number == params.EFFECT_PARAM_STATE:
-            slot.on = value != 0
-        elif number == params.EFFECT_PARAM_MIX:
-            slot.mix = value
-        return idx
-
-    def _apply_rendered_string(self, msg: bytes) -> ApplyOutcome:
-        """Route a ``$3C`` Rendered String reply — a transient, unstored event."""
-        parsed = nrpn.parse_rendered_string(msg)
-        if parsed is None:
-            return ApplyOutcome.empty()
-        page, number, value, text = parsed
-        return ApplyOutcome.fast(RenderedString(page=page, number=number, value=value, text=text))
-
-    def _apply_multi(self, page: int, number: int, vals: bytes) -> ApplyOutcome:
-        """Route a ``$02`` multi-param message: the meter block, or a rig-load dump."""
-        if page == gen.PAGE_REALTIME and number == gen.METER_BLOCK_NUMBER:
-            self.status = RealtimeStatus.from_values(vals)
-            return ApplyOutcome.fast(Status(status=self.status))
+    def _fold_elements(self, u: Update, values: tuple[int, ...]) -> ApplyOutcome:
+        """Fold a block that is not the meter frame one address at a time."""
         out = ApplyOutcome.empty()
-        for num, value in nrpn.multi_values(number, vals):
-            step = self._route_param(page, num, value)
+        for i, value in enumerate(values):
+            step = self.apply_update(Update(u.source, u.phase, u.address + i, Num(value)))
             out.events.extend(step.events)
             out.slow_changed = out.slow_changed or step.slow_changed
+            out.positions.extend(step.positions)
         return out
+
+    def _position_report(self, field: gen.Field) -> list[int]:
+        """What a position row reports for the Navigator once it has folded
+        (or deduped): the flat rig index, when both halves are known and it
+        fits sixteen bits. Every other row reports nothing."""
+        if field in (gen.Field.CURRENT_BANK, gen.Field.CURRENT_RIG_SLOT):
+            index = self.current_rig_index
+            if index is not None:
+                return [index]
+        return []
+
+    def _untracked(self, u: Update) -> ApplyOutcome:
+        """An address the tree does not store.
+
+        The stream's generic numerics are still worth an event -- a UI may watch
+        a parameter the tree has no field for -- but the snapshot is untouched,
+        so it is never a slow change. Nothing else has a generic report.
+        """
+        if (
+            u.source is Channel.STREAM
+            and isinstance(u.decoded, Num)
+            and u.address < _FLAT_ADDRESS_LIMIT
+        ):
+            page, number = divmod(u.address, 128)
+            return ApplyOutcome.fast(ParamChanged(page, number, u.decoded.value))
+        return ApplyOutcome.empty()
+
+    def _events_for(self, route: gen.Route, u: Update, value: object) -> list[DeviceEvent]:
+        """The event(s) a row raises once its value is stored -- the ``event``
+        column of ``spec/state.toml``, hand-written here because the payloads
+        read the tree (the position carries both halves) and the wire value (a
+        generic ``ParamChanged`` reports what arrived, not the decoded bool)."""
+        f = route.field
+        page, number = divmod(u.address, 128)
+        if f is gen.Field.RIG_NAME:
+            return [StringTag(number=number), RigChanged()]
+        if f in _STRING_TAG_FIELDS:
+            return [StringTag(number=number)]
+        if f in _PARAM_CHANGED_FIELDS:
+            raw = u.decoded.value if isinstance(u.decoded, Num) else 0
+            return [ParamChanged(page, number, raw)]
+        if f in _EFFECT_FIELDS:
+            return [EffectChanged(slot=route.slot)]
+        if f in _BANK_PREVIEW_FIELDS:
+            return [BankPreview(number=number)]
+        if f is gen.Field.MORPH_BUTTON:
+            return [MorphButton(on=value)]
+        if f is gen.Field.MORPH_POSITION:
+            return [MorphChanged(value=value)]
+        if f is gen.Field.TEMPO_BPM:
+            return [TempoBpm(bpm=value)]
+        if f is gen.Field.BEAT_PULSE:
+            return [BeatPulse(on=value)]
+        if f is gen.Field.TUNER_DEVIANCE:
+            return [TunerDeviance(value=value)]
+        if f is gen.Field.STATUS:
+            return [Status(status=value)]
+        if f is gen.Field.TUNER_NOTE:
+            return [TunerNote(note=value)]
+        if f in (gen.Field.CURRENT_BANK, gen.Field.CURRENT_RIG_SLOT):
+            return [CurrentPosition(bank=self.current_bank, slot=self.current_rig_slot)]
+        raise ValueError(f"no event for {f}")
+
+
+#: The page-0 tags that raise a bare ``StringTag`` (the rig name raises
+#: ``RigChanged`` as well).
+_STRING_TAG_FIELDS = frozenset(
+    {
+        gen.Field.RIG_AUTHOR,
+        gen.Field.RIG_DATE,
+        gen.Field.RIG_COMMENT,
+        gen.Field.AMP_NAME,
+        gen.Field.CABINET_NAME,
+    }
+)
+#: The scalar numerics with no event of their own.
+_PARAM_CHANGED_FIELDS = frozenset(
+    {
+        gen.Field.RIG_VOLUME,
+        gen.Field.AMP_ON,
+        gen.Field.AMP_GAIN,
+        gen.Field.CABINET_ON,
+        gen.Field.MAIN_VOLUME,
+        gen.Field.HEADPHONE_VOLUME,
+        gen.Field.MONITOR_VOLUME,
+    }
+)
+_EFFECT_FIELDS = frozenset({gen.Field.EFFECT_TYPE, gen.Field.EFFECT_ON, gen.Field.EFFECT_MIX})
+_BANK_PREVIEW_FIELDS = frozenset(
+    {gen.Field.BANK_RIG_NAME, gen.Field.BANK_AMP_NAME, gen.Field.BANK_CABINET_NAME}
+)
+
+
+def _accepts(kind: gen.Kind, decoded: Decoded) -> bool:
+    """Does a row of ``kind`` take this shape of value? Page 0 is dual-use --
+    the same numbers are string tags via ``$03`` and numerics via ``$01`` -- so
+    the row's kind says which face it stores; the other is untracked. A block
+    is never accepted here: the meter frame is matched before this, and any
+    other block has already been split into its elements."""
+    if isinstance(decoded, Text):
+        return kind is gen.Kind.TEXT
+    if isinstance(decoded, Num):
+        return kind not in (gen.Kind.TEXT, gen.Kind.MULTI)
+    return False
+
+
+def _decode(kind: gen.Kind, decoded: Decoded, address: int) -> object | None:
+    """Turn the wire value into what the tree stores, or ``None`` to drop it.
+
+    An out-of-range value is dropped rather than truncated: a bank index or a
+    fader position that wrapped would be a plausible-looking lie.
+    """
+    if isinstance(decoded, Block):
+        # The frame whatever the block's length: a short read zero-fills the
+        # tail, an extra value is ignored.
+        raw = decoded.values[: gen.METER_COUNT]
+        raw += (0,) * (gen.METER_COUNT - len(raw))
+        return RealtimeStatus(raw=raw)
+    if isinstance(decoded, Text):
+        # A device secret the dump volunteers in the clear must never be stored.
+        if address in gen.SENSITIVE_ADDRESSES:
+            return gen.REDACTED_PLACEHOLDER
+        return decoded.text
+    value = decoded.value
+    if kind is gen.Kind.U14:
+        return value if value <= gen.FULL_SCALE else None
+    if kind is gen.Kind.U16:
+        return value if value <= 0xFFFF else None
+    if kind is gen.Kind.U7:
+        return value & 0x7F
+    if kind is gen.Kind.BOOL:
+        return value != 0
+    if kind is gen.Kind.BPM:
+        return value // gen.TEMPO_BPM_SCALE if value <= gen.FULL_SCALE else None
+    raise ValueError(f"no decode for {kind}")
+
+
+def _decode_stream(msg: bytes) -> Update | RenderedString | None:
+    """What one unframed MIDI3 message carries, before any of it is folded.
+
+    The decode half of :meth:`DeviceState.apply`, on its own so that the
+    model's stream link can see the address and value of every message it
+    ingests -- a request's reply is recognised by exactly that, whether or not
+    the fold then stores it (a reply carrying the value already held is deduped
+    to nothing, yet it answers the request all the same). Returns the
+    :class:`Update` the message is, the :class:`RenderedString` reply that
+    stays outside the table, or ``None`` for a non-Kemper or unparseable
+    message.
+    """
+    parsed = NrpnHeader.parse(msg)
+    if parsed is None:
+        return None
+    header, vals = parsed
+    function = header.function
+    flat = header.page * 128 + header.number
+    decoded: Decoded
+
+    # The extended ($06) and extended-string ($07) addresses are 5x7-bit
+    # encoded and do not fit the fixed header layout, so decode both off the
+    # raw message.
+    if function == nrpn.FUNCTION_EXT_PARAM:
+        ext = nrpn.parse_extended_param(msg)
+        if ext is None:
+            return None
+        flat, value = ext
+        decoded = Num(value)
+    elif function == nrpn.FUNCTION_EXT_STRING_PARAM:
+        ext_string = nrpn.parse_extended_string(msg)
+        if ext_string is None:
+            return None
+        flat, text = ext_string
+        decoded = Text(text)
+    elif function == nrpn.FUNCTION_STRING_PARAM:
+        decoded = Text(_ascii_until_nul(vals))
+    elif function == nrpn.FUNCTION_SINGLE_PARAM:
+        if len(vals) < 2:
+            return None
+        decoded = Num(u14(vals[0], vals[1]))
+    elif function == nrpn.FUNCTION_MULTI_PARAM:
+        decoded = Block(tuple(value for _number, value in nrpn.multi_values(0, vals)))
+    elif function == nrpn.FUNCTION_RENDERED_STRING_REPLY:
+        rendered = nrpn.parse_rendered_string(msg)
+        if rendered is None:
+            return None
+        page, number, value, text = rendered
+        return RenderedString(page, number, value, text)
+    else:
+        return None
+    return Update(Channel.STREAM, Phase.LIVE, flat, decoded)
 
 
 def _ascii_until_nul(data: bytes) -> str:
