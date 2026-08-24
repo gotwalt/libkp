@@ -215,9 +215,7 @@ def test_cbor_stream_decodes(entry):
         got = [
             [
                 address,
-                gen.REDACTED_PLACEHOLDER
-                if address in gen.SENSITIVE_ADDRESSES
-                else decoded.text,
+                gen.REDACTED_PLACEHOLDER if address in gen.SENSITIVE_ADDRESSES else decoded.text,
             ]
             for item in cbor.control_items(items)
             for address, decoded in item.values
