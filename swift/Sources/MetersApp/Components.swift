@@ -491,10 +491,12 @@ struct MorphControl: View {
     }
 
     private var title: String {
+        // Explicit optional patterns: older compilers do not promote the
+        // bare literals over the optional and refuse the switch as
+        // non-exhaustive, so CI's toolchain needs them spelled out.
         switch isMorphed {
-        case true: return "Base"
-        case false: return "Morph"
-        case nil: return "Morph"
+        case .some(true): return "Base"
+        case .some(false), .none: return "Morph"
         }
     }
 
