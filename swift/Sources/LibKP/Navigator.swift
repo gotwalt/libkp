@@ -202,42 +202,43 @@ extension DeviceModel {
         stepRig(by: forward ? Params.bankSlots : -Params.bankSlots)
     }
 
-    /// Load `slot` (1…``Params/bankSlots``, clamped) of the aimed bank — the
-    /// bank of the outstanding aim, else the device's own. Ignored while no
-    /// position is known, since there is no bank to name.
+    /// Load `slot` (1…``Params/bankSlots``) of the aimed bank — the bank of
+    /// the outstanding aim, else the device's own. Ignored for a slot out of
+    /// range: there is no such slot to load, and guessing at a neighbour
+    /// would put a rig load on the wire that nobody asked for. Ignored too
+    /// while no position is known, since there is no bank to name.
     ///
     /// Addressed as a flat index like every other move, so the bank preselect
     /// is re-armed with the slot load: a bare slot load drops into whatever
     /// bank is still loaded, silently undoing a Bank Up tapped a moment
     /// earlier.
     public func selectSlot(_ slot: UInt8) {
+        guard slot >= 1, Int(slot) <= Params.bankSlots else { return }
         guard let current = state.aimedRigIndex else { return }
         let slots = UInt16(Params.bankSlots)
-        let clamped = UInt16(min(max(Int(slot), 1), Params.bankSlots))
-        navigateTo(current / slots * slots + clamped - 1)
+        navigateTo(current / slots * slots + UInt16(slot) - 1)
     }
 
     /// Execute the actions the state machine handed back, in order.
     ///
     /// A `send` while the stream is not open cannot be queued for later — the
     /// aim would be sent into a session that no longer exists — so it is
-    /// dropped on the spot and the machine reset. The timers are armed under a
-    /// serial each, so one that was superseded or cancelled cannot call back
-    /// into a machine that has moved on.
+    /// dropped on the spot and the machine reset; so is one the stream link's
+    /// command queue has no room for, since a queue that full is a socket
+    /// nothing is getting through, and a load should not sit behind it. The
+    /// timers are armed under a serial each, so one that was superseded or
+    /// cancelled cannot call back into a machine that has moved on.
     func drive(_ actions: [NavAction]) {
         for action in actions {
             switch action {
             case .send(let index):
-                guard stream != nil, state.channels.stream == .open else {
+                guard let stream, state.channels.stream == .open,
+                    stream.enqueue(pair: loadPair(index))
+                else {
                     cancelNavigationTimers()
                     navigator = NavigatorState()
                     emit(.navigationDropped(index: index, reason: .unconfirmed))
                     return
-                }
-                let epoch = self.epoch
-                Task { [weak self] in
-                    guard let self else { return }
-                    await self.sendRigLoad(index, epoch: epoch)
                 }
             case .startSettle:
                 navSettleTask?.cancel()
@@ -275,20 +276,15 @@ extension DeviceModel {
     /// The documented pair for a flat index: the absolute bank preselect
     /// (CC47) followed by the slot load (CC50–54) that commits it. The index
     /// divides by ``Params/bankSlots``, so index 123 is bank 25, slot 4.
-    ///
-    /// A failed write is the stream ending, which the supervisor handles;
-    /// the aim goes with the life.
-    private func sendRigLoad(_ index: UInt16, epoch: Int) async {
-        guard epoch == self.epoch else { return }
+    /// Queued as one unit on the stream link, so nothing comes between them.
+    private func loadPair(_ index: UInt16) -> ([UInt8], [UInt8]) {
         let slots = UInt16(Params.bankSlots)
         let bank = UInt8(truncatingIfNeeded: index / slots)
         let slot = UInt8(index % slots) + 1
-        do {
-            try await write(Control.bankPreselect(bank).message(channel: DeviceModel.ccChannel))
-            try await write(Control.loadSlot(slot).message(channel: DeviceModel.ccChannel))
-        } catch {
-            // The supervisor has already torn the life down.
-        }
+        return (
+            Control.bankPreselect(bank).message(channel: DeviceModel.ccChannel),
+            Control.loadSlot(slot).message(channel: DeviceModel.ccChannel)
+        )
     }
 
     /// The settle timer fired. A serial that no longer matches is a timer

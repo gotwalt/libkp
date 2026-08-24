@@ -70,8 +70,6 @@ public enum SessionError: Error, Sendable {
     case closed
     /// The device answered the protocol selection with a rejection.
     case protocolRejected(name: String, detail: String?)
-    /// The device offered no usable protocol in its greeting.
-    case noProtocolOffered
 }
 
 extension SessionError: CustomStringConvertible {
@@ -83,7 +81,6 @@ extension SessionError: CustomStringConvertible {
         case .closed: return "connection closed by device"
         case let .protocolRejected(name, detail):
             return "device rejected protocol \"\(name)\"" + (detail.map { ": \($0)" } ?? "")
-        case .noProtocolOffered: return "device offered no protocol in its greeting"
         }
     }
 }
@@ -129,7 +126,11 @@ public enum RequestError: Error, Equatable, Sendable {
     case timeout
     /// The address is one the stream never answers — a `wire = "control"` row
     /// of the routing table, which is the morph position — so nothing was
-    /// sent. It reaches the tree through the control link instead.
+    /// sent, whichever request form asked (a rendered string of it included).
+    /// It reaches the tree through the control link instead. Also the reply
+    /// that answered ``DeviceModel/requestParam(page:number:)`` but does not
+    /// fit the 14 bits a `$01` carries: a control-channel value at the same
+    /// address, which the request cannot return.
     case unreadable
 }
 

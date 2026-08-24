@@ -84,6 +84,9 @@ public final class Session: @unchecked Sendable {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.libkp.session")
     private let inbox = Inbox()
+    /// Set by the first ``close()``; a second is a no-op, so the ledger is
+    /// stamped once.
+    private let closeGate = ResumeOnce()
     /// The ledger key this session opened under, stamped again on close.
     private let ledgerPeer: ConnectionLedger.Peer
 
@@ -102,8 +105,12 @@ public final class Session: @unchecked Sendable {
     ///
     /// Waits out ``connectionCooldown`` from the last open or close to the same
     /// `host:port` before dialling (see ``ConnectionLedger``); the `timeout`
-    /// covers only the dial itself. Cancelling the task while it waits throws
-    /// `CancellationError` without touching the socket.
+    /// covers only the dial itself. A dial the peer refuses — nothing
+    /// listening on the port, no route to the host — fails at once with
+    /// ``SessionError/connect(address:detail:)`` rather than waiting out the
+    /// timeout for a path that will not change, as Rust and Python fail; the
+    /// timeout is for a dial that simply gets no answer. Cancelling the task
+    /// while it waits throws `CancellationError` without touching the socket.
     public static func connect(
         host: String,
         port: UInt16 = Generated.port,
@@ -138,7 +145,10 @@ public final class Session: @unchecked Sendable {
                 switch state {
                 case .ready:
                     gate.finish { continuation.resume() }
-                case let .failed(error):
+                case let .failed(error), let .waiting(error):
+                    // `Network` parks a refused dial in `waiting` for a path
+                    // change; for a device on the LAN there is none coming,
+                    // and the refusal is the answer.
                     gate.finish {
                         continuation.resume(
                             throwing: SessionError.connect(
@@ -281,11 +291,16 @@ public final class Session: @unchecked Sendable {
     ///
     /// Stamps the ``ConnectionLedger`` synchronously, so a `connect` to the same
     /// peer issued right after this call — even from the same task, with no
-    /// suspension in between — waits out ``connectionCooldown``.
+    /// suspension in between — waits out ``connectionCooldown``. Idempotent:
+    /// a second close does nothing, and in particular does not stamp the
+    /// ledger again — the model's teardown and a caller's own `close` can
+    /// both reach a session, and the cooldown runs from the first.
     public func close() {
-        ConnectionLedger.shared.noteClose(ledgerPeer)
-        connection.cancel()
-        inbox.fail(SessionError.closed)
+        closeGate.finish {
+            ConnectionLedger.shared.noteClose(ledgerPeer)
+            connection.cancel()
+            inbox.fail(SessionError.closed)
+        }
     }
 
     // MARK: - Handshake
@@ -326,8 +341,8 @@ public final class Session: @unchecked Sendable {
     /// nothing at all in `greetingTimeout` fails with
     /// ``SessionError/timeout(phase:ms:)`` for phase `"greeting"`, reporting
     /// the wait actually spent. One that greets without offering anything
-    /// usable fails with ``SessionError/noProtocolOffered``. The default is
-    /// ``handshakeTimeout``; tests shorten it.
+    /// usable — an empty list — is the same failure: no greeting worth the
+    /// name arrived. The default is ``handshakeTimeout``; tests shorten it.
     public func handshake(
         preferred: [String], idle: TimeInterval,
         greetingTimeout: TimeInterval = Session.handshakeTimeout
@@ -340,7 +355,8 @@ public final class Session: @unchecked Sendable {
         let offered = Session.parseProtocolList(greeting)
         guard let selected = preferred.first(where: { offered.contains($0) }) ?? offered.first
         else {
-            throw SessionError.noProtocolOffered
+            throw SessionError.timeout(
+                phase: "greeting", ms: UInt64((greetingTimeout * 1000).rounded()))
         }
         let response = try await selectProtocol(
             selected, idle: idle, replyTimeout: greetingTimeout)

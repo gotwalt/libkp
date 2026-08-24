@@ -13,7 +13,7 @@ from conftest import VECTORS_DIR, vector
 
 from libkp import _generated as gen
 from libkp import cbor, control, midi3, nrpn, params, protocol
-from libkp._nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
+from libkp.nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
 from libkp.state import (
     ApplyOutcome,
     Channel,

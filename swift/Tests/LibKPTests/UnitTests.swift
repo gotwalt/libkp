@@ -1082,6 +1082,157 @@ final class StateTests: XCTestCase {
         XCTAssertEqual(state, other, "dump bookkeeping is not part of the snapshot")
     }
 
+    /// The value a row stores, read back off the tree: the mirror of the
+    /// fold's `set`, exhaustive over the fields the same way.
+    private func read(_ state: DeviceState, _ route: Route) -> Stored? {
+        let index = Int(route.slot ?? 0)
+        func num(_ v: UInt16?) -> Stored? { v.map { .num($0) } }
+        func bool(_ v: Bool?) -> Stored? { v.map { .bool($0) } }
+        func text(_ v: String?) -> Stored? { v.map { .text($0) } }
+        switch route.field {
+        case .rigName: return text(state.rig.name)
+        case .rigAuthor: return text(state.rig.author)
+        case .rigDate: return text(state.rig.date)
+        case .rigComment: return text(state.rig.comment)
+        case .ampName: return text(state.amp.name)
+        case .cabinetName: return text(state.cabinet.name)
+        case .morphPosition: return num(state.morph)
+        case .tempoBpm: return num(state.rig.tempoBpm)
+        case .rigVolume: return num(state.rig.volume)
+        case .ampOn: return bool(state.amp.on)
+        case .ampGain: return num(state.amp.gain)
+        case .cabinetOn: return bool(state.cabinet.on)
+        case .effectType: return num(state.effects[index].kind)
+        case .effectOn: return bool(state.effects[index].on)
+        case .effectMix: return num(state.effects[index].mix)
+        case .tunerDeviance: return num(state.tuner.deviance)
+        case .tunerNote: return num(state.tuner.note.map { UInt16($0) })
+        case .mainVolume: return num(state.output.mainVolume)
+        case .headphoneVolume: return num(state.output.headphoneVolume)
+        case .monitorVolume: return num(state.output.monitorVolume)
+        case .bankRigName: return text(state.bank.slots[index].rigName)
+        case .bankAmpName: return text(state.bank.slots[index].ampName)
+        case .bankCabinetName: return text(state.bank.slots[index].cabinetName)
+        case .currentBank: return num(state.currentBank)
+        case .currentRigSlot: return num(state.currentRigSlot)
+        case .status: return state.status == RealtimeStatus() ? nil : .frame(state.status.raw)
+        case .morphButton, .beatPulse: return nil
+        }
+    }
+
+    /// Every row's `kind` fits its `field`: a value decoded by the row
+    /// stores, reads back equal, and raises at least one event — except the
+    /// two momentaries, which hold nothing and leave the tree untouched.
+    func testEveryRouteStoresAndReadsBack() {
+        for route in Generated.stateRoutes {
+            // A `multi` row is written by its base as one frame.
+            if route.kind == .multi && route.slot != 0 { continue }
+            let decoded: Decoded
+            switch route.kind {
+            case .text: decoded = .text("x")
+            case .multi: decoded = .block([UInt16](repeating: 7, count: Generated.meterCount))
+            default: decoded = .num(1)
+            }
+            guard let stored = Stored(decoded, as: route.kind, at: route.address) else {
+                return XCTFail("\(route.field) at \(route.address) did not decode")
+            }
+            var state = DeviceState()
+            let outcome = state.applyUpdate(
+                Update(source: .stream, phase: .live, address: route.address, decoded: decoded))
+            XCTAssertFalse(outcome.events.isEmpty, "\(route.field) raised nothing")
+            XCTAssertEqual(outcome.slowChanged, route.lane == .slow, "\(route.field)")
+            switch route.field {
+            case .morphButton, .beatPulse:
+                XCTAssertNil(read(state, route))
+                XCTAssertEqual(state, DeviceState(), "\(route.field) stores nothing")
+            default:
+                XCTAssertEqual(read(state, route), stored, "\(route.field) read back")
+                XCTAssertNotEqual(state, DeviceState())
+            }
+        }
+    }
+
+    /// The table is address-sorted and every row is found by its address;
+    /// an address with no row is not.
+    func testTheTableIsSortedAndEveryRowIsFoundByLookup() {
+        let routes = Generated.stateRoutes
+        for (earlier, later) in zip(routes, routes.dropFirst()) {
+            XCTAssertLessThan(earlier.address, later.address)
+        }
+        for route in routes {
+            XCTAssertEqual(Routes.lookup(route.address)?.address, route.address)
+            XCTAssertEqual(Routes.lookup(route.address)?.field, route.field)
+        }
+        XCTAssertNil(Routes.lookup(102_405))
+    }
+
+    /// A `$02` block anywhere but exactly on the meter frame is a run of
+    /// singles at consecutive addresses, each folded on its own — including
+    /// a short block at the meter base, whose elements are numerics at
+    /// `multi` rows, which take no numeric, so each falls through to the
+    /// stream's generic report and `status` is untouched.
+    func testABlockOffTheMeterBaseFoldsElementByElement() {
+        var state = DeviceState()
+        let settings = UInt32(Generated.pageRigSettings) * 128
+        let out = state.applyUpdate(
+            Update(source: .stream, phase: .live, address: settings, decoded: .block([7680, 9000])))
+        XCTAssertTrue(out.slowChanged)
+        XCTAssertEqual(
+            out.events,
+            [
+                .tempoBpm(120),
+                .paramChanged(page: Generated.pageRigSettings, number: 1, value: 9000),
+            ])
+        XCTAssertEqual(state.rig.tempoBpm, 120)
+        XCTAssertEqual(state.rig.volume, 9000)
+
+        let base = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.meterBlockNumber)
+        let short = state.applyUpdate(
+            Update(source: .stream, phase: .live, address: base, decoded: .block([1, 2])))
+        XCTAssertFalse(short.slowChanged)
+        XCTAssertEqual(
+            short.events,
+            [
+                .paramChanged(
+                    page: Generated.pageRealtime, number: Generated.meterBlockNumber, value: 1),
+                .paramChanged(
+                    page: Generated.pageRealtime, number: Generated.meterBlockNumber + 1, value: 2),
+            ])
+        XCTAssertEqual(state.status, RealtimeStatus())
+    }
+
+    /// A row dedupes on the decoded value: a `bool` row arriving as `1` and
+    /// then `5` is one change. The meter frame is the one FAST row with
+    /// state, and it never dedupes.
+    func testTrackedRowsDedupeOnTheDecodedValue() {
+        var state = DeviceState()
+        let on = Nrpn.setSingle(
+            product: 0, device: 0, page: Generated.ampPage, number: Generated.ampOnNumber, value: 1)
+        XCTAssertTrue(state.apply(on).slowChanged)
+        let ampOn = UInt32(Generated.ampPage) * 128 + UInt32(Generated.ampOnNumber)
+        XCTAssertEqual(state.applyCbor(address: ampOn, value: 5), ApplyOutcome())
+        XCTAssertEqual(state.amp.on, true)
+
+        let frame = Nrpn.sysex(
+            product: 0, device: 0, function: Generated.fnMultiParam, page: Generated.pageRealtime,
+            number: Generated.meterBlockNumber,
+            values: meterBlock([UInt16](repeating: 7, count: Generated.meterCount)))
+        XCTAssertEqual(state.apply(frame).events.count, 1)
+        XCTAssertEqual(state.apply(frame).events.count, 1)
+    }
+
+    /// A secret arriving at a text row is stored as the placeholder, never as
+    /// itself. No row today sits at a sensitive address, so this drives the
+    /// decode of one row directly, with the rig-name row's kind standing in.
+    func testSensitiveTextIsRedactedBeforeItIsStored() {
+        let secret = Decoded.text("hunter2")
+        XCTAssertEqual(
+            Stored(secret, as: .text, at: Generated.sensitiveAddresses[0]),
+            .text(Generated.redactedPlaceholder))
+        XCTAssertEqual(
+            Stored(secret, as: .text, at: UInt32(Generated.stringRigName)), .text("hunter2"))
+    }
+
     func testTunerDevianceIsFastAndNoteIsSlow() {
         var state = DeviceState()
         let deviance = state.apply(
@@ -1232,5 +1383,73 @@ final class CborTests: XCTestCase {
         let snap = Cbor.extractSnapshot([name, secret])
         XCTAssertEqual(snap.string(1), "Maz 18 Pushed")
         XCTAssertEqual(snap.string(Generated.sensitiveAddresses[0]), Generated.redactedPlaceholder)
+    }
+
+    /// The item walk keeps item boundaries — a run is one item whose entries
+    /// are consecutive addresses — skips the `[5, …]` blobs, keeps a negative
+    /// value for the model to drop, steps over a leading source-flag word,
+    /// and names the run that closes a dump section by its base.
+    func testControlItemsSkipBlobsAndFindTheEndMarker() {
+        let end = UInt64(Generated.dumpEndAddress)
+        let run = CBORValue.tag(1, .array([.uint(2), .uint(end), .uint(7), .uint(8)]))
+        let name = CBORValue.tag(1, .array([.uint(4), .uint(1), .text("AC30")]))
+        let blob = CBORValue.tag(1, .array([.uint(5), .uint(17), .bytes([1, 2, 3])]))
+        let negative = Cbor.paramWrite(addr: Generated.morphAddress, value: -1)
+        let flagged = CBORValue.tag(
+            1, .array([.neg(-1), .uint(1), .uint(15872), .uint(1)]))
+        let items = [name, blob, negative, flagged, run].compactMap(Cbor.controlItem)
+        XCTAssertEqual(
+            items,
+            [
+                ControlItem(base: 1, entries: [.text(address: 1, text: "AC30")]),
+                ControlItem(
+                    base: Generated.morphAddress,
+                    entries: [.num(address: Generated.morphAddress, value: -1)]),
+                ControlItem(base: 15872, entries: [.num(address: 15872, value: 1)]),
+                ControlItem(
+                    base: Generated.dumpEndAddress,
+                    entries: [
+                        .num(address: Generated.dumpEndAddress, value: 7),
+                        .num(address: Generated.dumpEndAddress + 1, value: 8),
+                    ]),
+            ])
+        XCTAssertEqual(items.lastIndex { $0.base == Generated.dumpEndAddress }, 3)
+        XCTAssertNil(items.prefix(3).lastIndex { $0.base == Generated.dumpEndAddress })
+        // An empty string is no string at all.
+        XCTAssertNil(Cbor.controlItem(.tag(1, .array([.uint(4), .uint(1), .text("")]))))
+    }
+
+    /// A negative or oversized address is malformed; wrapping it into a
+    /// plausible-looking address would invent a parameter that was never
+    /// sent, so the pair is skipped.
+    func testNumericValuesSkipUnrepresentablePairs() {
+        let good = Cbor.paramWrite(addr: Generated.morphAddress, value: 8192)
+        let pairs = Cbor.numericValues([good])
+        XCTAssertEqual(pairs.count, 1)
+        XCTAssertEqual(pairs[0].address, Generated.morphAddress)
+        XCTAssertEqual(pairs[0].value, 8192)
+        let wide = CBORValue.tag(
+            1, .array([.uint(1), .uint(UInt64(UInt32.max) + 1), .uint(1)]))
+        XCTAssertTrue(Cbor.numericValues([wide]).isEmpty)
+        let negative = CBORValue.tag(1, .array([.uint(1), .neg(-5), .uint(1)]))
+        XCTAssertTrue(Cbor.numericValues([negative]).isEmpty)
+        // A run that overflows the address space drops the elements past it.
+        let edge = CBORValue.tag(
+            1, .array([.uint(2), .uint(UInt64(UInt32.max)), .uint(1), .uint(2)]))
+        let kept = Cbor.numericValues([edge])
+        XCTAssertEqual(kept.count, 1)
+        XCTAssertEqual(kept[0].address, UInt32.max)
+    }
+
+    /// A device write can split an item across two TCP reads; the decoder
+    /// holds the head until the rest arrives rather than resyncing over it.
+    func testDecoderBuffersAPartialItemAcrossChunks() {
+        let item = Cbor.paramWrite(addr: 102_528, value: 1)
+        let full = Cbor.encode(item)
+        var decoder = CBORDecoder()
+        XCTAssertEqual(decoder.push(Array(full[..<4])), [])
+        XCTAssertEqual(decoder.pending, 4)
+        XCTAssertEqual(decoder.push(Array(full[4...])), [item])
+        XCTAssertEqual(decoder.pending, 0)
     }
 }

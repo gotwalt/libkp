@@ -184,10 +184,9 @@ def test_cbor_session_streams_the_dump_and_later_pushes():
                 return seen
 
     seen = asyncio.run(scenario())
-    assert seen[:4] == [
-        (gen.CURRENT_BANK_ADDRESS - 1, 0),
-        (gen.CURRENT_BANK_ADDRESS, 3),
-        (gen.CURRENT_RIG_SLOT_ADDRESS, 1),
-        (gen.MORPH_ADDRESS, 8192),
-    ]
+    # The whole dump, in document order, then the later push.
+    assert seen[:-1] == cbor.numeric_values(DEFAULT_DUMP)
+    assert (gen.CURRENT_BANK_ADDRESS, 3) in seen
+    assert (gen.CURRENT_RIG_SLOT_ADDRESS, 1) in seen
+    assert (gen.MORPH_ADDRESS, 8192) in seen
     assert seen[-1] == (gen.MORPH_ADDRESS, 0)

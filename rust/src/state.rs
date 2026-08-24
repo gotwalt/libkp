@@ -1285,4 +1285,147 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn tracked_rows_dedupe_on_the_decoded_value() {
+        let mut st = DeviceState::new();
+        assert!(
+            st.apply(&set_single(0x00, 0x00, AMP_PAGE, AMP_ON_NUMBER, 1))
+                .slow_changed
+        );
+        // A different wire value that decodes to the same bool is not a change —
+        // the row is `both`, so the control copy reaches the dedupe.
+        assert_eq!(
+            st.apply_cbor(u32::from(AMP_PAGE) * 128 + u32::from(AMP_ON_NUMBER), 5),
+            ApplyOutcome::empty()
+        );
+        // The meter frame is the one FAST row with state, and never dedupes.
+        let frame = sysex(
+            0x00,
+            0x00,
+            FUNCTION_MULTI_PARAM,
+            PAGE_REALTIME,
+            METER_BLOCK_NUMBER,
+            &meter_block(&[7; METER_COUNT]),
+        );
+        assert_eq!(st.apply(&frame).events.len(), 1);
+        assert_eq!(st.apply(&frame).events.len(), 1);
+    }
+
+    #[test]
+    fn a_block_off_the_meter_base_folds_element_by_element() {
+        let mut st = DeviceState::new();
+        let out = st.apply_update(&Update {
+            source: Channel::Stream,
+            phase: Phase::Live,
+            address: u32::from(PAGE_RIG_SETTINGS) * 128,
+            decoded: Decoded::Block(vec![7680, 9000]),
+        });
+        assert!(out.slow_changed);
+        assert_eq!(
+            out.events,
+            vec![
+                DeviceEvent::TempoBpm(120),
+                DeviceEvent::ParamChanged {
+                    page: PAGE_RIG_SETTINGS,
+                    number: RIG_VOLUME_NUMBER,
+                    value: 9000
+                }
+            ]
+        );
+        assert_eq!((st.rig.tempo_bpm, st.rig.volume), (Some(120), Some(9000)));
+        // A block at the meter base but not the meter's length is not the frame:
+        // its elements are numerics at `multi` rows, which take no numeric, so
+        // each falls through to the generic report and `status` is untouched.
+        let base = u32::from(PAGE_REALTIME) * 128 + u32::from(METER_BLOCK_NUMBER);
+        let out = st.apply_update(&Update {
+            source: Channel::Stream,
+            phase: Phase::Live,
+            address: base,
+            decoded: Decoded::Block(vec![1, 2]),
+        });
+        assert!(!out.slow_changed);
+        assert_eq!(
+            out.events,
+            vec![
+                DeviceEvent::ParamChanged {
+                    page: PAGE_REALTIME,
+                    number: METER_BLOCK_NUMBER,
+                    value: 1
+                },
+                DeviceEvent::ParamChanged {
+                    page: PAGE_REALTIME,
+                    number: METER_BLOCK_NUMBER + 1,
+                    value: 2
+                },
+            ]
+        );
+        assert_eq!(st.status, RealtimeStatus::default());
+    }
+
+    #[test]
+    fn a_string_at_a_numeric_row_is_untracked() {
+        // Page 0 is dual-use; a row's kind says which face it stores.
+        let mut st = DeviceState::new();
+        let numeric_row = u32::from(PAGE_RIG_SETTINGS) * 128 + u32::from(RIG_VOLUME_NUMBER);
+        st.apply_cbor(numeric_row, 100);
+        assert_eq!(st.apply_cbor_text(numeric_row, "x"), ApplyOutcome::empty());
+        assert_eq!(st.rig.volume, Some(100));
+        // A text at a text row is tracked; a num at a text row is the generic
+        // stream report.
+        assert_eq!(
+            st.apply_update(&Update {
+                source: Channel::Stream,
+                phase: Phase::Live,
+                address: 1,
+                decoded: Decoded::Text("x".into()),
+            })
+            .events,
+            vec![
+                DeviceEvent::StringTag { number: 1 },
+                DeviceEvent::RigChanged
+            ]
+        );
+        let out = st.apply_update(&Update {
+            source: Channel::Stream,
+            phase: Phase::Live,
+            address: 1,
+            decoded: Decoded::Num(5),
+        });
+        assert_eq!(
+            out,
+            ApplyOutcome::fast(DeviceEvent::ParamChanged {
+                page: 0,
+                number: 1,
+                value: 5
+            })
+        );
+        assert_eq!(st.rig.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn control_channel_copies_of_stream_rows_are_dropped() {
+        // The control channel carries its own meter, beat and tuner feeds at
+        // the stream's addresses; those rows are the stream's, so the copies
+        // are silent.
+        let mut st = DeviceState::new();
+        let fresh = st.clone();
+        for address in [
+            u32::from(PAGE_REALTIME) * 128 + u32::from(METER_BLOCK_NUMBER) + 3,
+            u32::from(PAGE_REALTIME) * 128 + u32::from(BEAT_PULSE_NUMBER),
+            u32::from(PAGE_REALTIME) * 128 + u32::from(TUNER_DEVIANCE_NUMBER),
+            u32::from(PAGE_TUNER_NOTE) * 128 + u32::from(TUNER_NOTE_NUMBER),
+            u32::from(PAGE_MORPH) * 128 + u32::from(MORPH_BUTTON_NUMBER),
+        ] {
+            assert_eq!(st.apply_cbor(address, 1), ApplyOutcome::empty());
+        }
+        assert_eq!(st, fresh);
+        // An untracked control address is silent too — no generic event here.
+        assert_eq!(st.apply_cbor(0x09 * 128 + 3, 5000), ApplyOutcome::empty());
+        // A negative value is not a parameter value and never reaches the table.
+        assert_eq!(
+            st.apply_cbor(generated::MORPH_ADDRESS, -1),
+            ApplyOutcome::empty()
+        );
+    }
 }

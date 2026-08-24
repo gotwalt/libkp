@@ -71,6 +71,8 @@ public actor DeviceModel {
     /// different policy is a different model.
     public nonisolated let options: ConnectOptions
     nonisolated let host: String
+    /// The port the model dials, resolved at connect: what
+    /// ``connect(host:port:options:)`` was given, else ``ConnectOptions/port``.
     nonisolated let port: UInt16
 
     var state = DeviceState()
@@ -88,6 +90,11 @@ public actor DeviceModel {
     var stream: StreamLink?
     /// The control link, while it is open.
     var control: ControlLink?
+    /// The best-effort or scheduled open of the control link while it is
+    /// under way — parked in the ledger, dialling, handshaking. Held so a
+    /// teardown can cancel it: an open left to run would dial the device
+    /// after the life it belonged to had ended.
+    var controlOpenTask: Task<Void, Never>?
     var controlIngestTask: Task<Void, Never>?
     var syncTask: Task<Void, Never>?
     var settleTask: Task<Void, Never>?
@@ -101,6 +108,10 @@ public actor DeviceModel {
     var reconnectAttempt: UInt32 = 0
     /// Between the dump trigger and the dump's end (or its settle time).
     var dumpActive = false
+    /// Runs based at ``Generated/dumpEndAddress`` folded since the trigger. A
+    /// dump has two sections, each closed by one, and the
+    /// ``Generated/dumpEndRuns``-th ends it.
+    var dumpEndRuns = 0
 
     // The request lane (see Lane.swift).
     var pending: [UInt32: [PendingRequest]] = [:]
@@ -117,11 +128,13 @@ public actor DeviceModel {
     var navWindowTask: Task<Void, Never>?
     var navWindowSerial = 0
 
-    init(host: String, port: UInt16, options: ConnectOptions) {
+    init(host: String, port: UInt16?, options: ConnectOptions) {
+        var options = options
+        if let port { options.port = port }
         self.host = host
-        self.port = port
+        self.port = options.port
         self.options = options
-        peer = "\(host):\(port)"
+        peer = "\(host):\(options.port)"
     }
 
     /// Dropping the last handle closes both sockets and finishes the streams —
@@ -132,8 +145,8 @@ public actor DeviceModel {
         stream?.close()
         control?.close()
         for task in [
-            controlIngestTask, syncTask, settleTask, reopenTask, reconnectTask, navSettleTask,
-            navWindowTask,
+            controlOpenTask, controlIngestTask, syncTask, settleTask, reopenTask, reconnectTask,
+            navSettleTask, navWindowTask,
         ] {
             task?.cancel()
         }
@@ -197,16 +210,51 @@ public actor DeviceModel {
     }
 
     /// Fold one value from the CBOR channel into this model's tree, as a live
-    /// push off the control channel.
+    /// push off the control channel — through the same funnel the model's
+    /// own control link uses, so a request waiting at the address is answered
+    /// by it and a position it carries reaches the Navigator, exactly as if
+    /// the link had read it.
     ///
     /// The model's own control link does this for every value it reads; this
     /// remains only for a client still holding its own ``CborSession`` beside
     /// a model, and goes with the next step.
     @available(*, deprecated, message: "the model's control link folds the CBOR channel itself")
     public func applyCbor(address: UInt32, value: Int64) {
-        let outcome = state.applyCbor(address: address, value: value)
+        // A negative value is nothing the tree stores.
+        guard let value = UInt64(exactly: value) else { return }
+        let update = Update(source: .control, phase: .live, address: address, decoded: .num(value))
+        if fold(update) { publishSnapshot() }
+    }
+
+    /// Fold one update from either link — the funnel: every event it raises,
+    /// the replies the request lane is waiting on, and the Navigator's
+    /// position — and say whether a slow field moved. The caller owns the
+    /// chunk's one snapshot, so a value that settles an aim rides in it.
+    func fold(_ update: Update) -> Bool {
+        let outcome = state.applyUpdate(update)
         for event in outcome.events { emit(event) }
-        if outcome.slowChanged { publishSnapshot() }
+        resolve(update)
+        return forwardPosition(outcome) || outcome.slowChanged
+    }
+
+    /// A folded update moved the device's position: hand the flat index to
+    /// the Navigator, whichever wire carried it. Returns whether the
+    /// snapshot's navigation changed.
+    private func forwardPosition(_ outcome: ApplyOutcome) -> Bool {
+        let moved = outcome.events.contains {
+            if case .currentPosition = $0 { true } else { false }
+        }
+        guard moved, let index = state.currentRigIndex else { return false }
+        return navigationPosition(index)
+    }
+
+    /// Test hook: forget when the control link was last attempted, so
+    /// ``reopenControl()`` is not refused with ``ChannelError/tooSoon``. The
+    /// reopen gap is ``Generated/controlReopenMinGapMs`` — far longer than a
+    /// test may wait — and there is no other way to reach the reopen's
+    /// success path against a fake.
+    func clearControlAttemptForTests() {
+        lastControlAttempt = nil
     }
 
     // MARK: - Parameters (NRPN `$01`, 14-bit, state-tracked)
@@ -370,19 +418,21 @@ public actor DeviceModel {
 
     // MARK: - Wire
 
-    /// Frame and write raw (pre-framing) MIDI bytes on the stream link.
+    /// Queue raw (pre-framing) MIDI bytes on the stream link's command queue,
+    /// waiting for room while it is full. Returns once queued; the link's
+    /// writer frames and writes commands in the order they were queued.
     ///
-    /// A failed write is the stream ending: it is handed to the supervisor,
-    /// which closes both links and either reports the loss or starts the
-    /// reconnect, exactly as a read error would.
+    /// A failed write is the stream ending: the writer hands it to the
+    /// supervisor, which closes both links and either reports the loss or
+    /// starts the reconnect, exactly as a read error would — so a command
+    /// queued onto a stream that then goes is simply never written.
     func write(_ bytes: [UInt8]) async throws {
-        guard let stream, state.channels.stream == .open else { throw CommandError.disconnected }
-        let epoch = self.epoch
-        do {
-            try await stream.session.writeAll(Midi3.frame(bytes))
-        } catch {
-            streamEnded(epoch: epoch)
-            throw CommandError.disconnected
+        while true {
+            guard let stream, state.channels.stream == .open else {
+                throw CommandError.disconnected
+            }
+            if stream.enqueue(bytes) { return }
+            guard await stream.waitForRoom() else { throw CommandError.disconnected }
         }
     }
 }

@@ -23,8 +23,9 @@ public enum Routes {
 
 /// What a routed value becomes once its row's `kind` has decoded it — the shape
 /// the tree stores and compares. A momentary (the beat pulse, the morph button)
-/// still decodes; it is just never written anywhere.
-private enum Stored: Equatable {
+/// still decodes; it is just never written anywhere. Internal, not private,
+/// so the tests can drive the decode of one row directly.
+enum Stored: Equatable {
     /// A `u14`, `u16` or `u7` value, or a `bpm` already divided down.
     case num(UInt16)
     /// A `bool`: nonzero on the wire is on.

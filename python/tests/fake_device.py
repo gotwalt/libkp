@@ -13,14 +13,20 @@ rejected, as on the device), the preamble, then the protocol's own traffic:
   arbitrary messages.
 - **CBOR** (:data:`~libkp.session.PROTOCOL_CBOR_CONTROL`): decoded items are
   recorded per connection; the dump trigger is answered with ``dump_items``
-  (by default :data:`DEFAULT_DUMP`, a short dump ending with the run at
+  (by default :data:`DEFAULT_DUMP`, a short dump in the real one's two-section
+  shape, each section closed by a run at
   :data:`~libkp._generated.DUMP_END_ADDRESS`), and
   :meth:`FakeDevice.push_items` sends more at any time.
 
 Either kind of connection, or all of them, can be hung up. The greeting can
 be held back for a while (``greeting_delay``), as a device that has served a
 few sessions does, or withheld altogether (``greet=False``) to exercise the
-handshake's timeout.
+handshake's timeout; the selection's answer likewise (``selection_delay``,
+``ack=False``). :meth:`FakeDevice.push_raw` writes pre-framed bytes in one
+segment, so several messages can land in one read, and
+:meth:`FakeDevice.pause_accepting` / :meth:`FakeDevice.resume_accepting`
+refuse and then re-admit fresh connections, for a reconnect that must try
+more than once.
 """
 
 from __future__ import annotations
@@ -37,11 +43,16 @@ from libkp.session import (
     SESSION_PREAMBLE,
 )
 
-#: The dump a CBOR connection serves by default: a rig name, the position as
-#: one run, the morph, and the run that always ends a real dump.
+#: The dump a CBOR connection serves by default, in the real dump's two-section
+#: shape: a system section closed by a run based at
+#: :data:`~libkp._generated.DUMP_END_ADDRESS`, then the rig section, which
+#: opens with the position as one run and carries the rig name and the morph,
+#: closed by the second such run -- the one that ends the dump.
 DEFAULT_DUMP: list = [
-    cbor.Tag(1, [4, gen.STRING_RIG_NAME, "Dump Rig"]),
+    cbor.param_write(gen.SYSTEM_PAGE * 128 + gen.MAIN_VOLUME_NUMBER, 8192),
+    cbor.Tag(1, [2, gen.DUMP_END_ADDRESS, 0, 0]),
     cbor.Tag(1, [2, gen.CURRENT_BANK_ADDRESS - 1, 0, 3, 1]),
+    cbor.Tag(1, [4, gen.STRING_RIG_NAME, "Dump Rig"]),
     cbor.param_write(gen.MORPH_ADDRESS, 8192),
     cbor.Tag(1, [2, gen.DUMP_END_ADDRESS, 0, 0]),
 ]
@@ -112,7 +123,12 @@ class FakeConnection:
 
     async def push(self, message: bytes) -> None:
         """Send one raw MIDI message, framed."""
-        self._writer.write(midi3.frame(message))
+        await self.push_raw(midi3.frame(message))
+
+    async def push_raw(self, data: bytes) -> None:
+        """Write ``data`` as it is, in one segment: several framed messages
+        back to back land in one read on the other side."""
+        self._writer.write(data)
         await self._writer.drain()
 
     async def push_items(self, items: Iterable) -> None:
@@ -144,25 +160,33 @@ class FakeDevice:
         accepts: Iterable[str] | None = None,
         offer_cbor: bool = False,
         tail_messages: list[bytes] | None = None,
+        tail_items: list | None = None,
         push_messages: list[bytes] | None = None,
         close_after_handshake: bool = False,
         responder: Callable[[bytes], list[bytes]] | None = None,
         dump_items: list | None = None,
         greeting_delay: float = 0.0,
         greet: bool = True,
+        selection_delay: float = 0.0,
+        ack: bool = True,
     ) -> None:
         """
         ``offered`` is the greeting (by default the reserved GUID and the MIDI3
         stream; ``offer_cbor`` appends the CBOR control GUID). ``accepts`` is
         the set the fake answers ``+`` to: by default everything offered except
         the reserved GUID, which the device offers and rejects. ``accept=False``
-        rejects every selection. ``responder`` answers each received MIDI
+        rejects every selection. ``tail_messages`` (MIDI, on the stream) and
+        ``tail_items`` (CBOR, on the control channel) ride in the same segment
+        as the acceptance line, as the device's first burst does.
+        ``responder`` answers each received MIDI
         message with the messages it returns. ``dump_items`` is what a CBOR
         connection serves when the dump trigger arrives (default
         :data:`DEFAULT_DUMP`; ``[]`` serves nothing). ``greeting_delay`` is how
         many seconds the fake sits on a fresh connection before greeting, and
         ``greet=False`` never greets at all, holding the socket open until the
-        client gives up.
+        client gives up. ``selection_delay`` and ``ack=False`` do the same to
+        the answer to the selection: the fake greets, reads the selection, and
+        then sits on the answer, or never gives one.
         """
         if offered is None:
             offered = [PROTOCOL_RESERVED, PROTOCOL_MIDI3_STREAM]
@@ -176,19 +200,25 @@ class FakeDevice:
         else:
             self.accepts = {name for name in offered if name != PROTOCOL_RESERVED}
         self.tail_messages = tail_messages or []
+        self.tail_items = tail_items or []
         self.push_messages = push_messages or []
         self.close_after_handshake = close_after_handshake
         self.responder = responder
         self.dump_items = DEFAULT_DUMP if dump_items is None else dump_items
         self.greeting_delay = greeting_delay
         self.greet = greet
+        self.selection_delay = selection_delay
+        self.ack = ack
 
         #: Every connection accepted so far, in order.
         self.connections: list[FakeConnection] = []
         #: Set once any connection has written the session preamble.
         self.saw_preamble = asyncio.Event()
+        #: How many connections were refused while accepting was paused.
+        self.refused = 0
 
         self._server: asyncio.Server | None = None
+        self._accepting = True
 
     # -- conveniences over the connections ----------------------------------
 
@@ -229,11 +259,27 @@ class FakeDevice:
         assert stream is not None, "no stream client connected"
         await stream.push(message)
 
+    async def push_raw(self, data: bytes) -> None:
+        """Write pre-framed bytes to the MIDI3 client in one segment."""
+        stream = self.stream
+        assert stream is not None, "no stream client connected"
+        await stream.push_raw(data)
+
     async def push_items(self, items: Iterable) -> None:
         """Send CBOR items to the CBOR client."""
         control = self.control
         assert control is not None, "no control client connected"
         await control.push_items(items)
+
+    def pause_accepting(self) -> None:
+        """Refuse fresh connections: each is closed the moment it is accepted,
+        before any greeting, as a device that is not ready does. The listener
+        stays bound, so the port is the same when accepting resumes."""
+        self._accepting = False
+
+    def resume_accepting(self) -> None:
+        """Admit fresh connections again."""
+        self._accepting = True
 
     async def hangup(self, protocol: str | None = None) -> None:
         """Close the most recent connection of ``protocol``, or every
@@ -273,6 +319,12 @@ class FakeDevice:
     # -- one connection ------------------------------------------------------
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not self._accepting:
+            self.refused += 1
+            writer.close()
+            with _suppress_teardown():
+                await writer.wait_closed()
+            return
         connection = FakeConnection(writer)
         self.connections.append(connection)
         try:
@@ -301,8 +353,18 @@ class FakeDevice:
         await writer.drain()
 
         line = await reader.readline()
+        if not line:
+            # The client hung up without selecting: nothing was selected.
+            return
         selected = line.decode("ascii").strip()
         connection.selected = selected
+        if not self.ack:
+            # Say nothing more, ever; the connection ends when the client hangs up.
+            while await reader.read(4096):
+                pass
+            return
+        if self.selection_delay:
+            await asyncio.sleep(self.selection_delay)
         if selected not in self.accepts:
             writer.write(b"-NO\r\n")
             await writer.drain()
@@ -312,6 +374,9 @@ class FakeDevice:
         if selected == PROTOCOL_MIDI3_STREAM:
             for message in self.tail_messages:
                 response.extend(midi3.frame(message))
+        elif selected == PROTOCOL_CBOR_CONTROL:
+            for item in self.tail_items:
+                cbor.encode(item, response)
         writer.write(bytes(response))
         await writer.drain()
 

@@ -16,7 +16,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::nav;
@@ -52,7 +52,10 @@ pub(crate) async fn open_stream(
 }
 
 /// Start the stream task for one life. The sender is the command queue; the
-/// handle completes when the socket ends.
+/// handle completes when the socket ends. When the socket ends *on its own*
+/// (not by an abort), the task signals the supervisor through
+/// [`Shared::stream_ended`] — an aborted task is cancelled before that line and
+/// stays silent, so a teardown does not look like a loss.
 pub(crate) fn spawn_stream(
     shared: Arc<Shared>,
     epoch: u64,
@@ -60,7 +63,11 @@ pub(crate) fn spawn_stream(
     tail: Vec<u8>,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
-    let task = tokio::spawn(run_stream(shared, epoch, session, tail, rx));
+    let loss = shared.stream_ended();
+    let task = tokio::spawn(async move {
+        run_stream(shared, epoch, session, tail, rx).await;
+        let _ = loss.send(epoch).await;
+    });
     (tx, task)
 }
 
@@ -95,20 +102,52 @@ async fn run_stream(
     }
 }
 
-/// One read chunk of the stream into the core, and its positions on to the
-/// Navigator.
-fn fold_messages(shared: &Arc<Shared>, epoch: u64, msgs: &[Vec<u8>]) {
-    for index in shared.core.apply_messages(epoch, msgs) {
-        nav::position(shared, epoch, index);
+/// Finish one folded chunk and publish it once: forward its positions to the
+/// Navigator, end the dump if this chunk closed it, then publish the events
+/// and the single snapshot. Holding the publish until here is what folds a
+/// settled aim and a finished dump into the chunk's own snapshot instead of
+/// each raising one of its own.
+fn finish_chunk(shared: &Arc<Shared>, epoch: u64, mut chunk: super::core::Chunk, dump_ended: bool) {
+    for index in std::mem::take(&mut chunk.positions) {
+        let (events, slow) = nav::fold_position(shared, epoch, index);
+        chunk.events.extend(events);
+        chunk.slow |= slow;
     }
+    if dump_ended {
+        // The SyncCompleted rides in the chunk's event list, before its one
+        // snapshot, so an app that awaits it then reads the next snapshot is
+        // not left one behind.
+        chunk.events.extend(shared.core.end_dump_report(epoch));
+    }
+    shared.core.publish_chunk(epoch, &chunk.events, chunk.slow);
 }
 
-/// One chunk of control-link updates into the core, and its positions on to
-/// the Navigator.
+/// One read chunk of the stream into the core, its positions on to the
+/// Navigator, and one snapshot for the lot.
+fn fold_messages(shared: &Arc<Shared>, epoch: u64, msgs: &[Vec<u8>]) {
+    let chunk = shared.core.fold_message_chunk(epoch, msgs);
+    finish_chunk(shared, epoch, chunk, false);
+}
+
+/// One chunk of control-link updates into the core, its positions on to the
+/// Navigator, and one snapshot for the lot. `dump_ended` says this chunk
+/// carried the run that closed the dump.
 pub(crate) fn fold_updates(shared: &Arc<Shared>, epoch: u64, updates: &[crate::state::Update]) {
-    for index in shared.core.apply_updates(epoch, updates) {
-        nav::position(shared, epoch, index);
-    }
+    let chunk = shared.core.fold_update_chunk(epoch, updates);
+    finish_chunk(shared, epoch, chunk, false);
+}
+
+/// [`fold_updates`] for the control link, told whether this chunk ended the
+/// dump so the [`DeviceEvent::SyncCompleted`](crate::model::DeviceEvent::SyncCompleted)
+/// rides in its snapshot.
+fn fold_control(
+    shared: &Arc<Shared>,
+    epoch: u64,
+    updates: &[crate::state::Update],
+    dump_ended: bool,
+) {
+    let chunk = shared.core.fold_update_chunk(epoch, updates);
+    finish_chunk(shared, epoch, chunk, dump_ended);
 }
 
 // ---- the control link ------------------------------------------------------
@@ -117,38 +156,53 @@ pub(crate) fn fold_updates(shared: &Arc<Shared>, epoch: u64, updates: &[crate::s
 /// handshake, preamble, dump trigger), report it open, fold what it sends
 /// until the socket ends, report it lost.
 ///
-/// The dump phase starts with the trigger and ends when the run at
-/// [`generated::DUMP_END_ADDRESS`] — the item that always closes a dump — has
-/// been folded, or [`generated::DUMP_SETTLE_MS`] after the trigger if it never
-/// comes. Items up to and including the marker fold as [`Phase::Dump`], so a
-/// value pushed live meanwhile keeps its authority; everything after folds as
-/// [`Phase::Live`].
+/// The dump phase starts with the trigger and ends when the
+/// [`generated::DUMP_END_RUNS`]-th run based at [`generated::DUMP_END_ADDRESS`]
+/// has been folded, or [`generated::DUMP_SETTLE_MS`] after the trigger if it
+/// never comes. A real dump has two sections — a system section closed by one
+/// such run, then the rig section closed by a second — so a single run does
+/// not end the phase; the count is kept across reads. Items up to and
+/// including the closing run fold as [`Phase::Dump`], so a value pushed live
+/// meanwhile keeps its authority; everything after folds as [`Phase::Live`].
 ///
-/// `Err` is the open failing; the link ending after it opened is `Ok`, and so
-/// is finding another attempt already under way (the claim fails), since what
-/// was asked for is happening.
-pub(crate) async fn run_control(shared: Arc<Shared>, epoch: u64) -> Result<(), SessionError> {
+/// `opened` resolves the moment the link is open — `Ok(())` on open (or when a
+/// sibling attempt already holds the claim), `Err` when the open failed — so a
+/// caller that must know only whether the link came up need not await the whole
+/// life. The link ending after it opened is reported through `channels`, not
+/// here.
+pub(crate) async fn run_control(
+    shared: Arc<Shared>,
+    epoch: u64,
+    opened: oneshot::Sender<Result<(), SessionError>>,
+) {
     let core = &shared.core;
     // Claiming the link is what raises `Connecting`; it happens here, in the
     // task, so that a subscriber who joined right after `connect` returned
     // sees the whole `Connecting → Open` sequence.
     if !core.claim_control(epoch) {
-        return Ok(());
+        // Another attempt holds the claim: what was asked for is happening.
+        let _ = opened.send(Ok(()));
+        return;
     }
     shared.note_control_attempt();
     let mut link = match ControlLink::open(shared.ip, shared.opts.port, READ_IDLE).await {
         Ok(link) => link,
         Err(e) => {
             core.set_channel(epoch, Channel::Control, ChannelState::Unavailable);
-            return Err(e);
+            let _ = opened.send(Err(e));
+            return;
         }
     };
     core.begin_dump(epoch);
     core.set_channel(epoch, Channel::Control, ChannelState::Open);
+    let _ = opened.send(Ok(()));
 
     let settle = tokio::time::sleep(Duration::from_millis(generated::DUMP_SETTLE_MS));
     tokio::pin!(settle);
     let mut dumping = true;
+    // Runs based at DUMP_END_ADDRESS seen since the trigger. The phase ends at
+    // the DUMP_END_RUNS-th, so a lone run (the system section's) does not.
+    let mut end_runs = 0usize;
     loop {
         tokio::select! {
             _ = &mut settle, if dumping => {
@@ -163,20 +217,32 @@ pub(crate) async fn run_control(shared: Arc<Shared>, epoch: u64) -> Result<(), S
                     let mut ended = false;
                     let updates = if !dumping {
                         cbor::updates(&items, Phase::Live)
-                    } else if let Some(end) = cbor::dump_end_index(&items) {
-                        // The marker closes the dump; whatever follows it in
-                        // the same read is already live.
-                        ended = true;
-                        let mut updates = cbor::updates(&items[..=end], Phase::Dump);
-                        updates.extend(cbor::updates(&items[end + 1..], Phase::Live));
-                        updates
                     } else {
-                        cbor::updates(&items, Phase::Dump)
+                        // Find the run that carries the phase's end: the one
+                        // that brings the cumulative count to DUMP_END_RUNS.
+                        let mut split = None;
+                        for index in cbor::dump_end_indices(&items) {
+                            end_runs += 1;
+                            if end_runs >= generated::DUMP_END_RUNS {
+                                split = Some(index);
+                                break;
+                            }
+                        }
+                        match split {
+                            Some(end) => {
+                                // The closing run ends the dump; whatever
+                                // follows it in the same read is already live.
+                                ended = true;
+                                let mut updates = cbor::updates(&items[..=end], Phase::Dump);
+                                updates.extend(cbor::updates(&items[end + 1..], Phase::Live));
+                                updates
+                            }
+                            None => cbor::updates(&items, Phase::Dump),
+                        }
                     };
-                    fold_updates(&shared, epoch, &updates);
+                    fold_control(&shared, epoch, &updates, ended);
                     if ended {
                         dumping = false;
-                        core.end_dump(epoch, true);
                     }
                 }
                 Err(_) => {
@@ -186,7 +252,7 @@ pub(crate) async fn run_control(shared: Arc<Shared>, epoch: u64) -> Result<(), S
                         core.end_dump(epoch, false);
                     }
                     core.set_channel(epoch, Channel::Control, ChannelState::Lost);
-                    return Ok(());
+                    return;
                 }
             },
         }

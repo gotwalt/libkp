@@ -29,8 +29,10 @@ carrying — among much else — the current bank
 (:data:`libkp._generated.CURRENT_BANK_ADDRESS`) and rig slot
 (:data:`libkp._generated.CURRENT_RIG_SLOT_ADDRESS`), both 0-based, and the
 morph position (:data:`libkp._generated.MORPH_ADDRESS`). The write is
-non-mutating. The dump is recognised as finished by its last item, the run at
-:data:`libkp._generated.DUMP_END_ADDRESS` (docs/11).
+non-mutating. The dump has two sections -- the system state, then the loaded
+rig -- and each closes with a run based at
+:data:`libkp._generated.DUMP_END_ADDRESS`, so it is recognised as finished by
+the :data:`libkp._generated.DUMP_END_RUNS`-th such run (docs/11).
 """
 
 from __future__ import annotations
@@ -44,9 +46,9 @@ from dataclasses import dataclass, field
 
 from . import _generated as gen
 from ._broadcast import Broadcast
-from .errors import SessionError
+from .errors import ProtocolRejectedError, SessionError
 from .protocol import PORT
-from .session import PROTOCOL_CBOR_CONTROL, Session
+from .session import PROTOCOL_CBOR_CONTROL, HandshakeOutcome, Session, parse_protocol_list
 from .state import Decoded, DeviceState, Num, Text
 
 __all__ = [
@@ -496,8 +498,9 @@ class ControlItem:
 
     ``base`` is the item's own address -- a run's starting address, or the
     address of a single or a string -- kept because the state dump is
-    recognised as finished by the run whose base is
-    :data:`libkp._generated.DUMP_END_ADDRESS`. ``values`` are the
+    recognised as finished by the runs whose base is
+    :data:`libkp._generated.DUMP_END_ADDRESS` (one closes each of its two
+    sections). ``values`` are the
     ``(address, decoded)`` pairs the item carries, in item order: a
     :class:`~libkp.state.Num` per numeric, a :class:`~libkp.state.Text` per
     string. A ``[5, addr, bytes]`` blob, and any pair a 32-bit address or a
@@ -711,7 +714,15 @@ class ControlLink:
     by construction, not by convention.
     """
 
-    __slots__ = ("_session", "_on_items", "_on_closed", "_decoder", "_task", "_closed")
+    __slots__ = (
+        "_session",
+        "_on_items",
+        "_on_closed",
+        "_decoder",
+        "_pending",
+        "_task",
+        "_closed",
+    )
 
     def __init__(
         self,
@@ -723,6 +734,11 @@ class ControlLink:
         self._on_items = on_items
         self._on_closed = on_closed
         self._decoder = Decoder()
+        #: Items decoded from the acceptance line's tail, handed over by the
+        #: ingest task's first delivery so nothing that arrived before the
+        #: trigger is lost -- and nothing is delivered before the caller has
+        #: the link and has begun the dump.
+        self._pending: list = []
         self._task: asyncio.Task | None = None
         self._closed = False
 
@@ -737,20 +753,39 @@ class ControlLink:
         """Dial ``ip:port`` (paced by the connection ledger), select the control
         protocol, write the preamble and the dump trigger, and start ingesting.
 
+        The protocol is selected only if the greeting offers it. The generic
+        :meth:`~libkp.session.Session.handshake` falls back to the device's
+        first offered protocol when the preferred one is missing, which is
+        right for the stream and wrong here -- a control link on some other
+        protocol is not a control link -- so a greeting without it is a
+        :class:`~libkp.errors.ProtocolRejectedError`, raised before any
+        selection is written.
+
         ``on_items`` receives each read's items in order, the handshake tail's
-        first -- delivered before the trigger is written, since anything riding
-        on the acceptance predates the dump. ``on_closed`` is called once if the
-        device ends the socket, never after :meth:`close`. A failure anywhere
-        before the return -- the trigger write included -- closes the socket
-        and raises the :class:`~libkp.errors.SessionError`: a link that could
-        not ask for the dump has not opened.
+        first: they are held and delivered by the ingest task, after the
+        trigger is written and this has returned, so the caller has begun the
+        dump before anything folds. ``on_closed`` is called once if the device
+        ends the socket, never after :meth:`close`. A failure anywhere before
+        the return -- the trigger write included -- closes the socket and
+        raises the :class:`~libkp.errors.SessionError`: a link that could not
+        ask for the dump has not opened.
         """
         session = await Session.connect(ip, port)
         try:
-            outcome = await session.handshake([PROTOCOL_CBOR_CONTROL], _READ_IDLE)
+            greeting = await session.read_greeting(_READ_IDLE)
+            offered = parse_protocol_list(greeting)
+            if PROTOCOL_CBOR_CONTROL not in offered:
+                raise ProtocolRejectedError(PROTOCOL_CBOR_CONTROL, "not offered in the greeting")
+            response = await session.select_protocol(PROTOCOL_CBOR_CONTROL, _READ_IDLE)
             await session.write_session_preamble()
+            outcome = HandshakeOutcome(
+                greeting=greeting,
+                offered=offered,
+                selected=PROTOCOL_CBOR_CONTROL,
+                response=response,
+            )
             self = cls(session, on_items, on_closed)
-            self._deliver(self._decoder.push(outcome.response_tail()))
+            self._pending = self._decoder.push(outcome.response_tail())
             # Writing one item asks for the whole state; the reply is the burst
             # the stream opens with.
             await session.write_all(to_vec(state_dump_request()))
@@ -774,6 +809,10 @@ class ControlLink:
 
     async def _ingest(self) -> None:
         try:
+            # The handshake tail first, the way the first read would carry it.
+            pending, self._pending = self._pending, []
+            if pending:
+                self._deliver(pending)
             while True:
                 chunk = await self._session.read_once(_READ_IDLE, 64 * 1024)
                 if chunk:
