@@ -1,10 +1,11 @@
 """Live terminal view of the Profiler's current patch and realtime stream.
 
-Connects (discovering the device if no ``--ip`` is given), performs the
-read-only initial rig sync, then renders a full-screen ANSI view that updates
-straight off the stream:
+Connects (discovering the device if no ``--ip`` is given) with the model's
+default options -- the stream, the control link beside it, and the read-only
+request burst -- then renders a full-screen ANSI view that updates straight
+off the model:
 
-- the current rig name, author and tempo,
+- the current rig name, author, tempo and morph position,
 - the amp and cabinet names,
 - the eight effect blocks with on/off and effect type,
 - the tuner strobe with an in-tune / sharp / flat verdict,
@@ -301,10 +302,11 @@ def render(view: MeterView, state: DeviceState) -> str:
 
     line(
         f"{BOLD}KEMPER LIVE{RESET}  {DIM}{view.ip}{RESET}   "
-        f"frames {view.frames} ({view.message_rate():.1f}/s)"
+        f"frames {view.frames} ({view.message_rate():.1f}/s)   {DIM}{state.connection.value}{RESET}"
     )
     line()
-    line(f"  {BOLD}RIG{RESET}  {BOLD}{rig.name or '(unknown)'}{RESET}   {beat} {tempo}")
+    morph = "" if state.morph is None else f"   morph {state.morph / FULL_SCALE * 100:.0f}%"
+    line(f"  {BOLD}RIG{RESET}  {BOLD}{rig.name or '(unknown)'}{RESET}   {beat} {tempo}{morph}")
     author = rig.author or "—"
     line(f"  {DIM}by {author}{RESET}")
     line(f"  AMP  {_pad(state.amp.name or '—', 24)}CAB  {state.cabinet.name or '—'}")
@@ -347,7 +349,12 @@ def _field_index(ident: str) -> int:
 
 
 async def run(args: argparse.Namespace) -> int:
-    """Connect, sync, and render until the device hangs up or the user quits."""
+    """Connect, and render until the device hangs up or the user quits.
+
+    Bare ``connect``: the model's defaults open both links and run the burst,
+    and with no reconnect policy a lost stream is reported as
+    :class:`~libkp.state.Disconnected`, which is when this exits.
+    """
     ip = args.ip
     if ip is None:
         print("No --ip given; discovering...", file=sys.stderr)

@@ -2,12 +2,59 @@ import Foundation
 
 // MARK: - The data shape
 
-/// Whether a live session to the Profiler is currently open.
+/// Whether the model has a live stream to the Profiler, and how whole it is.
+///
+/// The stream link is what "connected" means: without it there is no state.
+/// The control link is best-effort by default, so its absence is a lesser
+/// condition, ``degraded``, in which everything but the control channel's own
+/// addresses (the morph position) keeps working. Every transition raises
+/// ``DeviceEvent/connectionChanged(_:)``.
 public enum Connection: Sendable, Equatable {
-    /// A session is open and the stream is being ingested.
-    case connected
-    /// No session (initial state, or the device closed the connection).
+    /// No stream (initial state, the device closed it, or ``DeviceModel/close()``).
     case disconnected
+    /// The stream was lost and the model is waiting out the backoff before
+    /// dialling again — only with ``ReconnectPolicy/stream`` set. `attempt`
+    /// counts from 1 and resets once a dial succeeds.
+    case reconnecting(attempt: UInt32)
+    /// The stream is open, and the control link is either open or was never
+    /// asked for (``ControlPolicy/off``).
+    case connected
+    /// The stream is open, but the control link was asked for and is
+    /// ``ChannelState/unavailable`` or ``ChannelState/lost``. The morph position
+    /// stops moving; nothing else is affected.
+    case degraded
+}
+
+/// Where one of the model's two links is in its life.
+public enum ChannelState: Sendable, Equatable {
+    /// Not open, and not by the device's doing: before the first attempt,
+    /// after ``DeviceModel/close()``, a control link never asked for
+    /// (``ControlPolicy/off``), or one the stream took down with it.
+    case closed
+    /// Dialling, handshaking, or writing the preamble.
+    case connecting
+    /// Open and being ingested.
+    case open
+    /// The open failed — the dial, the handshake, the preamble, or (for the
+    /// control link) the dump-trigger write.
+    case unavailable
+    /// Was open, then the device ended the socket. For the stream that is the
+    /// end of the life (``Connection/disconnected``, or a reconnect); for the
+    /// control link it is ``Connection/degraded`` while the stream stays up.
+    case lost
+}
+
+/// The state of the model's two links, one per ``Channel``.
+public struct Channels: Sendable, Equatable {
+    /// The MIDI3 stream — the link ``Connection`` is about.
+    public var stream: ChannelState
+    /// The CBOR control link, which carries the state dump and the morph.
+    public var control: ChannelState
+
+    public init(stream: ChannelState = .closed, control: ChannelState = .closed) {
+        self.stream = stream
+        self.control = control
+    }
 }
 
 /// The loaded rig's metadata and rig-wide settings.
@@ -210,8 +257,9 @@ public enum DeviceEvent: Sendable, Equatable {
     case tempoBpm(UInt16)
     /// The morph position changed (0 = base, 16383 = fully morphed).
     ///
-    /// Only a CBOR session ever sees this: the position is never sent on the
-    /// MIDI3 stream, even while a morph is ramping. See ``morphButton(on:)``.
+    /// Only the control link carries this: the position is never sent on the
+    /// MIDI3 stream, even while a morph is ramping, so a model whose control
+    /// link is down never raises it. See ``morphButton(on:)``.
     case morphChanged(UInt16)
     /// The morph button was pressed (`true`) or released (`false`) — momentary,
     /// so nothing about it is stored in the snapshot.
@@ -231,10 +279,27 @@ public enum DeviceEvent: Sendable, Equatable {
     /// for the new values (both 0-based); a `nil` here is a half not yet known,
     /// not a cleared one.
     case currentPosition(bank: UInt16?, slot: UInt16?)
-    /// The model connected to a device.
+    /// The stream came up: at connect, and again after a reconnect. Kept
+    /// alongside ``connectionChanged(_:)`` for callers that only care about the
+    /// two ends of the life.
     case connected
-    /// The device closed the connection.
+    /// The stream is gone and the model is not going to dial again: the device
+    /// closed it under the default ``ReconnectPolicy``, or ``DeviceModel/close()``
+    /// was called.
     case disconnected
+    /// ``DeviceState/connection`` moved — every transition, including the ones
+    /// ``connected`` and ``disconnected`` also announce.
+    case connectionChanged(Connection)
+    /// One of the two links moved. This is the only event that names a
+    /// channel; everything else is one tree, whichever wire fed it.
+    case channelChanged(channel: Channel, state: ChannelState)
+    /// A sync finished. ``Channel/stream``: the connect-time request burst's
+    /// last reply landed, or timed out. ``Channel/control``: the state dump
+    /// ended — its last run was folded, or the settle time elapsed.
+    case syncCompleted(source: Channel)
+    /// A request at `address` (`page * 128 + number`, or the extended address)
+    /// drew no reply inside ``Generated/requestTimeoutMs`` and was dropped.
+    case requestTimedOut(address: UInt32)
 }
 
 /// The result of applying one message to a ``DeviceState``: the granular events
@@ -281,9 +346,10 @@ public struct ApplyOutcome: Sendable, Equatable {
 /// morph position only ever arrives on the control channel. See the `wire`
 /// column of `spec/state.toml`.
 public enum Channel: Sendable, Equatable {
-    /// The MIDI3 SysEx stream (``DeviceModel``'s own session).
+    /// The MIDI3 SysEx stream — the model's stream link.
     case stream
-    /// The CBOR control channel (``CborSession``, the state dump).
+    /// The CBOR control channel — the model's control link, which asks for the
+    /// state dump when it opens and then carries live pushes.
     case control
 }
 
@@ -352,10 +418,15 @@ struct DumpGuard: Sendable, Equatable {
 /// A cheap-to-copy bag of plain data. Callers read fields directly
 /// (`state.rig.name`, `state.effects[0].on`, …). The decode logic in
 /// ``apply(_:)`` and ``applyUpdate(_:)`` is pure: no IO, no clock, so tests
-/// drive it with synthesized messages and hand-built updates.
+/// drive it with synthesized messages and hand-built updates. `connection` and
+/// `channels` are the one part the model writes on its own, from what its
+/// sockets do rather than from anything the device sent.
 public struct DeviceState: Sendable, Equatable {
-    /// Whether a live session is open.
+    /// Whether the stream is up, and whether the control link is beside it.
     public var connection: Connection
+    /// Where each of the two links is. `connection` summarises this; a client
+    /// that wants to know *which* link is down reads it here.
+    public var channels: Channels
     /// The loaded rig's metadata and settings.
     public var rig: Rig
     /// The amplifier block.
@@ -373,10 +444,9 @@ public struct DeviceState: Sendable, Equatable {
     /// Current bank, 0-based, once known. Kept live by the `$06` Extended
     /// Parameter the device sends at ``Generated/currentBankAddress`` whenever
     /// the bank changes — from the front panel as readily as from a controller —
-    /// and by the reply to ``DeviceModel/refreshPosition()``. Can also be seeded
-    /// before a session opens, from the CBOR state-dump snapshot
-    /// (``StateSnapshot/fetch(host:port:timeout:)``) via
-    /// ``DeviceModel/setCurrentPosition(bank:slot:)``.
+    /// by the reply to ``DeviceModel/refreshPosition()``, and by the control
+    /// link's copy, which the state dump carries too. Four sources, one row:
+    /// the tree dedupes, so a change is reported exactly once.
     public var currentBank: UInt16?
     /// Current rig slot within the bank, 0-based, once known. Same source as
     /// ``currentBank``, at ``Generated/currentRigSlotAddress``; slot 0 is rig
@@ -391,20 +461,22 @@ public struct DeviceState: Sendable, Equatable {
     }
     /// Latest morph position (0 = base, 16383 = fully morphed), once seen.
     ///
-    /// In practice filled only from a CBOR source — the state dump
-    /// (``StateSnapshot/morph``) or a CBOR session's live pushes — because the
-    /// MIDI3 stream never carries the position. A MIDI3-only client never
-    /// learns it, so this stays `nil` there.
+    /// Filled only by the control link — from the state dump it asks for on
+    /// opening, then from live pushes — because the MIDI3 stream never carries
+    /// the position and never answers a request for it. While the control link
+    /// is down (``Connection/degraded``) this holds its last value and stops
+    /// moving; with ``ControlPolicy/off`` it stays `nil`.
     public var morph: UInt16?
     /// The most recent realtime status / meter frame (the FAST lane).
     public var status: RealtimeStatus
     /// Dump-phase bookkeeping (``beginDump()``); never part of the snapshot.
     var dumpGuard = DumpGuard()
 
-    /// A fresh, empty state: disconnected, no rig data, all eight effect slots
-    /// seeded in signal-chain order, zeroed meters.
+    /// A fresh, empty state: disconnected with both links closed, no rig data,
+    /// all eight effect slots seeded in signal-chain order, zeroed meters.
     public init() {
         connection = .disconnected
+        channels = Channels()
         rig = Rig()
         amp = Amp()
         cabinet = Cabinet()
@@ -451,33 +523,52 @@ extension DeviceState {
     /// - Anything else → ignored.
     @discardableResult
     public mutating func apply(_ msg: [UInt8]) -> ApplyOutcome {
-        guard let (header, values) = NrpnHeader.parse(msg) else { return .empty }
+        switch DeviceState.decode(msg) {
+        case .update(let update)?:
+            return applyUpdate(update)
+        case let .renderedString(page, number, value, text)?:
+            return .fast(.renderedString(page: page, number: number, value: value, text: text))
+        case nil:
+            return .empty
+        }
+    }
+
+    /// Decode ONE unframed MIDI message as far as the funnel needs it, without
+    /// touching the tree. ``apply(_:)`` is this plus the fold; the model's
+    /// ingest uses it directly so it can see the address a message names —
+    /// that is what answers a pending request, whether or not the value
+    /// changed anything.
+    static func decode(_ msg: [UInt8]) -> StreamMessage? {
+        guard let (header, values) = NrpnHeader.parse(msg) else { return nil }
         let flat = UInt32(header.page) * 128 + UInt32(header.number)
 
         switch header.function {
         case Generated.fnSingleParam:
-            guard values.count >= 2 else { return .empty }
+            guard values.count >= 2 else { return nil }
             let value = Nrpn.u14(values[0], values[1])
-            return applyUpdate(Update.stream(flat, .num(UInt64(value))))
+            return .update(Update.stream(flat, .num(UInt64(value))))
         case Generated.fnMultiParam:
             let block = Nrpn.multiValues(number: header.number, values: values).map(\.value)
-            return applyUpdate(Update.stream(flat, .block(block)))
+            return .update(Update.stream(flat, .block(block)))
         case Generated.fnStringParam:
-            return applyUpdate(Update.stream(flat, .text(Fmt.textUntilNul(values[...]))))
+            return .update(Update.stream(flat, .text(Fmt.textUntilNul(values[...]))))
         case Generated.fnExtParam:
             // The extended ($06) and extended-string ($07) addresses are 5×7-bit
             // encoded and do not fit the fixed header layout, so both decode off
             // the raw message. The value spans 35 bits; the row's range check
             // decides whether it fits the field.
-            guard let (address, raw) = Nrpn.parseExtendedParam(msg) else { return .empty }
-            return applyUpdate(Update.stream(address, .num(raw)))
+            guard let (address, raw) = Nrpn.parseExtendedParam(msg) else { return nil }
+            return .update(Update.stream(address, .num(raw)))
         case Generated.fnExtStringParam:
-            guard let (address, text) = Nrpn.parseExtendedString(msg) else { return .empty }
-            return applyUpdate(Update.stream(address, .text(text)))
+            guard let (address, text) = Nrpn.parseExtendedString(msg) else { return nil }
+            return .update(Update.stream(address, .text(text)))
         case Generated.fnRenderedStringReply:
-            return applyRenderedString(msg)
+            guard let (page, number, value, text) = Nrpn.parseRenderedString(msg) else {
+                return nil
+            }
+            return .renderedString(page: page, number: number, value: value, text: text)
         default:
-            return .empty
+            return nil
         }
     }
 
@@ -485,8 +576,8 @@ extension DeviceState {
     ///
     /// The CBOR channel and the MIDI3 stream are two wire formats over one event
     /// universe, so a value arriving either way lands in the same field and
-    /// raises the same event. This is the entry point for a ``CborSession``'s
-    /// live pushes; the state dump's items go through ``applyUpdate(_:)`` tagged
+    /// raises the same event. This is what a live push off the control channel
+    /// becomes; the state dump's items go through ``applyUpdate(_:)`` tagged
     /// ``Phase/dump`` so a live push can outrank them (``beginDump()``).
     ///
     /// A negative value is nothing the tree stores and is dropped; a value too
@@ -524,12 +615,15 @@ extension DeviceState {
         dumpGuard = DumpGuard()
     }
 
-    /// Route a `$3C` Rendered String reply. It carries a value's exact display
-    /// text but is *not* stored in the snapshot tree.
-    private func applyRenderedString(_ msg: [UInt8]) -> ApplyOutcome {
-        guard let (page, number, value, text) = Nrpn.parseRenderedString(msg) else { return .empty }
-        return .fast(.renderedString(page: page, number: number, value: value, text: text))
-    }
+}
+
+/// One MIDI3 message decoded as far as the funnel needs it: an ``Update`` on
+/// the stream channel, or the one message that stays outside the routing table
+/// — the `$3C` rendered-string reply, which is a transient event and never
+/// state.
+enum StreamMessage: Sendable, Equatable {
+    case update(Update)
+    case renderedString(page: UInt8, number: UInt8, value: UInt16, text: String)
 }
 
 extension Update {

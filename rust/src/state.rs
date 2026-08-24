@@ -23,13 +23,65 @@ use crate::nrpn::{
 };
 use crate::params;
 
-/// Whether a live session to the Profiler is currently open.
+/// Where the model stands with the device as a whole — the one word an app keys
+/// its connection indicator on. The two links underneath it are reported
+/// separately in [`Channels`]; this is their summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Connection {
-    /// A session is open and the stream is being ingested.
-    Connected,
-    /// No session (initial state, or the device closed the connection).
+    /// No session: the initial state, the device closed the stream and no
+    /// reconnect policy was set, or the model was closed.
     Disconnected,
+    /// The stream was lost and the model is waiting out its backoff before it
+    /// dials again. `attempt` counts from 1 and starts over once a dial
+    /// succeeds.
+    Reconnecting {
+        /// Which retry is pending, counting from 1.
+        attempt: u32,
+    },
+    /// The stream is open and the control link is wherever its policy says it
+    /// should be: open, or never asked for.
+    Connected,
+    /// The stream is open but the control link, which was asked for, is not —
+    /// it could not be opened, or it was lost. Everything the stream carries
+    /// still flows; only what the control link alone carries (the morph
+    /// position) has gone stale.
+    Degraded,
+}
+
+/// The life of one of the model's two links to the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelState {
+    /// Not asked for: the policy is off, or the first attempt has not started.
+    Closed,
+    /// Dialing, or in the handshake.
+    Connecting,
+    /// Streaming.
+    Open,
+    /// The open failed — the dial, the handshake, or (for the control link)
+    /// the write of the dump trigger.
+    Unavailable,
+    /// Was open, then the socket ended.
+    Lost,
+}
+
+/// The state of both links, as they really are. The stream is the session the
+/// model cannot do without; the control link is the CBOR channel that carries
+/// the state dump and the morph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Channels {
+    /// The MIDI3 stream.
+    pub stream: ChannelState,
+    /// The CBOR control channel.
+    pub control: ChannelState,
+}
+
+impl Default for Channels {
+    fn default() -> Self {
+        Channels {
+            stream: ChannelState::Closed,
+            control: ChannelState::Closed,
+        }
+    }
 }
 
 /// Which wire carried an [`Update`].
@@ -268,8 +320,11 @@ impl Eq for DumpGuard {}
 /// [`subscribe`](crate::model::DeviceModel::subscribe) stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceState {
-    /// Whether a live session is open.
+    /// Where the model stands with the device: the summary of
+    /// [`channels`](Self::channels).
     pub connection: Connection,
+    /// The state of the stream and the control link, as they really are.
+    pub channels: Channels,
     /// The loaded rig's metadata and settings.
     pub rig: Rig,
     /// The amplifier block.
@@ -299,10 +354,10 @@ pub struct DeviceState {
     /// Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
     /// `0x00/0x77`).
     ///
-    /// Filled only from a CBOR source — the state dump
-    /// ([`StateSnapshot::morph`](crate::cbor::StateSnapshot::morph)) or a CBOR
-    /// session's live pushes. A MIDI3-only client never learns it, so this stays
-    /// `None` there.
+    /// Filled only over the CBOR control link — its state dump, then its live
+    /// pushes — because the position never appears on the MIDI3 stream. A model
+    /// whose control link is off, unavailable or lost never learns it, so this
+    /// stays `None` (or goes stale) there; `channels.control` says which.
     pub morph: Option<u16>,
     /// The most recent realtime status / meter frame (the FAST lane).
     pub status: RealtimeStatus,
@@ -335,6 +390,7 @@ impl DeviceState {
         });
         DeviceState {
             connection: Connection::Disconnected,
+            channels: Channels::default(),
             rig: Rig::default(),
             amp: Amp::default(),
             cabinet: Cabinet::default(),
@@ -396,63 +452,30 @@ impl DeviceState {
     ///   not a parameter.
     /// - Anything else → ignored.
     pub fn apply(&mut self, msg: &[u8]) -> ApplyOutcome {
-        let Some((h, vals)) = NrpnHeader::parse(msg) else {
-            return ApplyOutcome::empty();
-        };
-        let address = u32::from(h.page) * 128 + u32::from(h.number);
-        let decoded = match h.function {
-            // The extended forms carry 5×7-bit fields that do not fit the fixed
-            // header layout, so they are parsed off the raw message.
-            FUNCTION_EXT_PARAM => {
-                let Some((address, value)) = nrpn::parse_extended_param(msg) else {
-                    return ApplyOutcome::empty();
-                };
-                return self.apply_stream(address, Decoded::Num(value));
-            }
-            FUNCTION_EXT_STRING_PARAM => {
-                let Some((address, text)) = nrpn::parse_extended_string(msg) else {
-                    return ApplyOutcome::empty();
-                };
-                return self.apply_stream(address, Decoded::Text(text));
-            }
-            FUNCTION_STRING_PARAM => Decoded::Text(ascii_until_nul(vals)),
-            FUNCTION_SINGLE_PARAM => {
-                if vals.len() < 2 {
-                    return ApplyOutcome::empty();
-                }
-                Decoded::Num(u64::from(u14(vals[0], vals[1])))
-            }
-            // Consecutive 14-bit values from `number` on; a trailing odd byte is
-            // ignored, as `nrpn::multi_values` does.
-            FUNCTION_MULTI_PARAM => Decoded::Block(
-                vals.chunks_exact(2)
-                    .map(|pair| u14(pair[0], pair[1]))
-                    .collect(),
-            ),
-            FUNCTION_RENDERED_STRING_REPLY => {
-                let Some((page, number, value, text)) = nrpn::parse_rendered_string(msg) else {
-                    return ApplyOutcome::empty();
-                };
-                return ApplyOutcome::fast(DeviceEvent::RenderedString {
-                    page,
-                    number,
-                    value,
-                    text,
-                });
-            }
-            _ => return ApplyOutcome::empty(),
-        };
-        self.apply_stream(address, decoded)
+        match decode_stream(msg) {
+            StreamMessage::Update(update) => self.apply_update(&update),
+            StreamMessage::Rendered {
+                page,
+                number,
+                value,
+                text,
+            } => ApplyOutcome::fast(DeviceEvent::RenderedString {
+                page,
+                number,
+                value,
+                text,
+            }),
+            StreamMessage::Ignored => ApplyOutcome::empty(),
+        }
     }
 
     /// Fold one **CBOR** numeric address/value into the tree.
     ///
     /// The CBOR channel and the MIDI3 stream are two wire formats over one event
     /// universe, so a value arriving either way lands in the same field and
-    /// raises the same event. This is the entry point for a
-    /// [`CborSession`](crate::cbor::CborSession)'s live pushes; a state dump's
-    /// items go through [`apply_update`](Self::apply_update) tagged
-    /// [`Phase::Dump`] so the dump cannot overwrite a fresher live value.
+    /// raises the same event. This is the live-push decoder for a control-link
+    /// item; a state dump's items go through [`apply_update`](Self::apply_update)
+    /// tagged [`Phase::Dump`] so the dump cannot overwrite a fresher live value.
     ///
     /// The channel's integers are signed; no tracked row holds a negative value,
     /// so a negative is dropped here rather than reinterpreted.
@@ -494,15 +517,82 @@ impl DeviceState {
         self.dump.active = false;
         self.dump.touched.clear();
     }
+}
 
-    /// One live update off the stream.
-    fn apply_stream(&mut self, address: u32, decoded: Decoded) -> ApplyOutcome {
-        self.apply_update(&Update {
+/// What one unframed MIDI3 message decodes to, before the tree sees it.
+///
+/// [`DeviceState::apply`] is the decode followed by the fold; the model's core
+/// runs the two halves itself so that it can see the address a message
+/// carries and settle a pending request on it, which the folded
+/// [`ApplyOutcome`] alone cannot tell it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamMessage {
+    /// A value for the funnel: source [`Channel::Stream`], phase [`Phase::Live`].
+    Update(Update),
+    /// A `$3C` rendered-string reply: a transient event, never routed.
+    Rendered {
+        page: u8,
+        number: u8,
+        value: u16,
+        text: String,
+    },
+    /// Non-Kemper, malformed, or a function the tree does not decode.
+    Ignored,
+}
+
+/// Decode one unframed MIDI3 message. See [`DeviceState::apply`] for the
+/// per-function rules; this is the half of it that touches no state.
+pub(crate) fn decode_stream(msg: &[u8]) -> StreamMessage {
+    let Some((h, vals)) = NrpnHeader::parse(msg) else {
+        return StreamMessage::Ignored;
+    };
+    let address = u32::from(h.page) * 128 + u32::from(h.number);
+    let live = |address, decoded| {
+        StreamMessage::Update(Update {
             source: Channel::Stream,
             phase: Phase::Live,
             address,
             decoded,
         })
+    };
+    match h.function {
+        // The extended forms carry 5×7-bit fields that do not fit the fixed
+        // header layout, so they are parsed off the raw message.
+        FUNCTION_EXT_PARAM => match nrpn::parse_extended_param(msg) {
+            Some((address, value)) => live(address, Decoded::Num(value)),
+            None => StreamMessage::Ignored,
+        },
+        FUNCTION_EXT_STRING_PARAM => match nrpn::parse_extended_string(msg) {
+            Some((address, text)) => live(address, Decoded::Text(text)),
+            None => StreamMessage::Ignored,
+        },
+        FUNCTION_STRING_PARAM => live(address, Decoded::Text(ascii_until_nul(vals))),
+        FUNCTION_SINGLE_PARAM => {
+            if vals.len() < 2 {
+                return StreamMessage::Ignored;
+            }
+            live(address, Decoded::Num(u64::from(u14(vals[0], vals[1]))))
+        }
+        // Consecutive 14-bit values from `number` on; a trailing odd byte is
+        // ignored, as `nrpn::multi_values` does.
+        FUNCTION_MULTI_PARAM => live(
+            address,
+            Decoded::Block(
+                vals.chunks_exact(2)
+                    .map(|pair| u14(pair[0], pair[1]))
+                    .collect(),
+            ),
+        ),
+        FUNCTION_RENDERED_STRING_REPLY => match nrpn::parse_rendered_string(msg) {
+            Some((page, number, value, text)) => StreamMessage::Rendered {
+                page,
+                number,
+                value,
+                text,
+            },
+            None => StreamMessage::Ignored,
+        },
+        _ => StreamMessage::Ignored,
     }
 }
 

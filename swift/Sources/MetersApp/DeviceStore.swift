@@ -192,9 +192,6 @@ final class DeviceStore: ObservableObject {
     }
 
     private var model: DeviceModel?
-    /// The CBOR channel held alongside ``model``, when it opened. It carries the
-    /// morph position, which the streaming session never reports.
-    private var cborSession: CborSession?
     private var tasks: [Task<Void, Never>] = []
     private var epoch = 0
     /// The UDP discovery port, taken on first use and held for as long as this
@@ -237,34 +234,12 @@ final class DeviceStore: ObservableObject {
     private static let pendingWindow: TimeInterval = 1.5
     /// How long to wait before another attempt after a failure.
     private static let retryDelay: TimeInterval = 4
-    /// Breathing room between one connection closing and the next opening — the
-    /// device resets, or silently refuses to greet, a session opened immediately
-    /// after the previous socket closed. The value is the shared protocol
-    /// constant, so all implementations space connections the same way.
-    private static let connectionSpacing = Session.connectionCooldown
     /// The render tick — about 30 frames a second.
     private static let tickInterval: TimeInterval = 0.033
     /// The trailing window the message rate is averaged over.
     private static let rateWindow: TimeInterval = 2
     /// How long discovery listens for replies.
     private static let discoveryWindow: TimeInterval = 3
-
-    /// The handful of values the header shows that the initial rig sync does
-    /// not cover. These are requests, so nothing on the device changes.
-    ///
-    /// The morph position is deliberately absent: it is CBOR-only, so a request
-    /// for it on this session draws no reply and this app cannot show it. See
-    /// ``RigHeaderView``.
-    private static let extraParams: [(page: UInt8, number: UInt8)] = [
-        (Generated.ampPage, Generated.ampOnNumber),
-        (Generated.ampPage, Generated.gainNumber),
-        (Generated.pageRigSettings, Generated.tempoNumber),
-        (Generated.pageRigSettings, Generated.rigVolumeNumber),
-        (Generated.systemPage, Generated.mainVolumeNumber),
-        // Headphone + Monitor together are the physical Master Volume knob.
-        (Generated.systemPage, Generated.headphoneVolumeNumber),
-        (Generated.systemPage, Generated.monitorVolumeNumber),
-    ]
 
     // MARK: - Lifecycle
 
@@ -284,19 +259,15 @@ final class DeviceStore: ObservableObject {
 
         for task in tasks { task.cancel() }
         tasks.removeAll()
-        if let cborSession {
-            self.cborSession = nil
-            Task { await cborSession.close() }
-        }
         navigationTask?.cancel()
         navigationTask = nil
         moveInFlight = false
         sentIndex = nil
         pending = nil
         selectedSlot = nil
-        // Hand the outgoing model to the connect loop so it can close it *before*
-        // — and spaced from — the next connection, rather than racing a
-        // fire-and-forget close against the new CBOR fetch.
+        // Hand the outgoing model to the connect loop so it is closed *before*
+        // the next connection is dialled; the library's connection ledger then
+        // spaces the dial from that close.
         let closing = model
         model = nil
 
@@ -315,15 +286,13 @@ final class DeviceStore: ObservableObject {
     /// Resolve an address, connect, and attach the streams — retrying on a
     /// timer until it works or the epoch moves on.
     ///
-    /// `closing` is the previous session, if any. The device refuses a new
-    /// session that follows a close too closely, so it is closed and spaced
-    /// before the first connection attempt.
+    /// `closing` is the previous model, if any. The device refuses a new
+    /// session that follows a close too closely; the library's connection
+    /// ledger waits that out inside the next connect, so the close only has to
+    /// come first.
     private func runConnectLoop(epoch: Int, closing: DeviceModel?) async {
         if let closing {
             await closing.close()
-            try? await Task.sleep(
-                nanoseconds: UInt64(DeviceStore.connectionSpacing * 1_000_000_000))
-            guard epoch == self.epoch else { return }
         }
         while !Task.isCancelled && epoch == self.epoch {
             let defaults = UserDefaults.standard
@@ -383,28 +352,15 @@ final class DeviceStore: ObservableObject {
                 self.model = model
                 phase = .connected(host: host, name: name)
 
-                // `DeviceModel.connect` already ran the read-only rig sync.
-                Log.conn("requesting \(DeviceStore.extraParams.count) extra header params")
-                for (page, number) in DeviceStore.extraParams {
-                    try? await model.requestParam(page: page, number: number)
-                }
-                guard epoch == self.epoch else { return }
-
+                // `DeviceModel.connect` already queued the read-only sync burst
+                // — every header value included — and is opening the control
+                // link that carries the morph position in the background.
                 attachStreams(to: model, epoch: epoch)
 
-                // `DeviceModel.connect` asked the device where it is as part of
-                // its sync; the `$06` replies land on the stream we just
-                // subscribed to. Ask again, so a reply that beat the
-                // subscription is not the only one.
+                // The burst asked the device where it is; the `$06` replies
+                // land on the stream we just subscribed to. Ask again, so a
+                // reply that beat the subscription is not the only one.
                 try? await model.refreshPosition()
-
-                // Then the second channel. Neither one carries everything: the
-                // meter lane and the momentary events are MIDI3-only, while the
-                // morph position is CBOR-only. Holding both is the only way to
-                // show the whole device. Two read-only sessions coexist happily
-                // — it is connection *churn* the device objects to — so they are
-                // spaced by the cooldown and then simply left open.
-                await openCborSession(host: host, epoch: epoch)
                 return
             } catch {
                 guard epoch == self.epoch else { return }
@@ -412,38 +368,6 @@ final class DeviceStore: ObservableObject {
                 phase = .failed(message: "Could not connect to \(host): \(error)")
                 await waitBeforeRetry()
             }
-        }
-    }
-
-    /// Open the CBOR channel alongside the streaming session and pipe its values
-    /// into the model, so one state tree carries what both channels know.
-    ///
-    /// Non-fatal: if it fails the app runs on MIDI3 alone, which costs the morph
-    /// readout and nothing else. It is deliberately not retried in a loop — the
-    /// device is fragile under reconnection churn, and a missing morph is not
-    /// worth risking the session that carries the meters.
-    private func openCborSession(host: String, epoch: Int) async {
-        try? await Task.sleep(nanoseconds: UInt64(DeviceStore.connectionSpacing * 1_000_000_000))
-        guard epoch == self.epoch else { return }
-        do {
-            let session = try await CborSession.connect(host: host)
-            guard epoch == self.epoch else {
-                await session.close()
-                return
-            }
-            cborSession = session
-            Log.conn("CBOR channel open alongside the stream")
-            tasks.append(
-                Task {
-                    for await update in await session.updates() {
-                        guard epoch == self.epoch else { return }
-                        guard let model = self.model else { continue }
-                        await model.applyCbor(address: update.address, value: update.value)
-                    }
-                    Log.conn("CBOR channel closed")
-                })
-        } catch {
-            Log.conn("CBOR channel unavailable (\(error)) — morph will not be shown")
         }
     }
 
@@ -480,9 +404,11 @@ final class DeviceStore: ObservableObject {
                 for await event in await model.events() {
                     guard epoch == self.epoch else { return }
                     self.handle(event)
+                    // The model does not dial again on its own (this app keeps
+                    // its own retry loop for now), so this is the device
+                    // hanging up; the stream itself finishes only on close.
+                    if case .disconnected = event { self.handleStreamEnd(epoch: epoch) }
                 }
-                // The stream only finishes when the device hangs up.
-                self.handleStreamEnd(epoch: epoch)
             })
 
         tasks.append(
@@ -507,7 +433,7 @@ final class DeviceStore: ObservableObject {
     /// The device closed the connection: say so, then start over.
     private func handleStreamEnd(epoch: Int) {
         guard epoch == self.epoch else { return }
-        Log.conn("event stream finished — the device closed the connection")
+        Log.conn("the device closed the connection")
         phase = .failed(message: "The device closed the connection. Retrying…")
         tasks.append(
             Task {
@@ -521,10 +447,12 @@ final class DeviceStore: ObservableObject {
 
     /// Whether the rig is morphed — its position is past halfway.
     ///
-    /// `nil` until the CBOR channel reports a position; the streaming session
-    /// never does, so a MIDI3-only run has no morph state to show.
+    /// `nil` while the position is unavailable: the model's control link is
+    /// down (``LibKP/Connection/degraded``), or it has not yet delivered the
+    /// dump that carries the position. The streaming session never reports it.
     var isMorphed: Bool? {
-        state.morph.map { $0 > Generated.fullScale / 2 }
+        guard state.connection != .degraded else { return nil }
+        return state.morph.map { $0 > Generated.fullScale / 2 }
     }
 
     /// Morph to the rig's morphed sound, or back to its base.
@@ -534,8 +462,9 @@ final class DeviceStore: ObservableObject {
     /// alternates direction per press. A toggle wants a destination, not a
     /// direction, and the pedal is the control that names one.
     ///
-    /// The device does not echo the write; the position comes back on the CBOR
-    /// channel, so the readout follows the device rather than this call.
+    /// The device does not echo the write; the position comes back on the
+    /// model's control link, so the readout follows the device rather than
+    /// this call.
     func setMorphed(_ morphed: Bool) {
         guard let model else { return }
         Log.cmd("setMorphed \(morphed) (CC11 -> \(morphed ? 127 : 0))")
@@ -561,7 +490,7 @@ final class DeviceStore: ObservableObject {
         Task {
             do {
                 try await model.setEffectEnabled(slot, !on)
-                try await model.requestParam(page: effect.page, number: Params.effectParamState)
+                _ = try await model.requestParam(page: effect.page, number: Params.effectParamState)
             } catch {
                 Log.cmd("toggleEffect \(slot) failed: \(error)")
             }

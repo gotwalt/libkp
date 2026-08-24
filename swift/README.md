@@ -31,7 +31,10 @@ Requires Swift 6.0 or newer and macOS 13+.
 | `Sources/LibKP/Registry.swift` | Typed parameter descriptors and value formatting |
 | `Sources/LibKP/State.swift` | The state tree and the decoders in front of its fold |
 | `Sources/LibKP/Routes.swift` | The fold: one routing table, one funnel, whichever wire carried the value |
-| `Sources/LibKP/DeviceModel.swift` | The `actor` that owns the session and publishes state |
+| `Sources/LibKP/Cbor.swift` | The CBOR decoder/encoder, the control link, and the `CborSession` / `StateSnapshot` tooling built on it |
+| `Sources/LibKP/DeviceModel.swift` | The `actor` that owns both links and publishes state |
+| `Sources/LibKP/Link.swift` | Connect options, the stream link, and the supervisor: connect order, reconnect, channel health |
+| `Sources/LibKP/Lane.swift` | The request lane: requests that resolve with their reply, and `refresh()` |
 | `Sources/meters/main.swift` | A live full-screen terminal view |
 | `Sources/MetersApp/` | The same dashboard as a native SwiftUI macOS app |
 
@@ -61,19 +64,25 @@ is FAST or SLOW. An address with no row is untracked. Between `beginDump()` and
 `endDump()` — the CBOR state dump — a live push outranks the dump's stale copy
 of the same address.
 
-`DeviceModel` is the **async handle**: an actor that owns an `NWConnection`,
-runs an ingest loop, and publishes both a coalesced snapshot stream and a
-granular event stream.
+`DeviceModel` is the **async handle**: an actor that owns every socket to the
+device and publishes both a coalesced snapshot stream and a granular event
+stream. It holds two links: the MIDI3 **stream**, which is required and is what
+`connected` means, and — by default — the CBOR **control** link, which asks
+for the device's state dump when it opens and then carries what the stream
+never does, the morph position above all. Both feed the one tree, so an app
+sees one handle, one snapshot, one event stream, and never a channel name
+except in the `channelChanged` event.
 
 ```swift
 import LibKP
 
 let model = try await DeviceModel.connect(host: "192.168.1.50")
 
-// The store: a fresh snapshot whenever slow state changes.
+// The store: the current state first, then a fresh snapshot whenever slow
+// state changes. Finishes only on close().
 Task {
     for await state in await model.snapshots() {
-        print(state.rig.name ?? "—", state.effect("REV")?.on ?? false)
+        print(state.rig.name ?? "—", state.morph ?? 0, state.effect("REV")?.on ?? false)
     }
 }
 
@@ -81,9 +90,35 @@ Task {
 let meters = await model.status().raw
 
 try await model.setEffectEnabled("REV", false)   // a tracked parameter
+let on = try await model.requestParam(page: 0x3D, number: 3)  // a request, answered
 try await model.tapTempo()                       // a momentary action
 try await model.send(control: .freeze(true))     // any raw control
+await model.close()                              // both links; the streams finish
 ```
+
+`connect(host:port:options:)` takes a `ConnectOptions`; the defaults are the
+recommended session, and a bare `connect` is all the examples use:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `control` | `.bestEffort` | Open the control link after the stream, in the background. `.off` never opens it (`connection` is `.connected` on the stream alone, the morph stays `nil`); `.required` fails `connect` if it cannot open. |
+| `sync` | `.streamBurst` | Send the 46-request burst (`refresh()`) as soon as the stream is up: string tags, effect types and states, the bank preview, the position, the header values. `.off` asks for nothing. |
+| `reconnect.stream` | `nil` | With a `Backoff` (`Backoff.defaultStream()` is 4 s doubling to 30 s), a lost stream is dialled again on the same handle — same streams, same tree — through `.reconnecting(attempt:)` until it is `.connected` again or `close()` is called. `nil` reports `.disconnected` and stops. |
+| `reconnect.controlReopen` | `nil` | Reopen a lost control link this long after losing it (never inside `Generated.controlReopenMinGapMs`). `nil` never reopens it; `reopenControl()` is the explicit way, refused with `ChannelError.tooSoon` inside the gap. |
+
+`state.connection` is `.disconnected`, `.reconnecting(attempt:)`, `.connected`
+or `.degraded` — the last meaning the stream is up but a control link that was
+asked for is `.unavailable` (its open failed) or `.lost` (it dropped); the tree
+keeps working, only the morph stops moving. `state.channels` says which link is
+where. Every transition of either is an event (`connectionChanged`,
+`channelChanged`), and `connected` / `disconnected` are still raised at the two
+ends of a life.
+
+`CborSession` and `StateSnapshot.fetch` remain as tooling — a raw tap on the
+control channel, and a one-shot dump read — built on the same control-link
+code the model uses. An app that holds a model should not open either beside
+it: the model already has the dump and the live pushes, and a third session is
+churn the device objects to.
 
 Discovery is a one-liner when the address is unknown:
 
@@ -111,7 +146,8 @@ let replies = try await port.poll()
 State is classified into two lanes. **FAST** is the meter `RealtimeStatus`
 block, the beat pulse and tuner deviance — high-rate data best polled through
 `status()`. **SLOW** is everything else; those changes drive the coalesced
-`snapshots()` stream, at most one snapshot per ingested stream chunk.
+`snapshots()` stream, at most one snapshot per ingested chunk from either link
+— the whole state dump is one snapshot.
 
 ### Parameters vs actions
 
@@ -124,14 +160,21 @@ block, the beat pulse and tuner deviance — high-rate data best polled through
 - **Actions** (`tapTempo`, `rigUp`, `selectRig`, `send(control:)`, …) are
   momentary presses and live expression. They go out as 7-bit Control Change
   messages and are *not* reflected in state.
-- **Requests** (`refreshRig`, `requestParam`, `requestString`,
-  `requestRender`) are read-only: they ask the device for values and change
-  nothing.
+- **Requests** (`requestParam`, `requestString`, `requestExtParam`,
+  `requestExtString`, `requestRender`, and `refresh` with its `refreshRig` /
+  `refreshBank` / `refreshPosition` subsets) are read-only: they ask the
+  device for values and change nothing. Each travels the request lane — at
+  most `Generated.maxInFlightRequests` on the wire, the rest queued — and
+  returns the value that lands at its address (folding it into the tree on the
+  way), or throws `RequestError.timeout` after `Generated.requestTimeoutMs`
+  with no retry. The morph position is `RequestError.unreadable` without a
+  byte sent: the stream never answers it, the control link carries it.
 
 ## The `meters` example
 
-A live full-screen terminal view built on `DeviceModel`. On connect it runs the
-read-only rig sync, then renders the current patch and block status.
+A live full-screen terminal view built on `DeviceModel`. A bare `connect` runs
+the read-only sync burst and opens the control link; it then renders the
+current patch and block status, and exits when the device hangs up.
 
 ```sh
 swift run meters                     # discover a device on the LAN
@@ -167,14 +210,18 @@ swift run MetersApp
 It discovers a device on the LAN by default. Settings (⌘,) switches to a manual
 IP for a device discovery cannot reach, and toggles the level list between the
 three bar meters and all eleven raw fields. When the device drops the
-connection the app says so and reconnects on its own.
+connection the app says so and reconnects on its own. The morph readout comes
+from the model's control link; while the model is `.degraded` it shows `—`.
 
 ## Tests
 
 `swift test` runs two things:
 
 1. **Unit tests** for each layer — framing, builders, parsers, the control
-   vocabulary, name lookups, descriptors, and the decode routing.
+   vocabulary, name lookups, descriptors, the decode routing, and the model's
+   links and request lane against an in-process fake device
+   (`Tests/LibKPTests/FakeDevice.swift`), which serves any number of MIDI3 and
+   CBOR connections on a loopback port.
 2. **The shared conformance suite**, which loads every file in
    [`../spec/vectors`](../spec/vectors) and every fixture listed in
    [`../spec/captures`](../spec/captures) and asserts this implementation
