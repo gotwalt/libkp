@@ -404,9 +404,13 @@ impl DeviceState {
     /// current_rig_slot` — once both halves are known.
     ///
     /// This is the device's own numbering, and the only address that can name a
-    /// rig outside the current bank.
+    /// rig outside the current bank. `None` too for halves whose product
+    /// leaves sixteen bits — a garbled wire value must yield no index, not a
+    /// trap or a wrap into a plausible one.
     pub fn current_rig_index(&self) -> Option<u16> {
-        Some(self.current_bank? * generated::BANK_SLOTS as u16 + self.current_rig_slot?)
+        let flat = u32::from(self.current_bank?) * generated::BANK_SLOTS as u32
+            + u32::from(self.current_rig_slot?);
+        u16::try_from(flat).ok()
     }
 
     /// The rig index a UI should show and step from: the Navigator's aim
@@ -1334,9 +1338,9 @@ mod tests {
             ]
         );
         assert_eq!((st.rig.tempo_bpm, st.rig.volume), (Some(120), Some(9000)));
-        // A block at the meter base but not the meter's length is not the frame:
-        // its elements are numerics at `multi` rows, which take no numeric, so
-        // each falls through to the generic report and `status` is untouched.
+        // A block at the meter base is the frame whatever its length: a
+        // short read zero-fills the tail rather than spraying a run of
+        // generic reports at meter rate.
         let base = u32::from(PAGE_REALTIME) * 128 + u32::from(METER_BLOCK_NUMBER);
         let out = st.apply_update(&Update {
             source: Channel::Stream,
@@ -1345,22 +1349,13 @@ mod tests {
             decoded: Decoded::Block(vec![1, 2]),
         });
         assert!(!out.slow_changed);
+        let mut raw = [0u16; crate::generated::METER_COUNT];
+        (raw[0], raw[1]) = (1, 2);
         assert_eq!(
             out.events,
-            vec![
-                DeviceEvent::ParamChanged {
-                    page: PAGE_REALTIME,
-                    number: METER_BLOCK_NUMBER,
-                    value: 1
-                },
-                DeviceEvent::ParamChanged {
-                    page: PAGE_REALTIME,
-                    number: METER_BLOCK_NUMBER + 1,
-                    value: 2
-                },
-            ]
+            vec![DeviceEvent::Status(RealtimeStatus { raw })]
         );
-        assert_eq!(st.status, RealtimeStatus::default());
+        assert_eq!(st.status, RealtimeStatus { raw });
     }
 
     #[test]

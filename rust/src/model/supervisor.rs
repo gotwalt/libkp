@@ -55,7 +55,7 @@ pub(crate) struct Shared {
 /// the ledger's close stamp — before it returns.
 #[derive(Default)]
 struct Life {
-    commands: Option<mpsc::Sender<Vec<u8>>>,
+    commands: Option<mpsc::Sender<Vec<Vec<u8>>>>,
     stream: Option<JoinHandle<()>>,
     control: Option<JoinHandle<()>>,
     sync: Option<AbortHandle>,
@@ -120,25 +120,37 @@ impl Shared {
             .clone()
             .ok_or(CommandError::Disconnected)?;
         sender
-            .send(bytes)
+            .send(vec![bytes])
             .await
             .map_err(|_| CommandError::Disconnected)
     }
 
-    /// Put raw MIDI bytes on the current life's command queue without
-    /// waiting: what a caller that must return at once — the Navigator's
-    /// tap — uses. A full queue is refused as [`CommandError::Disconnected`]
-    /// rather than waited out; sixty-four unwritten commands mean the wire is
-    /// not draining, and a rig load queued behind them would land who knows
-    /// when.
-    pub(crate) fn try_enqueue(&self, bytes: Vec<u8>) -> Result<(), CommandError> {
+    /// Put the Navigator's two-message rig load on the current life's
+    /// command queue without waiting: a tap must return at once. Both
+    /// messages go as one queue item, written back to back; a full queue is
+    /// refused as [`CommandError::Disconnected`] rather than waited out —
+    /// sixty-four unwritten commands mean the wire is not draining, and a
+    /// rig load queued behind them would land who knows when — and a refusal
+    /// queues neither, so no orphaned bank preselect is left arming the
+    /// device for a load that never followed.
+    pub(crate) fn try_enqueue_pair(
+        &self,
+        first: Vec<u8>,
+        second: Vec<u8>,
+    ) -> Result<(), CommandError> {
         let sender = self
             .life()
             .commands
             .clone()
             .ok_or(CommandError::Disconnected)?;
+        // The pair travels as one queue item, but it is two commands: refuse
+        // it unless the queue has room for both, the bound Swift's per-command
+        // queue applies, so all three languages refuse at the same depth.
+        if sender.capacity() < 2 {
+            return Err(CommandError::Disconnected);
+        }
         sender
-            .try_send(bytes)
+            .try_send(vec![first, second])
             .map_err(|_| CommandError::Disconnected)
     }
 

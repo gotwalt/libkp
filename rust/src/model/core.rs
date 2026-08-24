@@ -182,16 +182,17 @@ impl Core {
         }
         let mut events = Vec::new();
         let mut slow = false;
+        let mut positions = Vec::new();
         {
             let mut st = self.write();
             for update in updates {
                 let outcome = st.apply_update(update);
                 events.extend(outcome.events);
                 slow |= outcome.slow_changed;
+                positions.extend(outcome.positions);
             }
         }
         self.settle_updates(updates);
-        let positions = positions(&events);
         Chunk {
             events,
             slow,
@@ -207,6 +208,7 @@ impl Core {
         let decoded: Vec<StreamMessage> = msgs.iter().map(|m| decode_stream(m)).collect();
         let mut events = Vec::new();
         let mut slow = false;
+        let mut positions = Vec::new();
         let mut updates = Vec::new();
         {
             let mut st = self.write();
@@ -216,6 +218,7 @@ impl Core {
                         let outcome = st.apply_update(&update);
                         events.extend(outcome.events);
                         slow |= outcome.slow_changed;
+                        positions.extend(outcome.positions);
                         updates.push(update);
                     }
                     StreamMessage::Rendered {
@@ -235,7 +238,6 @@ impl Core {
         }
         self.settle_updates(&updates);
         self.settle_rendered(&events);
-        let positions = positions(&events);
         Chunk {
             events,
             slow,
@@ -605,7 +607,14 @@ impl Core {
             match &update.decoded {
                 Decoded::Num(v) => self.deliver(PendingKey::Num(update.address), Reply::Num(*v)),
                 Decoded::Text(t) => {
-                    self.deliver(PendingKey::Text(update.address), Reply::Text(t.clone()))
+                    // The fold redacts a secret before it stores; a request's
+                    // reply must not hand out what the tree refuses to.
+                    let text = if crate::cbor::is_sensitive(update.address) {
+                        generated::REDACTED_PLACEHOLDER.to_string()
+                    } else {
+                        t.clone()
+                    };
+                    self.deliver(PendingKey::Text(update.address), Reply::Text(text))
                 }
                 Decoded::Block(values) => {
                     for (i, v) in values.iter().enumerate() {
@@ -686,19 +695,30 @@ impl Core {
     }
 }
 
-/// The flat rig indices a chunk's [`DeviceEvent::CurrentPosition`] events
-/// carry, in order — every one whose two halves are both known. The
-/// Navigator is told each of them: only a report equal to its aim means
-/// anything to it, and it is the one to judge that.
-fn positions(events: &[DeviceEvent]) -> Vec<u16> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            DeviceEvent::CurrentPosition {
-                bank: Some(bank),
-                slot: Some(slot),
-            } => Some(bank * generated::BANK_SLOTS as u16 + slot),
-            _ => None,
-        })
-        .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Phase;
+
+    /// The request lane hands out what the fold would store: a text reply at
+    /// a sensitive address is the placeholder, never the secret.
+    #[test]
+    fn request_replies_are_redacted_at_sensitive_addresses() {
+        let core = Core::new(ControlPolicy::Off);
+        let secret = generated::SENSITIVE_ADDRESSES[0];
+        let (_id, mut redacted) = core.register(PendingKey::Text(secret));
+        let (_id, mut clear) = core.register(PendingKey::Text(1));
+        let text = |address, text: &str| Update {
+            source: Channel::Control,
+            phase: Phase::Live,
+            address,
+            decoded: Decoded::Text(text.to_string()),
+        };
+        core.settle_updates(&[text(secret, "hunter2"), text(1, "AC30")]);
+        assert_eq!(
+            redacted.try_recv().unwrap(),
+            Reply::Text(generated::REDACTED_PLACEHOLDER.to_string())
+        );
+        assert_eq!(clear.try_recv().unwrap(), Reply::Text("AC30".to_string()));
+    }
 }

@@ -1217,7 +1217,8 @@ final class NavigatorTests: XCTestCase {
     }
 
     /// An aim the device never confirms — past the last rig — is dropped after
-    /// the window, and the same index may be tried again afterwards.
+    /// the window, and the same index may be tried again afterwards. 639 is
+    /// the last index the wire can name (bank 127, slot 5).
     func testAnUnconfirmedAimIsDroppedAfterTheWindow() async throws {
         let device = try FakeDevice()
         defer { device.stop() }
@@ -1226,14 +1227,14 @@ final class NavigatorTests: XCTestCase {
         let stream = await device.connections(atLeast: 1)[0]
 
         let started = ContinuousClock.Instant.now
-        await model.navigateTo(999)
+        await model.navigateTo(639)
         // The device stays put and says so; that is not the aim.
         report(13, on: stream)
         let seen = await events.wait(within: .seconds(4)) {
-            $0.contains(.navigationDropped(index: 999, reason: .unconfirmed))
+            $0.contains(.navigationDropped(index: 639, reason: .unconfirmed))
         }
         let elapsed = started.duration(to: .now)
-        XCTAssertTrue(seen.contains(.navigationDropped(index: 999, reason: .unconfirmed)))
+        XCTAssertTrue(seen.contains(.navigationDropped(index: 639, reason: .unconfirmed)))
         XCTAssertGreaterThanOrEqual(
             elapsed,
             .milliseconds(Generated.rigLoadSettleMs + Generated.pendingWindowMs) - .milliseconds(30)
@@ -1241,11 +1242,47 @@ final class NavigatorTests: XCTestCase {
         let state = await model.snapshot()
         XCTAssertEqual(state.navigation, Navigation())
         XCTAssertEqual(state.aimedRigIndex, 13, "the device's position is the truth again")
-        XCTAssertEqual(stream.received, loadPair(999), "an index already sent is never re-sent")
+        XCTAssertEqual(stream.received, loadPair(639), "an index already sent is never re-sent")
 
-        await model.navigateTo(999)
+        await model.navigateTo(639)
         let received = await stream.received(atLeast: 4)
-        XCTAssertEqual(received, loadPair(999) + loadPair(999), "a drop forgets the sent index")
+        XCTAssertEqual(received, loadPair(639) + loadPair(639), "a drop forgets the sent index")
+        await model.close()
+    }
+
+    /// The bank preselect is a 7-bit CC value: an aim whose bank does not
+    /// fit (index ≥ 128 × bankSlots) is dropped immediately with nothing on
+    /// the wire — masking the bank would silently load a real but wrong rig.
+    func testAnIndexTheWireCannotNameIsDroppedAtOnce() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await connect(device)
+        let (events, _) = await attach(model)
+        let stream = await device.connections(atLeast: 1)[0]
+
+        let index = UInt16(128 * Params.bankSlots)
+        await model.navigateTo(index)
+        let seen = await events.wait {
+            $0.contains(.navigationDropped(index: index, reason: .unconfirmed))
+        }
+        XCTAssertTrue(seen.contains(.navigationDropped(index: index, reason: .unconfirmed)))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.navigation, Navigation())
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(stream.received, [], "nothing goes on the wire")
+        await model.close()
+    }
+
+    /// The request lane hands out what the fold would store: a string reply
+    /// at a sensitive address is the placeholder, never the secret.
+    func testASensitiveStringReplyIsRedacted() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let secret = Generated.sensitiveAddresses[0]
+        device.configure { $0.strings[secret] = "hunter2" }
+        let model = try await connect(device)
+        let text = try await model.requestExtString(address: secret)
+        XCTAssertEqual(text, Generated.redactedPlaceholder)
         await model.close()
     }
 

@@ -2,7 +2,7 @@
 #![allow(clippy::all)]
 #![cfg_attr(rustfmt, rustfmt::skip)]
 
-pub const SPEC_VERSION: &str = "0.7.0";
+pub const SPEC_VERSION: &str = "0.8.0";
 
 // Transport
 pub const PORT: u16 = 5727;

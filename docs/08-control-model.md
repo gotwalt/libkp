@@ -288,15 +288,21 @@ Since the device pushes the whole landed rig itself, there is no read-back after
 a move.
 
 **The device confirms, or it does not.** A position report that matches the
-aim, from either wire, retires it with `NavigationSettled`. How many rigs a
-device holds varies and nothing in the protocol announces it, so nothing here
-assumes a ceiling: aim past the end and the device stays put and says so in its
-position push, which does not match; the aim is kept for `pending_window_ms`
-(1.5 s) after the move settled and then dropped with `NavigationDropped`, and
-the device's own position is the truth again. An index already on the wire is
-never sent again while it stands. With the stream down an aim is dropped at
-once, the same way, rather than raising: an aim is a destination, not a
-command that failed.
+aim, from either wire, retires it with `NavigationSettled`. Re-loading the rig
+already loaded still confirms: the device's position push carries the values
+already stored, and the tree dedupes the *event*, but the report itself still
+reaches the Navigator — confirmation rides on pushes, not on changes. How many
+rigs a device holds varies and nothing in the protocol announces it, so
+nothing here assumes a ceiling: aim past the end and the device stays put and
+says so in its position push, which does not match; the aim is kept for
+`pending_window_ms` (1.5 s) after the move settled and then dropped with
+`NavigationDropped`, and the device's own position is the truth again. The
+wire itself has a ceiling, though: the bank preselect is a 7-bit CC value, so
+an index at or past `128 × bank_slots` cannot be expressed at all and is
+dropped at once — masking the bank would silently load a real but wrong rig.
+An index already on the wire is never sent again while it stands. With the
+stream down an aim is dropped at once, the same way, rather than raising: an
+aim is a destination, not a command that failed.
 
 The state machine is pure — `NavigatorState`, four fields and four inputs —
 and pinned by [`../spec/vectors/navigation.json`](../spec/vectors/navigation.json),

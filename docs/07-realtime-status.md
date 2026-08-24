@@ -23,6 +23,12 @@ are eleven ordinary NRPN parameters at addresses **`$7C`/78 through `$7C`/88**.
 They can be read individually with `$41`; the block is simply the efficient
 push form.
 
+A `$02` at the base is taken as the frame **whatever its length**: a truncated
+read zero-fills the missing tail, and values past the eleven are ignored. Only
+the base address decides — a `$02` anywhere else is an ordinary multi-parameter
+write. A frame is never split into per-address generic reports, so a short read
+cannot flood the event stream at meter rate.
+
 | | |
 |---|---|
 | Page | `$7C` (124) |

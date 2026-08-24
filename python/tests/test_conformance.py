@@ -31,7 +31,7 @@ from libkp.state import (
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.7.0"
+    assert gen.SPEC_VERSION == "0.8.0"
 
 
 def test_every_vector_file_is_covered():
@@ -422,6 +422,8 @@ def test_state_apply(case):
         assert [_event_name(e) for o in outcomes for e in o.events] == expect["events"]
     if "slow_steps" in expect:
         assert sum(o.slow_changed for o in outcomes) == expect["slow_steps"]
+    if "positions" in expect:
+        assert [p for o in outcomes for p in o.positions] == expect["positions"]
 
 
 # ---------------------------------------------------------------------------

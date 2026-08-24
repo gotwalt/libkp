@@ -623,6 +623,12 @@ class ApplyOutcome:
 
     events: list[DeviceEvent] = field(default_factory=list)
     slow_changed: bool = False
+    #: Every flat rig index this update reported for the Navigator: a position
+    #: row that stored -- or deduped an unchanged report -- with both halves
+    #: known and the index inside sixteen bits. A deduped report raises no
+    #: event, but the Navigator still needs it: re-loading the rig already
+    #: loaded is confirmed by a push that changes nothing.
+    positions: list[int] = field(default_factory=list)
 
     @classmethod
     def empty(cls) -> ApplyOutcome:
@@ -774,11 +780,13 @@ class DeviceState:
 
         ``current_bank * BANK_SLOTS + current_rig_slot`` -- the device's own
         numbering, and the only address that can name a rig outside the current
-        bank.
+        bank. ``None`` too for halves whose product leaves sixteen bits: a
+        garbled wire value must yield no index, not a plausible-looking one.
         """
         if self.current_bank is None or self.current_rig_slot is None:
             return None
-        return self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
+        flat = self.current_bank * gen.BANK_SLOTS + self.current_rig_slot
+        return flat if flat <= 0xFFFF else None
 
     @property
     def aimed_rig_index(self) -> int | None:
@@ -896,10 +904,11 @@ class DeviceState:
         In order:
 
         1. Look the address up in :data:`libkp._generated.STATE_ROUTES`. A
-           :class:`Block` matches a ``multi`` row only at the block's base and at
-           the block's full span, and then decodes as one unit (the meter frame);
-           any other block folds element by element as :class:`Num` updates at
-           ``address + i``, merging the outcomes.
+           :class:`Block` at a ``multi`` row's base decodes as one unit (the
+           meter frame) whatever its length -- a short block zero-fills the
+           tail, a long one is cut at the span; any other block folds element
+           by element as :class:`Num` updates at ``address + i``, merging the
+           outcomes.
         2. No row, or a row whose ``kind`` does not take this shape (a string at a
            numeric row, a numeric at a text row): nothing is stored. The stream
            still reports a numeric in the page/number space as a generic
@@ -915,18 +924,15 @@ class DeviceState:
         5. Dump authority (see :meth:`begin_dump`).
         6. Dedupe: a row with ``dedupe`` set and the decoded value already stored
            is a no-op -- no event, no snapshot. The momentaries and the meter
-           frame never dedupe; every arrival is the information.
+           frame never dedupe; every arrival is the information. A deduped
+           position row still reports its (unchanged) flat index in
+           :attr:`ApplyOutcome.positions`.
         7. Store, and raise the row's event: FAST rows raise the event only, SLOW
            rows also flag the snapshot.
         """
         route = _routes.lookup(u.address)
         if isinstance(u.decoded, Block):
-            if (
-                route is None
-                or route.kind is not gen.Kind.MULTI
-                or route.slot != 0
-                or len(u.decoded.values) != _routes.span(route)
-            ):
+            if route is None or route.kind is not gen.Kind.MULTI or route.slot != 0:
                 return self._fold_elements(u, u.decoded.values)
         elif route is None or not _accepts(route.kind, u.decoded):
             return self._untracked(u)
@@ -945,11 +951,17 @@ class DeviceState:
                 return ApplyOutcome.empty()
 
         if route.dedupe and _routes.read(self, route) == value:
-            return ApplyOutcome.empty()
+            # A silenced position update still reports the (unchanged) index:
+            # the Navigator is confirmed by pushes, not by changes.
+            return ApplyOutcome(positions=self._position_report(route.field))
 
         _routes.write(self, route, value)
         events = self._events_for(route, u, value)
-        return ApplyOutcome(events=events, slow_changed=route.lane is gen.Lane.SLOW)
+        return ApplyOutcome(
+            events=events,
+            slow_changed=route.lane is gen.Lane.SLOW,
+            positions=self._position_report(route.field),
+        )
 
     # -- fold helpers ------------------------------------------------------
 
@@ -960,7 +972,18 @@ class DeviceState:
             step = self.apply_update(Update(u.source, u.phase, u.address + i, Num(value)))
             out.events.extend(step.events)
             out.slow_changed = out.slow_changed or step.slow_changed
+            out.positions.extend(step.positions)
         return out
+
+    def _position_report(self, field: gen.Field) -> list[int]:
+        """What a position row reports for the Navigator once it has folded
+        (or deduped): the flat rig index, when both halves are known and it
+        fits sixteen bits. Every other row reports nothing."""
+        if field in (gen.Field.CURRENT_BANK, gen.Field.CURRENT_RIG_SLOT):
+            index = self.current_rig_index
+            if index is not None:
+                return [index]
+        return []
 
     def _untracked(self, u: Update) -> ApplyOutcome:
         """An address the tree does not store.
@@ -1064,7 +1087,11 @@ def _decode(kind: gen.Kind, decoded: Decoded, address: int) -> object | None:
     fader position that wrapped would be a plausible-looking lie.
     """
     if isinstance(decoded, Block):
-        return RealtimeStatus(raw=decoded.values)
+        # The frame whatever the block's length: a short read zero-fills the
+        # tail, an extra value is ignored.
+        raw = decoded.values[: gen.METER_COUNT]
+        raw += (0,) * (gen.METER_COUNT - len(raw))
+        return RealtimeStatus(raw=raw)
     if isinstance(decoded, Text):
         # A device secret the dump volunteers in the clear must never be stored.
         if address in gen.SENSITIVE_ADDRESSES:

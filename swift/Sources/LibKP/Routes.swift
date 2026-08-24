@@ -58,7 +58,11 @@ enum Stored: Equatable {
             // routed sensitive address stores the placeholder, never the secret.
             self = .text(Cbor.isSensitive(address) ? Generated.redactedPlaceholder : t)
         case (.multi, .block(let values)):
-            self = .frame(values)
+            // The frame whatever the block's length: a short read zero-fills
+            // the tail, an extra value is ignored.
+            var raw = Array(values.prefix(Generated.meterCount))
+            raw.append(contentsOf: repeatElement(0, count: Generated.meterCount - raw.count))
+            self = .frame(raw)
         default:
             // A kind/shape mismatch never reaches here: `accepts` screens it.
             return nil
@@ -99,10 +103,11 @@ extension DeviceState {
     ///
     /// The rules, in order (see `docs/09` and the header of `spec/state.toml`):
     ///
-    /// 1. **Lookup** the row for the address. A `$02` block is the meter frame
-    ///    only when it sits exactly on the meter block's base with the block's
-    ///    full span; any other block is a run of singles at consecutive
-    ///    addresses, each folded on its own.
+    /// 1. **Lookup** the row for the address. A `$02` block at the meter
+    ///    block's base is the frame whatever its length — a short block
+    ///    zero-fills the tail, a long one is cut at the span; a block
+    ///    anywhere else is a run of singles at consecutive addresses, each
+    ///    folded on its own.
     /// 2. **No route**: a numeric off the stream at a paged address is still a
     ///    generic ``DeviceEvent/paramChanged(page:number:value:)`` (FAST, no
     ///    state); anything else untracked is silent.
@@ -119,7 +124,9 @@ extension DeviceState {
     ///    dropped — the push is newer than the dump's copy.
     /// 7. **Dedupe**: a row with `dedupe` that already holds the value is a
     ///    no-op — no event, no snapshot. The momentaries and the meter frame
-    ///    never dedupe; their every arrival is the information.
+    ///    never dedupe; their every arrival is the information. Dedupe
+    ///    silences the event, not the Navigator: a position row still reports
+    ///    the (unchanged) index in ``ApplyOutcome/positions``.
     /// 8. **Store and report**: write the field, raise the row's event; a
     ///    `fast` row is event only, a `slow` row also flags the snapshot.
     @discardableResult
@@ -127,7 +134,7 @@ extension DeviceState {
         // 1. Lookup.
         let route = Routes.lookup(update.address)
         if case .block(let values) = update.decoded,
-            !(route?.kind == .multi && route?.slot == 0 && values.count == Generated.meterCount)
+            !(route?.kind == .multi && route?.slot == 0)
         {
             var out = ApplyOutcome.empty
             for (i, value) in values.enumerated() {
@@ -155,12 +162,31 @@ extension DeviceState {
             case .dump: if dumpGuard.touched.contains(update.address) { return .empty }
             }
         }
-        // 7. Dedupe.
+        // 7. Dedupe. A silenced position update still reports the
+        // (unchanged) index: the Navigator is confirmed by pushes, not by
+        // changes.
         let changed = set(route.field, slot: route.slot, value)
-        if route.dedupe && !changed { return .empty }
+        if route.dedupe && !changed {
+            return ApplyOutcome(positions: positionReport(route.field))
+        }
         // 8. Report.
         let events = events(for: route, value, wire: update.decoded)
-        return ApplyOutcome(events: events, slowChanged: route.lane == .slow)
+        return ApplyOutcome(
+            events: events, slowChanged: route.lane == .slow,
+            positions: positionReport(route.field))
+    }
+
+    /// What a position row reports for the Navigator once it has folded (or
+    /// deduped): the flat rig index, when both halves are known and it fits
+    /// sixteen bits. Every other row reports nothing.
+    private func positionReport(_ field: Route.Field) -> [UInt16] {
+        switch field {
+        case .currentBank, .currentRigSlot:
+            guard let index = currentRigIndex else { return [] }
+            return [index]
+        default:
+            return []
+        }
     }
 
     /// Rule 2: what an untracked value still does. The stream reports any

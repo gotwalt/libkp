@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import NamedTuple
 
-SPEC_VERSION = "0.7.0"
+SPEC_VERSION = "0.8.0"
 
 PORT = 5727
 CONNECT_TIMEOUT_SECS = 5

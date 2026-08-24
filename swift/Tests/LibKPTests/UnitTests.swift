@@ -1166,11 +1166,10 @@ final class StateTests: XCTestCase {
         XCTAssertNil(Routes.lookup(102_405))
     }
 
-    /// A `$02` block anywhere but exactly on the meter frame is a run of
-    /// singles at consecutive addresses, each folded on its own — including
-    /// a short block at the meter base, whose elements are numerics at
-    /// `multi` rows, which take no numeric, so each falls through to the
-    /// stream's generic report and `status` is untouched.
+    /// A `$02` block off the meter base is a run of singles at consecutive
+    /// addresses, each folded on its own. At the base it is the frame
+    /// whatever its length: a short read zero-fills the tail rather than
+    /// spraying a run of generic reports at meter rate.
     func testABlockOffTheMeterBaseFoldsElementByElement() {
         var state = DeviceState()
         let settings = UInt32(Generated.pageRigSettings) * 128
@@ -1190,15 +1189,10 @@ final class StateTests: XCTestCase {
         let short = state.applyUpdate(
             Update(source: .stream, phase: .live, address: base, decoded: .block([1, 2])))
         XCTAssertFalse(short.slowChanged)
-        XCTAssertEqual(
-            short.events,
-            [
-                .paramChanged(
-                    page: Generated.pageRealtime, number: Generated.meterBlockNumber, value: 1),
-                .paramChanged(
-                    page: Generated.pageRealtime, number: Generated.meterBlockNumber + 1, value: 2),
-            ])
-        XCTAssertEqual(state.status, RealtimeStatus())
+        var raw = [UInt16](repeating: 0, count: Generated.meterCount)
+        (raw[0], raw[1]) = (1, 2)
+        XCTAssertEqual(short.events, [.status(RealtimeStatus(raw: raw))])
+        XCTAssertEqual(state.status, RealtimeStatus(raw: raw))
     }
 
     /// A row dedupes on the decoded value: a `bool` row arriving as `1` and

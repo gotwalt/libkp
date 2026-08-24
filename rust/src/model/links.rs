@@ -61,7 +61,7 @@ pub(crate) fn spawn_stream(
     epoch: u64,
     session: Session,
     tail: Vec<u8>,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
+) -> (mpsc::Sender<Vec<Vec<u8>>>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
     let loss = shared.stream_ended();
     let task = tokio::spawn(async move {
@@ -77,7 +77,7 @@ async fn run_stream(
     epoch: u64,
     mut session: Session,
     tail: Vec<u8>,
-    mut commands: mpsc::Receiver<Vec<u8>>,
+    mut commands: mpsc::Receiver<Vec<Vec<u8>>>,
 ) {
     let mut unframer = Unframer::new();
     // Decode anything that rode in on the handshake acceptance tail.
@@ -90,8 +90,14 @@ async fn run_stream(
                 Err(_) => return,
             },
             cmd = commands.recv() => match cmd {
-                Some(bytes) => {
-                    if session.write_all(&midi3::frame(&bytes)).await.is_err() {
+                Some(batch) => {
+                    // One item is one or more messages framed into a single
+                    // write, so the Navigator's pair cannot be split apart.
+                    let mut framed = Vec::new();
+                    for bytes in &batch {
+                        framed.extend_from_slice(&midi3::frame(bytes));
+                    }
+                    if session.write_all(&framed).await.is_err() {
                         return;
                     }
                 }

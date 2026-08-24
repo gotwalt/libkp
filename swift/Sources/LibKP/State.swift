@@ -316,10 +316,17 @@ public struct ApplyOutcome: Sendable, Equatable {
     public var events: [DeviceEvent]
     /// Whether a slow (snapshot-visible) field changed.
     public var slowChanged: Bool
+    /// Every flat rig index this update reported for the Navigator: a
+    /// position row that stored — or deduped an unchanged report — with both
+    /// halves known and the index inside sixteen bits. A deduped report
+    /// raises no event, but the Navigator still needs it: re-loading the rig
+    /// already loaded is confirmed by a push that changes nothing.
+    public var positions: [UInt16]
 
-    public init(events: [DeviceEvent] = [], slowChanged: Bool = false) {
+    public init(events: [DeviceEvent] = [], slowChanged: Bool = false, positions: [UInt16] = []) {
         self.events = events
         self.slowChanged = slowChanged
+        self.positions = positions
     }
 
     /// Nothing happened.
@@ -340,6 +347,7 @@ public struct ApplyOutcome: Sendable, Equatable {
     mutating func merge(_ other: ApplyOutcome) {
         events.append(contentsOf: other.events)
         slowChanged = slowChanged || other.slowChanged
+        positions.append(contentsOf: other.positions)
     }
 }
 
@@ -469,7 +477,10 @@ public struct DeviceState: Sendable, Equatable {
     /// only address that can name a rig outside the current bank.
     public var currentRigIndex: UInt16? {
         guard let currentBank, let currentRigSlot else { return nil }
-        return currentBank * UInt16(Params.bankSlots) + currentRigSlot
+        // Wide math, then bounds-checked: a garbled bank value off the wire
+        // must yield no index, not a trap or a wrap into a plausible one.
+        let flat = UInt32(currentBank) * UInt32(Params.bankSlots) + UInt32(currentRigSlot)
+        return UInt16(exactly: flat)
     }
     /// The flat rig index navigation steps *from*: the Navigator's outstanding
     /// aim while it has one, otherwise ``currentRigIndex``. The device takes a

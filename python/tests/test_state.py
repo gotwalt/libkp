@@ -527,17 +527,15 @@ def test_a_block_off_the_meter_base_folds_element_by_element():
     assert out.slow_changed
     assert out.events == [TempoBpm(120), ParamChanged(gen.PAGE_RIG_SETTINGS, 1, 9000)]
     assert (state.rig.tempo_bpm, state.rig.volume) == (120, 9000)
-    # A block at the meter base but not the meter's length is not the frame: its
-    # elements are numerics at ``multi`` rows, which take no numeric, so each
-    # falls through to the stream's generic report and ``status`` is untouched.
+    # A block at the meter base is the frame whatever its length: a short
+    # read zero-fills the tail rather than spraying a run of generic reports
+    # at meter rate.
     base = gen.PAGE_REALTIME * 128 + gen.METER_BLOCK_NUMBER
     out = state.apply_update(Update(Channel.STREAM, Phase.LIVE, base, Block((1, 2))))
     assert not out.slow_changed
-    assert out.events == [
-        ParamChanged(gen.PAGE_REALTIME, gen.METER_BLOCK_NUMBER, 1),
-        ParamChanged(gen.PAGE_REALTIME, gen.METER_BLOCK_NUMBER + 1, 2),
-    ]
-    assert state.status == RealtimeStatus()
+    raw = (1, 2) + (0,) * (gen.METER_COUNT - 2)
+    assert out.events == [Status(RealtimeStatus(raw=raw))]
+    assert state.status == RealtimeStatus(raw=raw)
 
 
 def test_a_string_at_a_numeric_row_is_untracked():

@@ -796,16 +796,21 @@ class ControlLink:
         return self
 
     async def close(self) -> None:
-        """Stop ingesting and close the socket. Idempotent."""
+        """Stop ingesting and close the socket. Idempotent -- and the socket
+        is closed (and the connection ledger stamped) even if this coroutine
+        is cancelled mid-close, since a link nobody can re-close must not
+        leak."""
         if self._closed:
             return
         self._closed = True
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
-        await self._session.close()
+        try:
+            if self._task is not None:
+                self._task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._task
+                self._task = None
+        finally:
+            await self._session.close()
 
     async def _ingest(self) -> None:
         try:
@@ -914,9 +919,11 @@ class CborSession:
 
         The first subscriber also receives whatever arrived before it subscribed,
         so the state dump is not lost to the gap between :meth:`connect` and this
-        call.
+        call. The queue is unbounded: the backlog alone can hold thousands of
+        dump values, and a raw capture stream is read for every one of them,
+        not the latest.
         """
-        queue = self._updates.subscribe()
+        queue = self._updates.subscribe(maxsize=0)
         while self._backlog:
             queue.put_nowait(self._backlog.popleft())
         return queue

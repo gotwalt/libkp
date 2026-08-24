@@ -16,6 +16,7 @@ from fake_device import FakeDevice, answer_requests, ext_param, wait_for
 
 from libkp import _generated as gen
 from libkp import cbor
+from libkp._link import COMMAND_QUEUE_DEPTH, StreamLink
 from libkp.errors import (
     ChannelOffError,
     ChannelTooSoonError,
@@ -519,6 +520,28 @@ def test_an_unsolicited_push_at_the_address_resolves_a_request():
                 await model.close()
 
     assert run(scenario()) == 42
+
+
+def test_a_sensitive_reply_is_redacted_on_the_request_path():
+    """The dump volunteers the WiFi credentials in the clear; a request's
+    reply hands out the placeholder, exactly as the fold and the snapshot
+    tooling do."""
+    secret = gen.SENSITIVE_ADDRESSES[1]
+
+    async def scenario():
+        async with FakeDevice(offer_cbor=True) as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=NO_SYNC)
+            events = model.events()
+            try:
+                await next_event(events, SyncCompleted)
+                request = asyncio.ensure_future(model.request_ext_string(secret))
+                await wait_for(lambda: len(device.received) == 1)
+                await device.push_items([cbor.Tag(1, [4, secret, "hunter2"])])
+                return await request
+            finally:
+                await model.close()
+
+    assert run(scenario()) == gen.REDACTED_PLACEHOLDER
 
 
 def test_at_most_sixteen_requests_are_on_the_wire_at_once():
@@ -1185,7 +1208,7 @@ def test_a_mismatched_position_keeps_the_aim():
             seen = []
             model.add_event_listener(seen.append)
             try:
-                model.navigate_to(999)
+                model.navigate_to(639)
                 await wait_for(lambda: len(device.received) >= 2)
                 for message in POSITION_14:
                     await device.push(message)
@@ -1195,14 +1218,15 @@ def test_a_mismatched_position_keeps_the_aim():
                 await model.close()
 
     state, seen = run(scenario())
-    assert state.navigation.aim == 999
-    assert state.aimed_rig_index == 999
+    assert state.navigation.aim == 639
+    assert state.aimed_rig_index == 639
     assert not any(isinstance(e, NavigationSettled | NavigationDropped) for e in seen)
 
 
 def test_an_aim_the_device_never_confirms_is_dropped_after_the_window():
     """Past the last rig the device stays put; the aim outlives the settle by
-    the pending window, then goes, and the same index is sendable again."""
+    the pending window, then goes, and the same index is sendable again. 639
+    is the last index the wire can name (bank 127, slot 5)."""
 
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -1210,24 +1234,47 @@ def test_an_aim_the_device_never_confirms_is_dropped_after_the_window():
             model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
             events = model.events()
             try:
-                model.navigate_to(999)
+                model.navigate_to(639)
                 started = loop.time()
                 await wait_for(lambda: len(device.received) >= 2)
                 dropped = await next_event(events, NavigationDropped)
                 elapsed = loop.time() - started
                 state = model.state()
-                model.navigate_to(999)
+                model.navigate_to(639)
                 await wait_for(lambda: len(device.received) >= 4)
                 return dropped, elapsed, state, device.received
             finally:
                 await model.close()
 
     dropped, elapsed, state, received = run(scenario())
-    assert dropped == NavigationDropped(999, NavDrop.UNCONFIRMED)
+    assert dropped == NavigationDropped(639, NavDrop.UNCONFIRMED)
     assert elapsed >= (gen.RIG_LOAD_SETTLE_MS + gen.PENDING_WINDOW_MS) / 1000.0 - 0.02
     assert state.navigation.aim is None
     assert state.navigation.in_flight is False
-    assert received == rig_load(999) + rig_load(999)
+    assert received == rig_load(639) + rig_load(639)
+
+
+def test_an_index_the_wire_cannot_name_is_dropped_at_once():
+    """The bank preselect is a 7-bit CC value: an aim whose bank does not fit
+    (index >= 128 * BANK_SLOTS) is dropped immediately with nothing on the
+    wire -- masking the bank would silently load a real but wrong rig."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            events = model.events()
+            try:
+                model.navigate_to(128 * gen.BANK_SLOTS)
+                dropped = await next_event(events, NavigationDropped)
+                await asyncio.sleep(0.05)
+                return dropped, model.state(), device.received
+            finally:
+                await model.close()
+
+    dropped, state, received = run(scenario())
+    assert dropped == NavigationDropped(128 * gen.BANK_SLOTS, NavDrop.UNCONFIRMED)
+    assert state.navigation.aim is None
+    assert received == []
 
 
 def test_an_aim_sent_once_is_not_sent_again_while_it_stands():
@@ -1569,3 +1616,43 @@ def test_close_cancels_a_control_link_still_waiting_its_turn():
     elapsed, control_connections = run(scenario())
     assert elapsed < CONNECTION_COOLDOWN / 4
     assert control_connections == 0
+
+
+def test_one_socket_loss_spawns_one_recovery():
+    """The ingest and writer tasks can both report the same loss in the same
+    tick; the second report must find itself stale rather than spawn a second
+    recovery for ``close()`` to lose track of."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=QUIET)
+            try:
+                epoch = model._epoch
+                model._on_stream_lost(epoch)
+                supervisor = model._supervisor
+                model._on_stream_lost(epoch)
+                assert model._supervisor is supervisor, "one recovery task"
+                await wait_for(lambda: model.state().connection is Connection.DISCONNECTED)
+            finally:
+                await model.close()
+
+    run(scenario())
+
+
+def test_the_rig_load_pair_is_queued_whole_or_not_at_all():
+    """With one slot left, the pair is refused and nothing is queued: an
+    orphaned bank preselect would leave the device armed for a load that
+    never followed."""
+
+    async def scenario():
+        link = StreamLink(None, b"")
+        for _ in range(COMMAND_QUEUE_DEPTH - 1):
+            link.send_nowait(b"x")
+        with pytest.raises(asyncio.QueueFull):
+            link.send_pair_nowait(b"a", b"b")
+        assert link._commands.qsize() == COMMAND_QUEUE_DEPTH - 1, "neither was queued"
+        link.send_nowait(b"y")  # room for one
+        with pytest.raises(asyncio.QueueFull):
+            link.send_nowait(b"z")
+
+    run(scenario())

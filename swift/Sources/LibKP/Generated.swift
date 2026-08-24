@@ -3,7 +3,7 @@
 import Foundation
 
 public enum Generated {
-    public static let specVersion: String = "0.7.0"
+    public static let specVersion: String = "0.8.0"
     public static let port: UInt16 = 5727
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15

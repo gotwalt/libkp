@@ -237,15 +237,17 @@ public actor DeviceModel {
         return forwardPosition(outcome) || outcome.slowChanged
     }
 
-    /// A folded update moved the device's position: hand the flat index to
-    /// the Navigator, whichever wire carried it. Returns whether the
-    /// snapshot's navigation changed.
+    /// A folded update reported the device's position: hand each flat index
+    /// to the Navigator, whichever wire carried it — changed or deduped
+    /// alike, since re-loading the rig already loaded is confirmed by a push
+    /// that changes nothing. Returns whether the snapshot's navigation
+    /// changed.
     private func forwardPosition(_ outcome: ApplyOutcome) -> Bool {
-        let moved = outcome.events.contains {
-            if case .currentPosition = $0 { true } else { false }
+        var changed = false
+        for index in outcome.positions {
+            changed = navigationPosition(index) || changed
         }
-        guard moved, let index = state.currentRigIndex else { return false }
-        return navigationPosition(index)
+        return changed
     }
 
     /// Test hook: forget when the control link was last attempted, so
