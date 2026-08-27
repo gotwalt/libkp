@@ -20,15 +20,14 @@ pip install -e '.[dev]'      # from python/
 Or run straight from the source tree:
 
 ```sh
-PYTHONPATH=src python -m libkp.examples.meters --help
+PYTHONPATH=src python examples/meters.py --help
 ```
 
 ## The live meters example
 
 ```sh
-python -m libkp.examples.meters              # discover a device, then render
-python -m libkp.examples.meters --ip 192.168.1.50 --all --width 48
-libkp-meters --help                          # same thing, installed as a script
+python examples/meters.py              # discover a device, then render
+python examples/meters.py --ip 192.168.1.50 --all --width 48
 ```
 
 A full-screen ANSI view that updates straight off the stream:
@@ -63,8 +62,8 @@ Ctrl-C restores the cursor and exits.
 gauges, an effect-block grid, a live tuner strobe) built on
 [Textual](https://textual.textualize.io/). It needs the optional `tui` extra
 (Textual); the library itself stays dependency-free. Run it with `uv` (below),
-or `pip install -e '.[tui]'` then `libkp-meters-tui`. Same core flags as the
-ANSI example; press `q` to quit and `a` to toggle the raw fields.
+or `pip install -e '.[tui]'` then `python examples/meters_tui.py`. Same core
+flags as the ANSI example; press `q` to quit and `a` to toggle the raw fields.
 
 ## Running the examples with uv
 
@@ -73,33 +72,25 @@ virtualenv — it resolves the package (and any extras) on the fly. From `python
 
 ```sh
 # Zero-dependency ANSI meters
-uv run libkp-meters --help
-uv run libkp-meters --ip 10.0.0.1 --all
+uv run examples/meters.py --help
+uv run examples/meters.py --ip 10.0.0.1 --all
 
 # Textual TUI — the `--extra tui` pulls in Textual just for this run
-uv run --extra tui libkp-meters-tui
-uv run --extra tui libkp-meters-tui --ip 10.0.0.1
-```
-
-The console scripts above come from `pyproject.toml`; the equivalent module form
-works too:
-
-```sh
-uv run python -m libkp.examples.meters
-uv run --extra tui python -m libkp.examples.meters_tui
+uv run --extra tui examples/meters_tui.py
+uv run --extra tui examples/meters_tui.py --ip 10.0.0.1
 ```
 
 Pin the interpreter (anything 3.11+) when you want a specific one, and
 materialize the environment once for repeated runs or editor tooling:
 
 ```sh
-uv run --python 3.14 --extra tui libkp-meters-tui   # choose the interpreter
-uv sync --extra tui                                 # create .venv with Textual
-uv run libkp-meters-tui                             #   then reuse it
+uv run --python 3.14 --extra tui examples/meters_tui.py   # choose the interpreter
+uv sync --extra tui                                        # create .venv with Textual
+uv run examples/meters_tui.py                               #   then reuse it
 ```
 
-Only the Textual example needs the `tui` extra; `uv run libkp-meters` needs
-nothing beyond the standard library.
+Only the Textual example needs the `tui` extra; `uv run examples/meters.py`
+needs nothing beyond the standard library.
 
 ## Quick start
 

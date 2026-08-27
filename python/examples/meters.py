@@ -12,7 +12,7 @@ off the model:
 - level bars for stack, rig output and loudness, with peak-hold,
 - a tempo pulse indicator and the last parameter seen.
 
-Run it with ``python -m libkp.examples.meters`` (Ctrl-C quits and restores the
+Run it with ``uv run examples/meters.py`` (Ctrl-C quits and restores the
 terminal). The realtime field identities it renders come from observed
 experimentation and are described by the shared spec.
 """
@@ -28,12 +28,12 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .. import _generated as gen
-from .. import params
-from ..discovery import find_first
-from ..errors import LibKPError
-from ..model import DeviceModel
-from ..state import (
+from libkp import _generated as gen
+from libkp import params
+from libkp.discovery import find_first
+from libkp.errors import LibKPError
+from libkp.model import DeviceModel
+from libkp.state import (
     BeatPulse,
     DeviceEvent,
     DeviceState,
@@ -409,7 +409,7 @@ async def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     """The command-line interface."""
     parser = argparse.ArgumentParser(
-        prog="python -m libkp.examples.meters",
+        prog="examples/meters.py",
         description=(
             "Live terminal view of a Kemper Profiler: rig, amp/cab, the eight "
             "effect blocks, the tuner strobe, and the realtime level meters."

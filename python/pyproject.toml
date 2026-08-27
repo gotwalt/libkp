@@ -17,13 +17,9 @@ dependencies = []
 dev = ["pytest>=8", "ruff>=0.6"]
 tui = ["textual>=0.60"]
 
-[project.scripts]
-libkp-meters = "libkp.examples.meters:main"
-libkp-meters-tui = "libkp.examples.meters_tui:main"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/libkp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "examples"]

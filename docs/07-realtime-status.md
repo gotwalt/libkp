@@ -189,7 +189,7 @@ The note being tracked is reported separately at page `$7D`, number 84
 ## The `meters` example
 
 Each implementation ships the same example — `rust/examples`,
-`python/src/libkp/examples`, `swift/Sources/meters` — and it exists to make this
+`python/examples`, `swift/Sources/meters` — and it exists to make this
 document concrete. It opens a session, ingests the stream, and renders a live
 terminal view:
 

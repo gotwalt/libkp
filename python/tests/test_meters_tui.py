@@ -6,10 +6,11 @@ check needs the optional ``tui`` extra and skips without it.
 
 from __future__ import annotations
 
+import meters
+import meters_tui
 import pytest
 
 from libkp import _generated as gen
-from libkp.examples import meters, meters_tui
 from libkp.state import RealtimeStatus
 
 # ---------------------------------------------------------------------------
