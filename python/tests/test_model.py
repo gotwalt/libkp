@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from fake_device import FakeDevice, answer_requests, ext_param, wait_for
 
 from libkp import _generated as gen
 from libkp import cbor
@@ -57,6 +56,7 @@ from libkp.state import (
     SyncCompleted,
     TempoBpm,
 )
+from libkp.testing import FakeDevice, answer_requests, ext_param, wait_for
 
 RIG_NAME = sysex(0x00, 0x00, 0x03, PAGE_STRINGS, 1, b"Test Rig\x00")
 REV_TYPE = set_single(0x00, 0x00, 0x3D, 0, 179)

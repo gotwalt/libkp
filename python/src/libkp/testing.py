@@ -1,4 +1,9 @@
-"""An in-process stand-in for a Profiler, for exercising the async layers.
+"""An in-process stand-in for a Profiler, for tests that want a real session.
+
+Shipped with the package so that anything built on libkp -- a Home Assistant
+integration, a controller, a script -- can drive the real transport in its own
+test suite without a device on the desk and without mocking the layers under
+test. libkp's own async tests use it as it stands.
 
 It speaks just enough of the transport to drive :class:`libkp.session.Session`,
 :class:`libkp.model.DeviceModel` and the CBOR tooling: any number of concurrent
@@ -34,9 +39,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable
 
-from libkp import _generated as gen
-from libkp import cbor, midi3, nrpn
-from libkp.session import (
+from . import _generated as gen
+from . import cbor, midi3, nrpn
+from .session import (
     PROTOCOL_CBOR_CONTROL,
     PROTOCOL_MIDI3_STREAM,
     PROTOCOL_RESERVED,

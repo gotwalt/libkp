@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import asyncio
 
-from fake_device import DEFAULT_DUMP, FakeDevice, wait_for
-
 from libkp import _generated as gen
 from libkp import cbor
 from libkp.session import PROTOCOL_CBOR_CONTROL
 from libkp.state import Num, Text
+from libkp.testing import DEFAULT_DUMP, FakeDevice, wait_for
 
 
 def test_encodes_with_minimal_length_heads():
