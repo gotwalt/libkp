@@ -62,7 +62,7 @@ of the current rig, its effect blocks, the tuner strobe, and the output meters:
 
 ```sh
 cd rust   && cargo run --example meters            # add `-- --ip 192.168.1.50` to skip discovery
-cd python && python -m libkp.examples.meters       # or `pip install -e .` then `libkp-meters`
+cd python && uv run examples/meters.py             # or `pip install -e .` then `python examples/meters.py`
 cd swift  && swift run meters                      # or `swift run MetersApp` for the macOS app
 ```
 

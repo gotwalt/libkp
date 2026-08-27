@@ -1,0 +1,27 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "active": {
+        "default": "mdi:guitar-electric",
+        "state": {
+          "off": "mdi:guitar-electric",
+          "on": "mdi:music-note"
+        }
+      }
+    },
+    "sensor": {
+      "rig_name": {
+        "default": "mdi:tune-vertical"
+      },
+      "amp_name": {
+        "default": "mdi:amplifier"
+      },
+      "cabinet_name": {
+        "default": "mdi:speaker"
+      },
+      "last_activity": {
+        "default": "mdi:clock-outline"
+      }
+    }
+  }
+}

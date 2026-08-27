@@ -151,7 +151,7 @@ Even with no requests outstanding, an open MIDI3 stream delivers:
   comment, amp, cabinet, every effect-slot type and state, and the rig settings.
 
 The `meters` example in each language (`rust/examples`,
-`python/src/libkp/examples`, `swift/Sources/meters`) does exactly this and
+`python/examples`, `swift/Sources/meters`) does exactly this and
 nothing more: connect, subscribe, and render what arrives.
 
 ## The model

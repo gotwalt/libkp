@@ -1,7 +1,7 @@
 """A polished **Textual** live view of the Profiler's current patch and stream.
 
 This is the rich, widget-based counterpart to the zero-dependency
-:mod:`libkp.examples.meters` ANSI view. It connects (discovering the device if
+:mod:`meters` ANSI view. It connects (discovering the device if
 no ``--ip`` is given) with the model's default options -- the stream, the
 control link that carries the morph, and the read-only request burst -- then
 drives a full-screen Textual UI straight off the async
@@ -21,12 +21,12 @@ standard library, and this module keeps every ``textual``/``rich`` import inside
 :func:`main` so importing or collecting the package never requires it. Install
 it with ``pip install 'libkp[tui]'`` and run::
 
-    python -m libkp.examples.meters_tui --ip 10.0.0.1
-    python -m libkp.examples.meters_tui --all --fps 60
+    uv run --extra tui examples/meters_tui.py --ip 10.0.0.1
+    uv run --extra tui examples/meters_tui.py --all --fps 60
 
 The reusable view logic — the wrap-aware strobe drift-rate verdict, the
 peak-hold decay, the tempo-pulse handling and the field labels — is shared with
-:mod:`libkp.examples.meters`. The realtime field identities come from observed
+:mod:`meters`. The realtime field identities come from observed
 experimentation and are described by the shared spec. Press ``q`` / ``Ctrl-C``
 to quit and ``a`` to toggle the full set of raw meter fields.
 """
@@ -38,12 +38,7 @@ import asyncio
 import sys
 import time
 
-from .. import _generated as gen
-from ..discovery import find_first
-from ..errors import LibKPError
-from ..model import DeviceModel
-from ..state import Connection, DeviceState
-from .meters import (
+from meters import (
     ALL_ROWS,
     BAR_ROWS,
     FPS,
@@ -53,6 +48,12 @@ from .meters import (
     MeterView,
     note_name,
 )
+
+from libkp import _generated as gen
+from libkp.discovery import find_first
+from libkp.errors import LibKPError
+from libkp.model import DeviceModel
+from libkp.state import Connection, DeviceState
 
 # --- shared, textual-free view helpers ---------------------------------------
 
@@ -464,9 +465,9 @@ def _build_app_class():
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The command-line interface (mirrors :mod:`libkp.examples.meters`)."""
+    """The command-line interface (mirrors :mod:`meters`)."""
     parser = argparse.ArgumentParser(
-        prog="python -m libkp.examples.meters_tui",
+        prog="examples/meters_tui.py",
         description=(
             "Polished Textual live view of a Kemper Profiler: rig, amp/cab, the "
             "eight effect blocks, the tuner strobe, and the realtime meters."
