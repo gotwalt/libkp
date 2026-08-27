@@ -10,11 +10,11 @@ import sys
 
 import meters
 import pytest
-from fake_device import FakeDevice
 
 from libkp import _generated as gen
 from libkp.nrpn import PAGE_STRINGS, set_single, sysex, u14_split
 from libkp.state import BeatPulse, DeviceState, ParamChanged, RealtimeStatus, Status
+from libkp.testing import FakeDevice
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 

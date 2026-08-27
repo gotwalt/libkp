@@ -16,6 +16,9 @@ Layers, lowest to highest:
 - :mod:`libkp.model` — :class:`~libkp.model.DeviceModel`, the async store over
   the stream and the control link.
 
+Beside the layers, :mod:`libkp.testing` holds :class:`~libkp.testing.FakeDevice`,
+an in-process Profiler for driving all of the above without a device.
+
 Constants and lookup tables come from :mod:`libkp._generated`, which is emitted
 from the shared spec; the protocol logic is hand-written here and held to the
 shared conformance vectors.

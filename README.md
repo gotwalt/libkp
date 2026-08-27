@@ -29,9 +29,10 @@ with my hands.
 | Python | `libkp` | Python 3.11+, standard library only     | [`python/`](python/) |
 | Swift  | `LibKP` | Swift 6, macOS 13+, `Network` framework | [`swift/`](swift/) |
 
-None of the three is on a package registry yet; depend on the directory as a
-path or git dependency. The shape of the API is the same everywhere — find a
-device, connect a model, subscribe to its state, send it things:
+Python is on PyPI — `pip install libkp`. Rust and Swift are not on a registry
+yet; depend on the directory as a path or git dependency. The shape of the API
+is the same everywhere — find a device, connect a model, subscribe to its
+state, send it things:
 
 ```rust
 use libkp::model::DeviceModel;
@@ -68,6 +69,14 @@ cd swift  && swift run meters                      # or `swift run MetersApp` fo
 
 Discovery needs UDP port 5727 to itself, so quit Kemper's Rig Manager (or pass
 `--ip`) before running it.
+
+### Built on libkp
+
+- [**kemper-homeassistant**](https://github.com/gotwalt/kemper-homeassistant) —
+  a Home Assistant integration: the rig, the amp, the cabinet, and whether
+  anyone is playing, held on one session that never polls the device. It
+  depends on `libkp` from PyPI, and tests against
+  [`libkp.testing.FakeDevice`](python/README.md#testing-against-a-fake-profiler).
 
 ## Status
 

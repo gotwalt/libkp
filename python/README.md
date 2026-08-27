@@ -14,7 +14,8 @@ the CC control vocabulary, and an observable async device model.
 ## Install
 
 ```sh
-pip install -e '.[dev]'      # from python/
+pip install libkp            # from PyPI
+pip install -e '.[dev]'      # or from python/, to work on it
 ```
 
 Or run straight from the source tree:
@@ -153,6 +154,7 @@ with DiscoveryPort.acquire() as port:  # raises PortUnavailableError if taken
 | `libkp.state` | The state tree and the pure `DeviceState.apply_update` fold. |
 | `libkp.model` | `DeviceModel`, the async store over the stream and the control link. |
 | `libkp.errors` | The exception family, all deriving from `LibKPError`. |
+| `libkp.testing` | `FakeDevice`, an in-process Profiler to test against. |
 | `libkp._generated` | **Generated, data only** — constants and lookup tables. Do not edit. |
 
 `_generated.py` is emitted from [`../spec`](../spec) by
@@ -371,6 +373,30 @@ for message in unframer.push(raw_stream_bytes):
         ...
 ```
 
+## Testing against a fake Profiler
+
+`libkp.testing.FakeDevice` is a Profiler stand-in that speaks the real
+transport in-process: the greeting, the protocol-selection handshake, the
+preamble, then MIDI3 framing or the CBOR dump. Anything built on libkp can hold
+a session against it in its own suite, with nothing below the socket mocked and
+no device on the desk.
+
+```python
+from libkp import DeviceModel
+from libkp.testing import FakeDevice, answer_requests
+
+fake = await FakeDevice(responder=answer_requests).start()
+model = await DeviceModel.connect("127.0.0.1", port=fake.port)
+...
+await model.close()
+await fake.stop()
+```
+
+It can also hang up mid-session, hold back the greeting, or refuse connections
+for a while — the states a reconnect has to survive. libkp's own async tests
+drive it; so does the [Home Assistant
+integration](https://github.com/gotwalt/kemper-homeassistant).
+
 ## Tests
 
 ```sh
@@ -388,7 +414,7 @@ The suite covers:
   checked for message count, pending bytes, exact messages, decoded status
   frames, the per-function histogram, and the resulting rig/amp/cab names.
 - **Unit tests** for each module, and async tests that drive `Session` and
-  `DeviceModel` against an in-process stand-in device (`tests/fake_device.py`).
+  `DeviceModel` against an in-process stand-in device (`libkp.testing`, shipped with the package).
 
 ## Provenance
 
