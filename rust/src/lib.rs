@@ -77,8 +77,8 @@ pub use error::{DiscoverError, ParseError, SessionError};
 pub use midi3::Unframer;
 pub use model::{
     ApplyOutcome, Backoff, ChannelError, CommandError, ConnectOptions, ControlPolicy, DeviceEvent,
-    DeviceModel, NavAction, NavigatorState, RealtimeStatus, ReconnectPolicy, RequestError,
-    SyncStrategy,
+    DeviceModel, NavAction, NavigatorState, RealtimeStatus, ReconnectPolicy, RecyclePolicy,
+    RequestError, SyncStrategy,
 };
 pub use nrpn::{
     NrpnHeader, beacon, control_change, ext_decode, multi_values, parse_extended_string,

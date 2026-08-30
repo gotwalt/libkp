@@ -287,6 +287,13 @@ public enum DeviceEvent: Sendable, Equatable {
     /// closed it under the default ``ReconnectPolicy``, or ``DeviceModel/close()``
     /// was called.
     case disconnected
+    /// The model retired a session that had reached
+    /// ``RecyclePolicy/maxAge`` and is opening another in its place. Raised as
+    /// the old sockets go away, before the new ones are dialled, so a client
+    /// can tell a deliberate swap from a device that dropped: the
+    /// ``Connection/reconnecting(attempt:)`` that follows was asked for.
+    /// `age` is how long the retired session had been open.
+    case sessionRecycled(age: Duration)
     /// ``DeviceState/connection`` moved — every transition, including the ones
     /// ``connected`` and ``disconnected`` also announce.
     case connectionChanged(Connection)

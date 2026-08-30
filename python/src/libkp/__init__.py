@@ -92,6 +92,7 @@ from .model import (
     ControlPolicy,
     DeviceModel,
     ReconnectPolicy,
+    RecyclePolicy,
     SyncStrategy,
 )
 from .nav import (
@@ -180,6 +181,7 @@ from .state import (
     RequestTimedOut,
     Rig,
     RigChanged,
+    SessionRecycled,
     Status,
     StringTag,
     SyncCompleted,
@@ -191,7 +193,7 @@ from .state import (
     Update,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "SPEC_VERSION",
@@ -289,6 +291,7 @@ __all__ = [
     "Disconnected",
     "ConnectionChanged",
     "ChannelChanged",
+    "SessionRecycled",
     "SyncCompleted",
     "RequestTimedOut",
     "Update",
@@ -303,6 +306,7 @@ __all__ = [
     "ControlPolicy",
     "SyncStrategy",
     "ReconnectPolicy",
+    "RecyclePolicy",
     "Backoff",
     # the Navigator's state machine
     "NavigatorState",

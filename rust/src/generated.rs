@@ -2,7 +2,7 @@
 #![allow(clippy::all)]
 #![cfg_attr(rustfmt, rustfmt::skip)]
 
-pub const SPEC_VERSION: &str = "0.8.0";
+pub const SPEC_VERSION: &str = "0.9.0";
 
 // Transport
 pub const PORT: u16 = 5727;
@@ -15,6 +15,7 @@ pub const DUMP_SETTLE_MS: u64 = 1000;
 pub const RECONNECT_DELAY_MS: u64 = 4000;
 pub const RECONNECT_MAX_DELAY_MS: u64 = 30000;
 pub const CONTROL_REOPEN_MIN_GAP_MS: u64 = 30000;
+pub const SESSION_MAX_AGE_MS: u64 = 600000;
 pub const RIG_LOAD_SETTLE_MS: u64 = 500;
 pub const PENDING_WINDOW_MS: u64 = 1500;
 pub const RIG_LOAD_CONTROLLERS: [u8; 7] = [48, 49, 50, 51, 52, 53, 54];

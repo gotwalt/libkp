@@ -129,6 +129,15 @@ reported as `Disconnected` and left there, and a lost control link as
 `CONTROL_REOPEN_MIN_GAP_MS` of the last attempt). Dropping the last handle,
 or `close()`, closes both links and raises `Disconnected`.
 
+One thing the model does do on its own, by default: it retires its own session
+every `SESSION_MAX_AGE_MS` (10 minutes) — `ConnectOptions::recycle`, a
+`RecyclePolicy` — closing both links cleanly, raising `SessionRecycled { age }`
+and dialling again at once on the same handle and the same tree. A Player asked
+to hold one session for hours has been seen to stop serving and flash its LEDs
+red; recycling is the cheap way never to ask it to (docs/11). A reopen that
+fails falls through to whatever `ReconnectPolicy` is set, counted from attempt
+two. `recycle: None` holds one session for as long as the device serves it.
+
 ### Parameters, requests and actions
 
 - **Parameters** (`set_gain`, `set_rig_volume`, `set_effect_enabled`, …) go out

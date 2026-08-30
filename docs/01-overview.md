@@ -173,7 +173,7 @@ The same surface, in each language:
 | | Rust | Python | Swift |
 |---|---|---|---|
 | Connect, defaults | `DeviceModel::connect(ip)` | `await DeviceModel.connect(ip)` | `try await DeviceModel.connect(host:)` |
-| Connect, options | `connect_with(ip, ConnectOptions { control, sync, reconnect, port })` | `connect(ip, options=ConnectOptions(...))` | `connect(host:port:options:)` |
+| Connect, options | `connect_with(ip, ConnectOptions { control, sync, reconnect, recycle, port })` | `connect(ip, options=ConnectOptions(...))` | `connect(host:port:options:)` |
 | Close | `close()` (or drop the last handle) | `close()` / `async with` | `close()` |
 | Snapshot | `state()` | `state()` | `snapshot()` |
 | Store | `subscribe()` | `subscribe()` | `snapshots()` |

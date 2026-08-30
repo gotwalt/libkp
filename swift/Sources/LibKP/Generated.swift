@@ -3,7 +3,7 @@
 import Foundation
 
 public enum Generated {
-    public static let specVersion: String = "0.8.0"
+    public static let specVersion: String = "0.9.0"
     public static let port: UInt16 = 5727
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15
@@ -14,6 +14,7 @@ public enum Generated {
     public static let reconnectDelayMs: UInt64 = 4000
     public static let reconnectMaxDelayMs: UInt64 = 30000
     public static let controlReopenMinGapMs: UInt64 = 30000
+    public static let sessionMaxAgeMs: UInt64 = 600000
     public static let rigLoadSettleMs: UInt64 = 500
     public static let pendingWindowMs: UInt64 = 1500
     public static let rigLoadControllers: [UInt8] = [48, 49, 50, 51, 52, 53, 54]

@@ -35,6 +35,7 @@ from libkp.model import (
     ControlPolicy,
     DeviceModel,
     ReconnectPolicy,
+    RecyclePolicy,
     SyncStrategy,
 )
 from libkp.nrpn import PAGE_STRINGS, set_single, sysex, u14_split
@@ -52,6 +53,7 @@ from libkp.state import (
     NavigationDropped,
     NavigationSettled,
     RequestTimedOut,
+    SessionRecycled,
     Status,
     SyncCompleted,
     TempoBpm,
@@ -63,7 +65,8 @@ REV_TYPE = set_single(0x00, 0x00, 0x3D, 0, 179)
 TEMPO = set_single(0x00, 0x00, gen.PAGE_RIG_SETTINGS, gen.TEMPO_NUMBER, 7680)
 
 #: No burst, no control link: the model as a bare stream, for tests about the
-#: stream alone (what ``connect(sync=False)`` used to give).
+#: stream alone (what ``connect(sync=False)`` used to give). The shipping
+#: recycle default stands: at ten minutes it never fires inside a test.
 QUIET = ConnectOptions(sync=SyncStrategy.OFF, control=ControlPolicy.OFF)
 #: No burst, control link by default: for tests about the control link.
 NO_SYNC = ConnectOptions(sync=SyncStrategy.OFF)
@@ -1656,3 +1659,148 @@ def test_the_rig_load_pair_is_queued_whole_or_not_at_all():
             link.send_nowait(b"z")
 
     run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Session recycling
+# ---------------------------------------------------------------------------
+
+#: The shortest recycle the model will honour: shorter values are clamped to
+#: the connection cooldown, since a session must at least outlive its own dial.
+SHORT_RECYCLE = ConnectOptions(
+    sync=SyncStrategy.OFF,
+    control=ControlPolicy.OFF,
+    recycle=RecyclePolicy(max_age=CONNECTION_COOLDOWN),
+)
+
+
+def test_a_session_that_reaches_its_age_limit_is_swapped_for_a_fresh_one():
+    """The default policy, on a short clock: the model closes the aged session
+    itself and opens another, keeping the handle, the receivers and every
+    value in the tree. Nothing is *lost* -- the stream reads ``CLOSED``, as a
+    socket the model let go of, never ``LOST``."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=SHORT_RECYCLE)
+            events = model.events()
+            snapshots = model.subscribe()
+            try:
+                await device.push(RIG_NAME)
+                await wait_for(lambda: model.state().rig.name == "Test Rig")
+                recycled = await next_event(events, SessionRecycled)
+                await next_event(events, Connected)
+                # The second life is a live session: a push on it lands.
+                await device.push(TEMPO)
+                await wait_for(lambda: model.state().rig.tempo_bpm == 120)
+                return (
+                    recycled,
+                    model.state(),
+                    await drain(snapshots),
+                    device.connection_count(PROTOCOL_MIDI3_STREAM),
+                )
+            finally:
+                await model.close()
+
+    recycled, state, snapshots, lives = run(scenario())
+    assert recycled.age >= CONNECTION_COOLDOWN
+    assert lives == 2, "the aged session was replaced, not merely reported"
+    assert state.connection is Connection.CONNECTED
+    assert state.channels.stream is ChannelState.OPEN
+    assert state.rig.name == "Test Rig", "the tree is kept across the swap"
+    assert state.rig.tempo_bpm == 120
+    assert any(s.connection is Connection.RECONNECTING for s in snapshots)
+    assert not any(s.connection is Connection.DISCONNECTED for s in snapshots)
+    assert not any(s.channels.stream is ChannelState.LOST for s in snapshots)
+
+
+def test_a_recycle_the_device_refuses_becomes_an_ordinary_outage():
+    """The swap is one immediate attempt and no more of its own: a device that
+    will not take the new session leaves the model where a real drop would --
+    ``Disconnected``, with no reconnect policy asking for anything else."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=SHORT_RECYCLE)
+            events = model.events()
+            try:
+                device.pause_accepting()
+                await next_event(events, SessionRecycled)
+                await next_event(events, Disconnected, timeout=6.0)
+                return model.state(), model.connected
+            finally:
+                await model.close()
+
+    state, connected = run(scenario())
+    assert not connected
+    assert state.connection is Connection.DISCONNECTED
+
+
+def test_a_refused_recycle_hands_over_to_the_backoff_when_there_is_one():
+    """With a reconnect policy the failed reopen is attempt one, and the
+    backoff carries on counting from two until the device takes a session
+    again."""
+    options = ConnectOptions(
+        sync=SyncStrategy.OFF,
+        control=ControlPolicy.OFF,
+        recycle=RecyclePolicy(max_age=CONNECTION_COOLDOWN),
+        reconnect=ReconnectPolicy(stream=Backoff(initial=0.05)),
+    )
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=options)
+            events = model.events()
+            try:
+                device.pause_accepting()
+                await next_event(events, SessionRecycled)
+                await wait_for(lambda: model.state().reconnect_attempt >= 2, 6.0)
+                device.resume_accepting()
+                await next_event(events, Connected, timeout=6.0)
+                return model.state(), device.connection_count(PROTOCOL_MIDI3_STREAM)
+            finally:
+                await model.close()
+
+    state, lives = run(scenario())
+    assert state.connection is Connection.CONNECTED
+    assert state.reconnect_attempt == 0
+    assert lives >= 2
+
+
+def test_recycling_can_be_turned_off():
+    """``recycle=None`` is the old behaviour: one session, held for as long as
+    the device serves it."""
+    options = ConnectOptions(sync=SyncStrategy.OFF, control=ControlPolicy.OFF, recycle=None)
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=options)
+            try:
+                await asyncio.sleep(CONNECTION_COOLDOWN * 2.5)
+                return model.state(), device.connection_count(PROTOCOL_MIDI3_STREAM)
+            finally:
+                await model.close()
+
+    state, lives = run(scenario())
+    assert state.connection is Connection.CONNECTED
+    assert lives == 1
+
+
+def test_closing_during_a_recycle_leaves_nothing_running():
+    """The swap is a supervisor like any other: ``close`` cancels it, the
+    connection ends ``DISCONNECTED``, and the device sees no third session."""
+
+    async def scenario():
+        async with FakeDevice() as device:
+            model = await DeviceModel.connect("127.0.0.1", device.port, options=SHORT_RECYCLE)
+            events = model.events()
+            await next_event(events, SessionRecycled)
+            # Close inside the swap, while the reopen is still waiting out the
+            # ledger's cooldown.
+            await model.close()
+            await asyncio.sleep(CONNECTION_COOLDOWN * 1.5)
+            return model.state(), device.connection_count(PROTOCOL_MIDI3_STREAM)
+
+    state, lives = run(scenario())
+    assert state.connection is Connection.DISCONNECTED
+    assert lives == 1, "the reopen was cancelled with the model"

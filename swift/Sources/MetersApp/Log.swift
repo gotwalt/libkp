@@ -86,6 +86,8 @@ enum Log {
             return "connected"
         case .disconnected:
             return "disconnected"
+        case let .sessionRecycled(age):
+            return "sessionRecycled after \(age)"
         case let .connectionChanged(connection):
             return "connection \(connection)"
         case let .channelChanged(channel, state):

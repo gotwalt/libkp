@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "libkp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Kemper Profiler network protocol: discovery, session, MIDI3/SysEx, control, and an observable device model."
 readme = "README.md"
 requires-python = ">=3.11"

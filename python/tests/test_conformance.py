@@ -31,7 +31,7 @@ from libkp.state import (
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.8.0"
+    assert gen.SPEC_VERSION == "0.9.0"
 
 
 def test_every_vector_file_is_covered():

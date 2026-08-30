@@ -17,7 +17,7 @@ use libkp::control::Control;
 use libkp::generated;
 use libkp::model::{
     Backoff, ChannelError, CommandError, ConnectOptions, ControlPolicy, DeviceEvent, DeviceModel,
-    ReconnectPolicy, RequestError, SyncStrategy,
+    ReconnectPolicy, RecyclePolicy, RequestError, SyncStrategy,
 };
 use libkp::nrpn::{self, FUNCTION_EXT_PARAM, set_single};
 use libkp::params::{BankPreviewField, bank_preview_address};
@@ -1883,4 +1883,140 @@ async fn a_pending_request_fails_when_the_model_closes() {
     assert!(wait_for(|| stream.requests() == 1, PATIENCE).await);
     model.close().await;
     assert_eq!(request.await.unwrap(), Err(RequestError::Disconnected));
+}
+
+// ---------------------------------------------------------------------------
+// Session recycling
+// ---------------------------------------------------------------------------
+
+/// A bare stream on the shortest recycle the model honours: anything below the
+/// connection cooldown is floored at it, since a session must at least outlive
+/// its own dial.
+fn short_recycle(fake: &FakeDevice) -> ConnectOptions {
+    ConnectOptions {
+        recycle: Some(RecyclePolicy {
+            max_age: CONNECTION_COOLDOWN,
+        }),
+        ..quiet(fake)
+    }
+}
+
+#[tokio::test]
+async fn a_session_that_reaches_its_age_limit_is_swapped_for_a_fresh_one() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), short_recycle(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    let first = fake.wait_for_stream(0).await;
+
+    let recycled = next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::SessionRecycled { .. })
+    })
+    .await;
+    assert_eq!(
+        recycled,
+        DeviceEvent::SessionRecycled {
+            age: CONNECTION_COOLDOWN
+        }
+    );
+    // The model let the socket go: closed, never lost.
+    next_event(
+        &mut events,
+        channel_event(Channel::Stream, ChannelState::Closed),
+    )
+    .await;
+    next_event(&mut events, |e| matches!(e, DeviceEvent::Connected)).await;
+
+    assert!(first.is_closed());
+    assert_eq!(fake.streams().len(), 2, "the aged session was replaced");
+    let state = model.state();
+    assert_eq!(state.connection, Connection::Connected);
+    assert_eq!(state.channels.stream, ChannelState::Open);
+
+    // The second life is a live session: a command reaches its socket.
+    let second = fake.wait_for_stream(1).await;
+    model.set_gain(9).await.unwrap();
+    assert!(wait_for(|| second.received().len() == 1, PATIENCE).await);
+    model.close().await;
+}
+
+#[tokio::test]
+async fn a_recycle_the_device_refuses_becomes_an_ordinary_outage() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(fake.ip(), short_recycle(&fake))
+        .await
+        .unwrap();
+    let mut events = model.events();
+    fake.wait_for_stream(0).await;
+    fake.pause_accepting();
+
+    next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::SessionRecycled { .. })
+    })
+    .await;
+    // One attempt, and with no reconnect policy the model stops there —
+    // exactly where a stream the device dropped would leave it.
+    next_event(&mut events, |e| matches!(e, DeviceEvent::Disconnected)).await;
+    assert_eq!(model.state().connection, Connection::Disconnected);
+    model.close().await;
+}
+
+#[tokio::test]
+async fn a_refused_recycle_hands_over_to_the_backoff_when_there_is_one() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            reconnect: ReconnectPolicy {
+                stream: Some(Backoff {
+                    initial: Duration::from_millis(50),
+                    max: Duration::from_millis(100),
+                }),
+                control_reopen: None,
+            },
+            ..short_recycle(&fake)
+        },
+    )
+    .await
+    .unwrap();
+    let mut events = model.events();
+    fake.wait_for_stream(0).await;
+    fake.pause_accepting();
+
+    next_event(&mut events, |e| {
+        matches!(e, DeviceEvent::SessionRecycled { .. })
+    })
+    .await;
+    // The failed reopen was attempt one; the backoff counts on from two.
+    next_event(&mut events, |e| {
+        matches!(
+            e,
+            DeviceEvent::ConnectionChanged(Connection::Reconnecting { attempt: 2 })
+        )
+    })
+    .await;
+    fake.resume_accepting();
+    next_event(&mut events, |e| matches!(e, DeviceEvent::Connected)).await;
+    assert_eq!(model.state().connection, Connection::Connected);
+    model.close().await;
+}
+
+#[tokio::test]
+async fn recycling_can_be_turned_off() {
+    let fake = FakeDevice::start().await;
+    let model = DeviceModel::connect_with(
+        fake.ip(),
+        ConnectOptions {
+            recycle: None,
+            ..quiet(&fake)
+        },
+    )
+    .await
+    .unwrap();
+    fake.wait_for_stream(0).await;
+    tokio::time::sleep(CONNECTION_COOLDOWN * 5 / 2).await;
+    assert_eq!(fake.streams().len(), 1, "one session, held open");
+    assert_eq!(model.state().connection, Connection::Connected);
+    model.close().await;
 }

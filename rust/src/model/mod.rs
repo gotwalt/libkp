@@ -312,6 +312,15 @@ pub enum DeviceEvent {
     /// policy is set), or the model was closed or dropped. Raised alongside
     /// [`ConnectionChanged`](Self::ConnectionChanged).
     Disconnected,
+    /// The model retired a session that had reached
+    /// [`RecyclePolicy::max_age`] and is opening another in its place. Raised
+    /// as the old sockets go away, before the new ones are dialed, so a client
+    /// can tell a deliberate swap from a device that dropped: the
+    /// [`Connection::Reconnecting`] that follows this event was asked for.
+    SessionRecycled {
+        /// How long the retired session had been open.
+        age: Duration,
+    },
     /// [`DeviceState::connection`] moved. Every transition raises this,
     /// including the ones between [`Connection::Connected`] and
     /// [`Connection::Degraded`] that the two events above do not cover.
@@ -549,10 +558,39 @@ pub struct ReconnectPolicy {
     pub control_reopen: Option<Duration>,
 }
 
+/// When to retire a working session and open another in its place.
+///
+/// On by default, unlike [`ReconnectPolicy`], and for the opposite reason:
+/// reconnecting asks the device to serve a socket it would not otherwise have
+/// served, while recycling only refuses to make it hold one for longer than it
+/// is known to. A Profiler that has held a session for hours has been seen to
+/// stop serving and flash its LEDs red, so the model closes both links at
+/// [`max_age`](Self::max_age) and opens them again — one handshake and one
+/// request burst, every ten minutes.
+///
+/// The swap raises [`DeviceEvent::SessionRecycled`] and reads as
+/// [`Connection::Reconnecting`] for the second or so it takes; the tree is not
+/// cleared, so a client's readings stand across it. Requests in flight fail as
+/// they would on any drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecyclePolicy {
+    /// How long a session may be open. Floored at the connection cooldown,
+    /// since a session must at least outlive its own dial.
+    pub max_age: Duration,
+}
+
+impl Default for RecyclePolicy {
+    fn default() -> Self {
+        RecyclePolicy {
+            max_age: Duration::from_millis(generated::SESSION_MAX_AGE_MS),
+        }
+    }
+}
+
 /// Everything [`DeviceModel::connect_with`] can be told. [`Default`] is what
 /// [`DeviceModel::connect`] uses: port [`crate::PORT`],
-/// [`ControlPolicy::BestEffort`], [`SyncStrategy::StreamBurst`], and no
-/// automatic reconnection.
+/// [`ControlPolicy::BestEffort`], [`SyncStrategy::StreamBurst`], no automatic
+/// reconnection, and a session no older than ten minutes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOptions {
     /// The TCP port. A real device only listens on [`crate::PORT`]; the field
@@ -564,6 +602,9 @@ pub struct ConnectOptions {
     pub sync: SyncStrategy,
     /// What to do when a link goes away.
     pub reconnect: ReconnectPolicy,
+    /// Retire a session this old and open another. `None` holds one open for
+    /// as long as it lasts.
+    pub recycle: Option<RecyclePolicy>,
 }
 
 impl Default for ConnectOptions {
@@ -573,6 +614,7 @@ impl Default for ConnectOptions {
             control: ControlPolicy::default(),
             sync: SyncStrategy::default(),
             reconnect: ReconnectPolicy::default(),
+            recycle: Some(RecyclePolicy::default()),
         }
     }
 }
