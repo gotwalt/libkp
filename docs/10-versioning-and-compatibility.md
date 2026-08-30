@@ -13,7 +13,8 @@ Every protocol constant and lookup table lives once, in [`../spec`](../spec):
   discovery poll, the CBOR channel's shapes and dump markers, and the
   `[safety]` pacing the model applies on the device's behalf (the request
   timeout and in-flight cap, the rig-load settle and pending window, the
-  reconnect and reopen floors, the rig-load controllers).
+  reconnect and reopen floors, the session's maximum age, the rig-load
+  controllers).
 - `parameters.toml` — the page/number parameter maps, effect slots, string tags,
   and well-known addresses.
 - `effect-types.toml` — the effect Type value → name table, and the category

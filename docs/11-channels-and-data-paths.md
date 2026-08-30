@@ -306,6 +306,44 @@ choices the caller makes, because every socket to the device is a cost it pays:
   the gap. Neither is on by default; the reopen cadence a device tolerates was
   deliberately not measured (below).
 
+## Recycling is not a policy — it is the default
+
+Reconnecting is opt-in because it asks the device to serve a socket it would
+not otherwise have served. Recycling is the opposite: it refuses to make the
+device hold one for longer than it is known to survive, so it is on by default,
+and it is the one thing the model does on its own without being asked.
+
+The reason is a failure nobody has a clean measurement of. A Player left with a
+session open for hours — a dashboard, a Home Assistant integration, anything
+that connects once and stays — has been observed to stop serving and flash its
+LEDs red, needing a power cycle or a Tap-button reboot to come back. Kemper's
+own forum thread on the red-LED fault ends with support saying the LED count
+means different things and each case needs diagnosing, so this is a hypothesis
+with a symptom attached, not a measured fuse like the rig-load one. The
+response is therefore the cheapest thing that would make the hypothesis moot:
+
+- `ConnectOptions.recycle = Some(RecyclePolicy { max_age })`, defaulting to
+  `session_max_age_ms` (10 minutes). At `max_age` the model closes both links
+  as a *close* — the stream reads `Closed`, not `Lost` — raises
+  `SessionRecycled { age }`, and dials again immediately; the ledger's 1 s
+  cooldown is the only wait, since the model itself is what closed the socket.
+- The tree is not cleared, and the receivers are the same ones, so a client
+  sees `Connected → Reconnecting { attempt: 1 } → Connected` and its readings
+  stand across the gap. Requests in flight fail as they would on any drop.
+- The immediate reopen is the swap's *only* attempt of its own. If it fails,
+  what follows is an ordinary outage: `ReconnectPolicy.stream`'s backoff if
+  there is one, counted from attempt two, and `Disconnected` if there is not.
+  A client whose reconnect includes rediscovery — the address may have moved —
+  keeps it, because the failure reaches it by the same road a real drop takes.
+- `max_age` is floored at the connection cooldown: a session must at least
+  outlive its own dial.
+- `recycle = None` restores the old behaviour of holding one session for as
+  long as the device serves it.
+
+The cost is one handshake and one 46-request burst every ten minutes, against a
+device that answers a burst in ~50 ms. The benefit is that no session ever
+grows old enough to test the hypothesis.
+
 ## Device hazards, and what makes each one structural
 
 These are empirical, and every one of them was found the hard way. Each is now
@@ -314,6 +352,7 @@ library rather than a discipline of its callers.
 
 | Hazard | Mechanism |
 |---|---|
+| **A session held open for hours may wedge the device.** Reported rather than measured: a Player that has served one connection for a long time stops serving and flashes its LEDs red. Nothing in the traffic says when it stopped being well. | `RecyclePolicy`, on by default: the model closes and reopens its own session every `session_max_age_ms` (10 min), so no session grows old. The swap is one close and one dial, paced by the same ledger. |
 | **Connection churn wedges the device.** Not concurrency — churn. It stops accepting TCP and does not recover without a power cycle. | The connection ledger inside `Session::connect`: every open to a peer waits out the cooldown from the last open or close, whoever is opening. |
 | **Concurrency is fine.** Two read-only sessions coexist indefinitely, and the model holds two by design. | The model opens the control link after the stream, through the ledger, and never opens a third. The tooling sessions pass the same ledger. |
 | **Overlapping rig loads wedge it, on a delayed fuse.** Two loads ~8 ms apart are answered normally; the device closes the session ~20 s later and refuses TCP until power-cycled. Nothing in the immediate response says harm was done. | The Navigator: one load in flight at a time, a fixed 500 ms settle, and every other route to a load (`send_control`, `send_raw`) refused before a byte goes out. |

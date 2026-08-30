@@ -350,7 +350,31 @@ impl Core {
     /// Not epoch-guarded: only the supervisor calls it, and it is the
     /// supervisor that turns the epoch.
     pub(crate) fn stream_lost(&self, next: Connection) {
+        self.end_life(ChannelState::Lost, next, None);
+    }
+
+    /// The model itself retired a session that reached its age limit: the same
+    /// teardown as a loss, except that the stream is [`ChannelState::Closed`] —
+    /// the model let it go, nothing went wrong — and
+    /// [`DeviceEvent::SessionRecycled`] leads the events, so a subscriber reads
+    /// the [`Connection::Reconnecting`] that follows as the deliberate swap it
+    /// is. One snapshot for all of it.
+    pub(crate) fn session_recycled(&self, age: std::time::Duration) {
+        self.end_life(
+            ChannelState::Closed,
+            Connection::Reconnecting { attempt: 1 },
+            Some(DeviceEvent::SessionRecycled { age }),
+        );
+    }
+
+    /// End the current life in the tree: both channels down, the dump and the
+    /// aim forgotten, every pending request failed, the connection at `next`.
+    /// `stream_state` is what became of the stream — `Lost` when the device
+    /// ended it, `Closed` when the model did — and `leading` is an event that
+    /// explains the whole transition, raised before the channels move.
+    fn end_life(&self, stream_state: ChannelState, next: Connection, leading: Option<DeviceEvent>) {
         let mut events = Vec::new();
+        events.extend(leading);
         {
             let mut st = self.write();
             // The control link is closed *because* the stream went, so its
@@ -363,11 +387,11 @@ impl Core {
                     state: ChannelState::Closed,
                 });
             }
-            if st.channels.stream != ChannelState::Lost {
-                st.channels.stream = ChannelState::Lost;
+            if st.channels.stream != stream_state {
+                st.channels.stream = stream_state;
                 events.push(DeviceEvent::ChannelChanged {
                     channel: Channel::Stream,
-                    state: ChannelState::Lost,
+                    state: stream_state,
                 });
             }
             st.end_dump();

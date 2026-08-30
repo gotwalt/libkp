@@ -184,8 +184,8 @@ the control link beside the stream and degrades the connection if it fails;
 `REQUIRED` fails the connect instead; `OFF` never opens it), the `sync`
 strategy (`STREAM_BURST` asks for every `request = true` row of the routing
 table — 46 read-only requests, all answered in ~50 ms; `OFF` asks for nothing),
-and a `ReconnectPolicy` (see below). A `port` passed positionally overrides
-`options.port`.
+a `ReconnectPolicy` and a `RecyclePolicy` (both below). A `port` passed
+positionally overrides `options.port`.
 
 `DeviceModel` classifies state into two lanes:
 
@@ -324,6 +324,19 @@ links and reports `Disconnected` — unless `ReconnectPolicy(stream=Backoff(...)
 was given, in which case the model reports `RECONNECTING`, waits out the
 backoff (`Backoff.default_stream()` is 4 s doubling to 30 s), and dials the
 whole sequence again on the same handle: same receivers, same tree.
+
+Unlike reconnecting, **recycling is on by default**:
+`ConnectOptions(recycle=RecyclePolicy(max_age=seconds))`, ten minutes
+(`SESSION_MAX_AGE_MS`) unless you say otherwise. At `max_age` the model closes
+both links itself — the stream reads `CLOSED`, not `LOST` — raises
+`SessionRecycled(age)`, and dials again at once; the tree and the receivers
+survive, so a client sees `CONNECTED → RECONNECTING → CONNECTED` and its
+readings stand across the gap. A device asked to hold one session for hours has
+been seen to stop serving and flash its LEDs red, and this is the cheap way to
+make sure it is never asked to (docs/11). If the immediate reopen fails it
+becomes an ordinary outage — the `ReconnectPolicy`'s backoff, counted from
+attempt two, or `Disconnected` — so a client whose own reconnect rediscovers
+the device keeps that path. `recycle=None` holds one session open indefinitely.
 
 Every socket goes through `Session.connect`, whose per-peer ledger waits out
 `CONNECTION_COOLDOWN` from the last open or close to that `(ip, port)` before

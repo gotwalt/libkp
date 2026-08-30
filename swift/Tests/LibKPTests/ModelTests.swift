@@ -1105,6 +1105,108 @@ final class SupervisorTests: XCTestCase {
         let closed = await stream.wait { $0.isClosed }
         XCTAssertTrue(closed)
     }
+
+    // MARK: Session recycling
+
+    /// The shortest recycle the model honours: anything under the connection
+    /// cooldown is floored at it, since a session must outlive its own dial.
+    private func recycling(reconnect: ReconnectPolicy = ReconnectPolicy()) -> ConnectOptions {
+        ConnectOptions(
+            control: .off, sync: .off, reconnect: reconnect,
+            recycle: RecyclePolicy(maxAge: .seconds(Session.connectionCooldown)))
+    }
+
+    /// A session that reaches its age limit is closed by the model and
+    /// replaced, on the same handle and the same streams. The stream is
+    /// `closed`, never `lost`: nothing went wrong.
+    func testASessionThatReachesItsAgeLimitIsSwappedForAFreshOne() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: recycling())
+        let (events, snapshots) = await attach(model)
+        let first = await device.connections(atLeast: 1)[0]
+
+        let age = Duration.seconds(Session.connectionCooldown)
+        let seen = await events.wait(within: .seconds(8)) { $0.contains(.connected) }
+        XCTAssertTrue(seen.contains(.sessionRecycled(age: age)))
+        XCTAssertTrue(seen.contains(.channelChanged(channel: .stream, state: .closed)))
+        XCTAssertFalse(seen.contains(.channelChanged(channel: .stream, state: .lost)))
+        XCTAssertFalse(seen.contains(.disconnected))
+        XCTAssertTrue(first.isClosed)
+
+        let connections = await device.connections(atLeast: 2)
+        XCTAssertEqual(connections.count, 2, "the aged session was replaced")
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .connected)
+        XCTAssertEqual(state.channels.stream, .open)
+        XCTAssertTrue(snapshots.all.contains { $0.connection == .reconnecting(attempt: 1) })
+        // The new life answers commands.
+        try await model.tapTempo()
+        await model.close()
+    }
+
+    /// One attempt, and no more of its own: a device that will not take the
+    /// new session leaves the model where a real drop would.
+    func testARecycleTheDeviceRefusesBecomesAnOrdinaryOutage() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port, options: recycling())
+        let (events, _) = await attach(model)
+        _ = await device.connections(atLeast: 1)
+        device.pauseAccepting()
+
+        let seen = await events.wait(within: .seconds(8)) { $0.contains(.disconnected) }
+        XCTAssertTrue(seen.contains(.sessionRecycled(age: .seconds(Session.connectionCooldown))))
+        XCTAssertTrue(seen.contains(.connectionChanged(.disconnected)))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .disconnected)
+        await model.close()
+    }
+
+    /// With a backoff, the failed reopen is attempt one and the policy counts
+    /// on from two until the device takes a session again.
+    func testARefusedRecycleHandsOverToTheBackoff() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let backoff = Backoff(initial: .milliseconds(50), max: .milliseconds(200))
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port,
+            options: recycling(reconnect: ReconnectPolicy(stream: backoff)))
+        let (events, _) = await attach(model)
+        _ = await device.connections(atLeast: 1)
+        device.pauseAccepting()
+
+        let refused = await events.wait(within: .seconds(8)) {
+            $0.contains(.connectionChanged(.reconnecting(attempt: 2)))
+        }
+        XCTAssertTrue(refused.contains(.connectionChanged(.reconnecting(attempt: 2))))
+        XCTAssertFalse(refused.contains(.disconnected))
+        device.resumeAccepting()
+        let seen = await events.wait(within: .seconds(8)) { $0.contains(.connected) }
+        XCTAssertTrue(seen.contains(.connected))
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .connected)
+        await model.close()
+    }
+
+    /// `recycle: nil` is the old behaviour: one session, held for as long as
+    /// the device serves it.
+    func testRecyclingCanBeTurnedOff() async throws {
+        let device = try FakeDevice()
+        defer { device.stop() }
+        let model = try await DeviceModel.connect(
+            host: host, port: device.port,
+            options: ConnectOptions(control: .off, sync: .off, recycle: nil))
+        _ = await device.connections(atLeast: 1)
+        try? await Task.sleep(for: .seconds(Session.connectionCooldown * 2.5))
+        let connections = await device.connections(atLeast: 1)
+        XCTAssertEqual(connections.count, 1, "one session, held open")
+        let state = await model.snapshot()
+        XCTAssertEqual(state.connection, .connected)
+        await model.close()
+    }
 }
 
 // MARK: - The Navigator

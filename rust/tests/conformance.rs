@@ -95,7 +95,7 @@ fn opt_str(v: &Value) -> Option<&str> {
 
 #[test]
 fn spec_version_matches() {
-    assert_eq!(generated::SPEC_VERSION, "0.8.0");
+    assert_eq!(generated::SPEC_VERSION, "0.9.0");
     assert_eq!(libkp::SPEC_VERSION, generated::SPEC_VERSION);
     assert_eq!(PORT, 5727);
 }

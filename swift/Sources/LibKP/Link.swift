@@ -87,9 +87,35 @@ public struct Backoff: Sendable, Equatable {
     }
 }
 
+/// When to retire a working session and open another in its place.
+///
+/// On by default, unlike ``ReconnectPolicy``, and for the opposite reason:
+/// reconnecting asks the device to serve a socket it would not otherwise have
+/// served, while recycling only refuses to make it hold one for longer than it
+/// is known to. A Profiler that has held a session for hours has been seen to
+/// stop serving and flash its LEDs red, so the model closes both links at
+/// ``maxAge`` and opens them again — one handshake and one request burst,
+/// every ten minutes.
+///
+/// The swap raises ``DeviceEvent/sessionRecycled(age:)`` and reads as
+/// ``Connection/reconnecting(attempt:)`` for the second or so it takes; the
+/// tree is not cleared, so a client's readings stand across it. Requests in
+/// flight fail as they would on any drop.
+public struct RecyclePolicy: Sendable, Equatable {
+    /// How long a session may be open. Floored at
+    /// ``Generated/connectionCooldownMs``, since a session must at least
+    /// outlive its own dial.
+    public var maxAge: Duration
+
+    public init(maxAge: Duration = .milliseconds(Generated.sessionMaxAgeMs)) {
+        self.maxAge = maxAge
+    }
+}
+
 /// Everything ``DeviceModel/connect(host:port:options:)`` can be told. The
 /// defaults are the recommended session: the device's port, the control link
-/// best-effort, the stream burst, no reconnects.
+/// best-effort, the stream burst, no reconnects, and a session no older than
+/// ten minutes.
 public struct ConnectOptions: Sendable, Equatable {
     /// The TCP port both links dial: ``Generated/port``, the only one a real
     /// device listens on. Fakes and tests set another. A port passed to
@@ -98,17 +124,22 @@ public struct ConnectOptions: Sendable, Equatable {
     public var control: ControlPolicy
     public var sync: SyncStrategy
     public var reconnect: ReconnectPolicy
+    /// Retire a session this old and open another; `nil` holds one open for as
+    /// long as it lasts.
+    public var recycle: RecyclePolicy?
 
     public init(
         port: UInt16 = Generated.port,
         control: ControlPolicy = .bestEffort,
         sync: SyncStrategy = .streamBurst,
-        reconnect: ReconnectPolicy = ReconnectPolicy()
+        reconnect: ReconnectPolicy = ReconnectPolicy(),
+        recycle: RecyclePolicy? = RecyclePolicy()
     ) {
         self.port = port
         self.control = control
         self.sync = sync
         self.reconnect = reconnect
+        self.recycle = recycle
     }
 }
 
@@ -345,6 +376,17 @@ extension DeviceModel {
                 await self.syncFinished(epoch: epoch)
             }
         }
+
+        // The clock that retires this life. Floored at the ledger's cooldown:
+        // a session must at least outlive its own dial.
+        if let recycle = options.recycle {
+            let age = Swift.max(recycle.maxAge, .milliseconds(Generated.connectionCooldownMs))
+            ageTask = Task { [weak self] in
+                try? await Task.sleep(for: age)
+                guard !Task.isCancelled else { return }
+                await self?.sessionAged(epoch: epoch, age: age)
+            }
+        }
     }
 
     /// Open the control link per policy, once the stream is up. Only
@@ -420,6 +462,27 @@ extension DeviceModel {
         }
     }
 
+    /// This life has been open for ``RecyclePolicy/maxAge``: close it and open
+    /// another in its place.
+    ///
+    /// The links go down as a *close*, not a loss — nothing went wrong — and
+    /// the swap dials at once, the ledger's cooldown being the only wait a
+    /// planned reopen needs. From there it is an ordinary outage: a reopen
+    /// that fails lands in whatever ``ReconnectPolicy`` the caller set, its
+    /// backoff or ``Connection/disconnected``, so a client that wants
+    /// discovery in that loop keeps it.
+    func sessionAged(epoch: Int, age: Duration) {
+        guard epoch == self.epoch, stream != nil, !closed else { return }
+        tearDownLinks(lost: false)
+        // The failed reopen that may follow is attempt two, as it would be
+        // after any first attempt that did not land.
+        reconnectAttempt = 1
+        emit(.sessionRecycled(age: age))
+        setConnection(.reconnecting(attempt: reconnectAttempt))
+        publishSnapshot()
+        scheduleReconnect(after: .zero)
+    }
+
     /// Close both sockets, stop every task of this life, and refuse whatever
     /// was still waiting. The tree keeps its values; only `channels` and the
     /// navigation change, because they say what is true now: the stream is
@@ -436,6 +499,8 @@ extension DeviceModel {
         settleTask = nil
         reopenTask?.cancel()
         reopenTask = nil
+        ageTask?.cancel()
+        ageTask = nil
         // An open still parked in the ledger, or dialling, must not reach the
         // device on behalf of a life that is over.
         controlOpenTask?.cancel()
@@ -473,7 +538,7 @@ extension DeviceModel {
     /// refused is the next failure, counted and backed off like a dial that
     /// never connected.
     private func retryLife(epoch: Int) async {
-        guard epoch == self.epoch, !closed, let backoff = options.reconnect.stream else { return }
+        guard epoch == self.epoch, !closed else { return }
         setChannel(.stream, .connecting)
         publishSnapshot()
         do {
@@ -493,6 +558,13 @@ extension DeviceModel {
         } catch {
             guard epoch == self.epoch, !closed else { return }
             setChannel(.stream, .unavailable)
+            // Without a backoff there is nothing more to try: a swap that
+            // could not reopen ends where a lost stream does.
+            guard let backoff = options.reconnect.stream else {
+                setConnection(.disconnected)
+                publishSnapshot()
+                return
+            }
             reconnectAttempt += 1
             setConnection(.reconnecting(attempt: reconnectAttempt))
             publishSnapshot()
@@ -508,6 +580,8 @@ extension DeviceModel {
         closed = true
         reconnectTask?.cancel()
         reconnectTask = nil
+        ageTask?.cancel()
+        ageTask = nil
         tearDownLinks(lost: false)
         setConnection(.disconnected)
         publishSnapshot()

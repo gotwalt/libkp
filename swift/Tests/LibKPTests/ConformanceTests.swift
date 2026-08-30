@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.8.0")
+        XCTAssertEqual(Generated.specVersion, "0.9.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file
@@ -462,6 +462,7 @@ final class ConformanceTests: XCTestCase {
         case .disconnected: return "disconnected"
         // The model raises these from what its sockets do; no vector step
         // drives them, so they have no wire name to check.
+        case .sessionRecycled: return "session_recycled"
         case .connectionChanged: return "connection_changed"
         case .channelChanged: return "channel_changed"
         case .syncCompleted: return "sync_completed"

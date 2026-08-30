@@ -86,6 +86,20 @@ a cost it pays (docs/11). Reconnecting the stream after a loss is opt-in the
 same way (:attr:`ReconnectPolicy.stream`): by default the model reports
 :class:`~libkp.state.Disconnected` and stops, exactly as before.
 
+Sessions do not last forever
+----------------------------
+
+A session that is never closed is not a session the device is known to
+survive: a Profiler left holding one for hours has been seen to stop serving
+and flash its LEDs red, and nothing in the traffic says when it stopped being
+well. So the model retires its own session on a clock --
+:class:`RecyclePolicy`, :data:`libkp._generated.SESSION_MAX_AGE_MS` (10
+minutes) by default -- closing both links cleanly and opening them again. This
+is the one thing the model does on its own by default, because unlike
+reconnecting it *lowers* what the device is asked to hold: the cost is one
+handshake and one burst every ten minutes, and what it buys is that no session
+grows old. Pass ``recycle=None`` to hold one open indefinitely.
+
 Every socket is opened through :class:`libkp.session.Session`, whose ledger
 spaces sockets to one device apart; the model adds no sleeps of its own.
 """
@@ -123,6 +137,7 @@ from .errors import (
 )
 from .nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSettle, StartWindow
 from .protocol import PORT
+from .session import CONNECTION_COOLDOWN
 from .state import (
     ApplyOutcome,
     Block,
@@ -144,6 +159,7 @@ from .state import (
     RealtimeStatus,
     RenderedString,
     RequestTimedOut,
+    SessionRecycled,
     SyncCompleted,
     Text,
     Update,
@@ -156,6 +172,7 @@ __all__ = [
     "ControlPolicy",
     "SyncStrategy",
     "ReconnectPolicy",
+    "RecyclePolicy",
     "Backoff",
     "RealtimeStatus",
     "DeviceEvent",
@@ -176,6 +193,8 @@ CC_CHANNEL: int = 0
 DUMP_SETTLE: float = gen.DUMP_SETTLE_MS / 1000.0
 #: The least time between two control opens, in seconds.
 CONTROL_REOPEN_MIN_GAP: float = gen.CONTROL_REOPEN_MIN_GAP_MS / 1000.0
+#: How long a session may stay open before the model retires it, in seconds.
+SESSION_MAX_AGE: float = gen.SESSION_MAX_AGE_MS / 1000.0
 #: How long a rig load is in flight after it is sent, in seconds.
 RIG_LOAD_SETTLE: float = gen.RIG_LOAD_SETTLE_MS / 1000.0
 #: How long after its move settled an unconfirmed aim is kept, in seconds.
@@ -264,14 +283,41 @@ class ReconnectPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class RecyclePolicy:
+    """When to retire a working session and open another in its place.
+
+    On by default, unlike :class:`ReconnectPolicy`, and for the opposite
+    reason: reconnecting asks the device to serve a socket it would not
+    otherwise have served, while recycling only refuses to make it hold one
+    for longer than it is known to. A Profiler that has held a session for
+    hours has been seen to stop serving and flash red, so the model closes
+    both links at :attr:`max_age` and opens them again -- one handshake and
+    one request burst, every ten minutes.
+
+    The swap is announced by :class:`~libkp.state.SessionRecycled` and reads
+    as :attr:`~libkp.state.Connection.RECONNECTING` for the second or so it
+    takes; the state tree is not cleared, so a client's readings stand across
+    it. Requests in flight fail as they would on any drop.
+    """
+
+    #: How long a session may be open, in seconds. Never shorter than the
+    #: connection cooldown, since a session must at least outlive its own dial.
+    max_age: float = SESSION_MAX_AGE
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectOptions:
     """Everything :meth:`DeviceModel.connect` can be told. The defaults are
-    what an app wants: both links, the request burst, no reconnecting."""
+    what an app wants: both links, the request burst, no reconnecting, and a
+    session no older than ten minutes."""
 
     port: int = PORT
     control: ControlPolicy = ControlPolicy.BEST_EFFORT
     sync: SyncStrategy = SyncStrategy.STREAM_BURST
     reconnect: ReconnectPolicy = field(default_factory=ReconnectPolicy)
+    #: Retire a session this old and open another; ``None`` holds one open for
+    #: as long as it lasts.
+    recycle: RecyclePolicy | None = field(default_factory=RecyclePolicy)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +353,7 @@ class DeviceModel:
         "_supervisor",
         "_epoch",
         "_closed",
+        "_life_started",
         "_last_control_open",
         "_dump_open",
         "_dump_end_runs",
@@ -336,6 +383,9 @@ class DeviceModel:
         #: previous life can recognise itself and touch nothing.
         self._epoch = 0
         self._closed = False
+        #: When the current life's stream opened, for the age the recycle
+        #: reports; meaningless while no stream is up.
+        self._life_started = float("-inf")
         self._last_control_open = float("-inf")
         self._dump_open = False
         #: Runs based at ``DUMP_END_ADDRESS`` folded since the trigger: each
@@ -966,6 +1016,7 @@ class DeviceModel:
             await stream.close()
             raise SessionError("the model was closed while connecting")
         self._stream = stream
+        self._life_started = _now()
         # One snapshot for the whole transition: the channel, then the
         # connection it brings up, never the tree half-moved between them.
         self._set_channel(Channel.STREAM, ChannelState.OPEN)
@@ -991,6 +1042,11 @@ class DeviceModel:
                 raise
         elif self._options.control is ControlPolicy.BEST_EFFORT:
             self._spawn(self._open_control_quietly(epoch))
+
+        # Armed last, so a life that fails to come up never starts a clock.
+        recycle = self._options.recycle
+        if recycle is not None:
+            self._spawn(self._age_out(epoch, max(recycle.max_age, CONNECTION_COOLDOWN)))
 
     async def _sync_stream(self, epoch: int) -> None:
         """The connect-time burst, in the background: connect does not wait for
@@ -1059,6 +1115,53 @@ class DeviceModel:
         ):
             await self._open_control_quietly(epoch)
 
+    async def _age_out(self, epoch: int, max_age: float) -> None:
+        """Wait out this life's :attr:`RecyclePolicy.max_age` and hand the swap
+        to a supervisor task.
+
+        The handoff is the same one :meth:`_on_stream_lost` makes, and for the
+        same reason: the swap closes the sockets this task belongs to, and
+        cancelling it is part of that -- a task cannot await its own
+        cancellation. Turning the epoch here also means a stream that is lost
+        in the same tick finds itself stale and does not recover a life that
+        is already being retired.
+        """
+        await asyncio.sleep(max_age)
+        if epoch != self._epoch or self._closed:
+            return
+        self._epoch += 1
+        previous = self._supervisor
+        self._supervisor = asyncio.get_running_loop().create_task(self._recycle(previous))
+
+    async def _recycle(self, previous: asyncio.Task | None) -> None:
+        """Close the aged session and open another in its place.
+
+        The links go down as a *close*, not a loss: nothing went wrong. One
+        immediate attempt follows -- :class:`libkp.session.Session` spaces it
+        from the close on its own -- and from there it is an ordinary outage,
+        so a reopen that fails lands in whatever :class:`ReconnectPolicy` the
+        caller set, backoff or :class:`~libkp.state.Disconnected`. A client
+        that wants discovery in that loop keeps it: the failure reaches it by
+        the same road a real drop takes.
+        """
+        if self._closed:
+            return
+        if previous is not None and not previous.done():
+            previous.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await previous
+        age = _now() - self._life_started
+        await self._drop_links(lost=False)
+        # One snapshot for the whole swap, with the event that says it was
+        # meant: the tree keeps its values, only the connection moves.
+        self._set_reconnecting(1)
+        self._emit(SessionRecycled(age))
+        self._publish()
+        with contextlib.suppress(SessionError):
+            await self._open()
+            return
+        await self._retry_open(after=1)
+
     def _on_stream_lost(self, epoch: int) -> None:
         """The stream's socket ended (read error or EOF), reported from its own
         task: hand recovery to a fresh task, since it has sockets to close.
@@ -1084,15 +1187,26 @@ class DeviceModel:
             with contextlib.suppress(asyncio.CancelledError):
                 await previous
         await self._drop_links(lost=True)
-
         # One snapshot for the whole loss, published only now that both
         # sockets are closed and the connection has moved on.
+        await self._retry_open(after=0)
+
+    async def _retry_open(self, *, after: int) -> None:
+        """Dial until the stream is back or the model is closed, counting from
+        the ``after``-th attempt already spent.
+
+        Where both a lost stream and a failed recycle end up: with a backoff
+        the connection reads :attr:`~libkp.state.Connection.RECONNECTING` for
+        as long as it takes, and without one it reports
+        :class:`~libkp.state.Disconnected` and stops, leaving the next move to
+        the caller.
+        """
         backoff = self._options.reconnect.stream
         if backoff is None:
             self._set_connection(Connection.DISCONNECTED)
             self._publish()
             return
-        attempt, delay = 1, backoff.initial
+        attempt, delay = after + 1, backoff.initial
         self._set_reconnecting(attempt)
         self._publish()
         while not self._closed:

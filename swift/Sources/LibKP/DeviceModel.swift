@@ -100,6 +100,9 @@ public actor DeviceModel {
     var settleTask: Task<Void, Never>?
     var reopenTask: Task<Void, Never>?
     var reconnectTask: Task<Void, Never>?
+    /// The clock that retires the current life, with ``ConnectOptions/recycle``
+    /// set. Cancelled with the life it belongs to.
+    var ageTask: Task<Void, Never>?
     /// When the control link was last dialled — the moment the device saw the
     /// attempt, whether or not it succeeded — which is what the reopen gap
     /// is measured from.
@@ -146,7 +149,7 @@ public actor DeviceModel {
         control?.close()
         for task in [
             controlOpenTask, controlIngestTask, syncTask, settleTask, reopenTask, reconnectTask,
-            navSettleTask, navWindowTask,
+            ageTask, navSettleTask, navWindowTask,
         ] {
             task?.cancel()
         }

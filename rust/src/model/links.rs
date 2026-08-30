@@ -66,7 +66,7 @@ pub(crate) fn spawn_stream(
     let loss = shared.stream_ended();
     let task = tokio::spawn(async move {
         run_stream(shared, epoch, session, tail, rx).await;
-        let _ = loss.send(epoch).await;
+        let _ = loss.send(super::supervisor::LifeEnd::Lost { epoch }).await;
     });
     (tx, task)
 }

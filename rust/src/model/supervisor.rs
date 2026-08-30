@@ -26,6 +26,35 @@ use crate::error::SessionError;
 use crate::generated;
 use crate::state::{Channel, ChannelState, Connection};
 
+/// How a life ended: the device stopped serving it, or it reached the age at
+/// which the model retires it. Both arrive on the same channel, so the
+/// supervisor handles them in the order they happened and a life cannot end
+/// twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifeEnd {
+    /// The stream socket ended on its own: a read error, or the device hung up.
+    Lost {
+        /// The epoch of the life whose socket ended.
+        epoch: u64,
+    },
+    /// The life reached [`RecyclePolicy::max_age`](super::RecyclePolicy::max_age)
+    /// and is to be swapped for a fresh one.
+    Aged {
+        /// The epoch of the life being retired.
+        epoch: u64,
+        /// How long it had been open.
+        age: Duration,
+    },
+}
+
+impl LifeEnd {
+    fn epoch(self) -> u64 {
+        match self {
+            LifeEnd::Lost { epoch } | LifeEnd::Aged { epoch, .. } => epoch,
+        }
+    }
+}
+
 /// Everything the clones of a model, and its tasks, share.
 pub(crate) struct Shared {
     pub(crate) core: Core,
@@ -45,7 +74,7 @@ pub(crate) struct Shared {
     /// join handle — which now lives in [`Life`] so [`close`](Self::close) can
     /// await the socket closing. An aborted stream task never sends, so a
     /// teardown does not wake the supervisor spuriously.
-    stream_ended: mpsc::Sender<u64>,
+    stream_ended: mpsc::Sender<LifeEnd>,
 }
 
 /// The handles of one life of the stream. Aborting them is how a life ends;
@@ -60,6 +89,8 @@ struct Life {
     control: Option<JoinHandle<()>>,
     sync: Option<AbortHandle>,
     reopen: Option<AbortHandle>,
+    /// The clock that retires this life, when a recycle policy is set.
+    age: Option<AbortHandle>,
     supervisor: Option<AbortHandle>,
 }
 
@@ -74,7 +105,10 @@ impl Life {
         if let Some(h) = self.control.take() {
             h.abort();
         }
-        for handle in [self.sync.take(), self.reopen.take()].into_iter().flatten() {
+        for handle in [self.sync.take(), self.reopen.take(), self.age.take()]
+            .into_iter()
+            .flatten()
+        {
             handle.abort();
         }
         self.commands = None;
@@ -82,7 +116,7 @@ impl Life {
 }
 
 impl Shared {
-    fn new(ip: Ipv4Addr, opts: ConnectOptions, stream_ended: mpsc::Sender<u64>) -> Self {
+    fn new(ip: Ipv4Addr, opts: ConnectOptions, stream_ended: mpsc::Sender<LifeEnd>) -> Self {
         Shared {
             core: Core::new(opts.control),
             lane: RequestLane::new(),
@@ -96,8 +130,8 @@ impl Shared {
         }
     }
 
-    /// A sender the stream task signals when its socket ends.
-    pub(crate) fn stream_ended(&self) -> mpsc::Sender<u64> {
+    /// A sender the stream task — or the age-out clock — signals a life's end on.
+    pub(crate) fn stream_ended(&self) -> mpsc::Sender<LifeEnd> {
         self.stream_ended.clone()
     }
 
@@ -198,6 +232,9 @@ impl Shared {
                 h.abort();
             }
             if let Some(h) = life.reopen.take() {
+                h.abort();
+            }
+            if let Some(h) = life.age.take() {
                 h.abort();
             }
             life.commands = None;
@@ -337,7 +374,35 @@ async fn start_life(
             shared.life().reopen = Some(reopen.abort_handle());
         }
     }
+
+    // Started last, so a life that fails to come up never starts a clock.
+    if let Some(recycle) = shared.opts.recycle {
+        let age = tokio::spawn(age_out(shared.clone(), epoch, recycle.max_age));
+        shared.life().age = Some(age.abort_handle());
+    }
     Ok(())
+}
+
+/// Retire a life that has been open for `max_age`: signal the supervisor and
+/// stop. Signalling rather than acting is what keeps one place — the
+/// supervisor — ending a life, so a swap and a loss racing in the same instant
+/// are still two ordered messages, and the second finds itself stale.
+///
+/// The wait is floored at the connection cooldown: a session must at least
+/// outlive its own dial.
+async fn age_out(shared: Arc<Shared>, epoch: u64, max_age: Duration) {
+    let cooldown = Duration::from_millis(generated::CONNECTION_COOLDOWN_MS);
+    tokio::time::sleep(max_age.max(cooldown)).await;
+    if shared.is_closed() {
+        return;
+    }
+    let _ = shared
+        .stream_ended()
+        .send(LifeEnd::Aged {
+            epoch,
+            age: max_age.max(cooldown),
+        })
+        .await;
 }
 
 /// Start one control attempt, returning its task and a one-shot that resolves
@@ -359,10 +424,15 @@ fn spawn_control(
 /// connect sequence again until it succeeds or the model is closed. Woken by
 /// [`Shared::stream_ended`]; an aborted stream task never signals, so a
 /// teardown does not wake this.
-async fn supervise(shared: Arc<Shared>, mut loss_rx: mpsc::Receiver<u64>) {
-    while loss_rx.recv().await.is_some() {
+async fn supervise(shared: Arc<Shared>, mut loss_rx: mpsc::Receiver<LifeEnd>) {
+    while let Some(end) = loss_rx.recv().await {
         if shared.is_closed() {
             return;
+        }
+        // A life ends once. A second report of the same one — the clock and
+        // the socket racing — arrives for an epoch that has already turned.
+        if end.epoch() != shared.core.epoch() {
+            continue;
         }
         // The old life is over: nothing of it may write again, both sockets
         // go together, and an aim with no wire to confirm it on is forgotten
@@ -371,15 +441,55 @@ async fn supervise(shared: Arc<Shared>, mut loss_rx: mpsc::Receiver<u64>) {
         shared.life().abort_links();
         shared.nav.clear();
 
+        // A retired session is swapped straight away: the model closed it, so
+        // there is nothing to wait out but the ledger's cooldown, which the
+        // dial takes on its own. Only if that one attempt fails is this an
+        // outage like any other, counted from attempt one.
+        let mut spent = 0u32;
+        if let LifeEnd::Aged { age, .. } = end {
+            shared.core.session_recycled(age);
+            let epoch = shared.core.epoch();
+            shared
+                .core
+                .set_channel(epoch, Channel::Stream, ChannelState::Connecting);
+            let reopened = match links::open_stream(shared.ip, shared.opts.port).await {
+                Ok((session, tail)) => {
+                    start_life(&shared, epoch, session, tail, Connection::Disconnected)
+                        .await
+                        .is_ok()
+                }
+                Err(_) => false,
+            };
+            if reopened {
+                continue;
+            }
+            shared
+                .core
+                .set_channel(epoch, Channel::Stream, ChannelState::Unavailable);
+            spent = 1;
+        }
+
         let Some(backoff) = shared.opts.reconnect.stream else {
-            shared.core.stream_lost(Connection::Disconnected);
+            // A swap that could not reopen ends where a loss does: the tree
+            // already says the stream is closed, so only the connection moves.
+            if spent > 0 {
+                shared.core.set_connection(Connection::Disconnected);
+            } else {
+                shared.core.stream_lost(Connection::Disconnected);
+            }
             return;
         };
-        let mut attempt = 1u32;
+        let mut attempt = spent + 1;
         let mut delay = backoff.initial;
-        shared
-            .core
-            .stream_lost(Connection::Reconnecting { attempt });
+        if spent > 0 {
+            shared
+                .core
+                .set_connection(Connection::Reconnecting { attempt });
+        } else {
+            shared
+                .core
+                .stream_lost(Connection::Reconnecting { attempt });
+        }
         loop {
             // The backoff is the only wait here; the ledger adds its own
             // cooldown inside the dial, and nothing else.

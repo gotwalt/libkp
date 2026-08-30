@@ -97,6 +97,8 @@ Works:
   succession wedge the device until it is power-cycled, so the library never
   sends one directly
 - Timed-out requests, connection spacing, and opt-in reconnect
+- Sessions recycled on a clock — the model closes and reopens its own session
+  every ten minutes, so a device is never asked to hold one indefinitely
 
 Not yet:
 

@@ -78,6 +78,7 @@ __all__ = [
     "NavigationDropped",
     "Connected",
     "Disconnected",
+    "SessionRecycled",
     "ConnectionChanged",
     "ChannelChanged",
     "SyncCompleted",
@@ -99,9 +100,12 @@ class Connection(Enum):
     #: model was not asked to reconnect, or :meth:`~libkp.model.DeviceModel.close`
     #: was called.
     DISCONNECTED = "disconnected"
-    #: The stream was lost and the model is waiting out a backoff before dialing
-    #: again (:attr:`DeviceState.reconnect_attempt` counts the tries). Only seen
-    #: when a :class:`~libkp.model.ReconnectPolicy` asked for it.
+    #: The stream is down and the model intends to dial again: it is waiting
+    #: out a backoff after a loss (:attr:`DeviceState.reconnect_attempt` counts
+    #: the tries), which only a :class:`~libkp.model.ReconnectPolicy` asks for,
+    #: or it is swapping a session that reached its age limit, which
+    #: :class:`~libkp.model.RecyclePolicy` does by default and which
+    #: :class:`SessionRecycled` announces.
     RECONNECTING = "reconnecting"
     #: The stream is open and being ingested, and the control channel is either
     #: open, still on its way, or was never asked for.
@@ -560,6 +564,21 @@ class Connected(DeviceEvent):
 @dataclass(frozen=True, slots=True)
 class Disconnected(DeviceEvent):
     """The device closed the connection, or the model was closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRecycled(DeviceEvent):
+    """The model retired a session that had reached its age limit, and is
+    opening another in its place (:class:`~libkp.model.RecyclePolicy`).
+
+    Raised as the old sockets go away, before the new ones are dialed, so a
+    client that watches connectivity can tell a deliberate swap from a device
+    that dropped: the :attr:`Connection.RECONNECTING` that follows this event
+    was asked for. ``age`` is how long, in seconds, the retired session had
+    been open.
+    """
+
+    age: float
 
 
 @dataclass(frozen=True, slots=True)
