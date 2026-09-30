@@ -63,13 +63,13 @@ def cc_const_name(name: str) -> str:
 # State routing table (spec/state.toml)
 # --------------------------------------------------------------------------
 
-ROUTE_KINDS = ("u14", "u16", "u7", "bool", "text", "bpm", "multi")
+ROUTE_KINDS = ("u14", "u16", "u7", "u35", "bool", "text", "bpm", "multi")
 ROUTE_LANES = ("fast", "slow")
 ROUTE_WIRES = ("stream", "control", "both")
 ROUTE_EVENTS = (
     "rig_changed", "string_tag", "bank_preview", "effect_changed", "param_changed", "status",
     "beat_pulse", "tempo_bpm", "morph_changed", "morph_button", "tuner_deviance", "tuner_note",
-    "current_position",
+    "current_position", "session_counter",
 )
 ROUTE_ADDRESS_FORMS = ("address", "page", "effect_param", "bank_preview")
 ROUTE_REFRESH = ("rig", "bank", "position")
@@ -348,6 +348,7 @@ def emit_rust(d: dict) -> str:
         "tuner_in_tune_window": ("TUNER_IN_TUNE_WINDOW", "u16"), "meter_count": ("METER_COUNT", "usize"),
         "current_bank_address": ("CURRENT_BANK_ADDRESS", "u32"),
         "current_rig_slot_address": ("CURRENT_RIG_SLOT_ADDRESS", "u32"),
+        "session_counter_address": ("SESSION_COUNTER_ADDRESS", "u32"),
         "string_rig_author": ("STRING_RIG_AUTHOR", "u8"),
         "string_rig_date": ("STRING_RIG_DATE", "u8"),
         "string_rig_comment": ("STRING_RIG_COMMENT", "u8"),
@@ -635,6 +636,7 @@ def emit_python(d: dict) -> str:
         "tuner_in_tune_window": "TUNER_IN_TUNE_WINDOW", "meter_count": "METER_COUNT",
         "current_bank_address": "CURRENT_BANK_ADDRESS",
         "current_rig_slot_address": "CURRENT_RIG_SLOT_ADDRESS",
+        "session_counter_address": "SESSION_COUNTER_ADDRESS",
         "string_rig_author": "STRING_RIG_AUTHOR", "string_rig_date": "STRING_RIG_DATE",
         "string_rig_comment": "STRING_RIG_COMMENT", "string_amp_name": "STRING_AMP_NAME",
         "string_cabinet_name": "STRING_CABINET_NAME", "cabinet_page": "CABINET_PAGE",
@@ -894,6 +896,7 @@ def emit_swift(d: dict) -> str:
         "tuner_in_tune_window": ("tunerInTuneWindow", "UInt16"), "meter_count": ("meterCount", "Int"),
         "current_bank_address": ("currentBankAddress", "UInt32"),
         "current_rig_slot_address": ("currentRigSlotAddress", "UInt32"),
+        "session_counter_address": ("sessionCounterAddress", "UInt32"),
         "string_rig_author": ("stringRigAuthor", "UInt8"),
         "string_rig_date": ("stringRigDate", "UInt8"),
         "string_rig_comment": ("stringRigComment", "UInt8"),

@@ -479,7 +479,8 @@ same slot pushes 100701 alone.
 
 Both fields use the 5×7-bit extended encoding, so a `$06` value spans 35 bits
 rather than the 14 a `$01` carries. Other extended addresses share the stream —
-102405 is a free-running counter the device emits every second — so match on the
+102405 is a free-running counter the device emits every second (session-scoped,
+not device uptime — it restarts with each session) — so match on the
 address rather than assuming any `$06` is a position.
 
 Established by observed experimentation; the function code `$46` is not in the

@@ -710,11 +710,12 @@ def _state_cases():
                                hx(ext_param(0x02, 0x00, CURRENT_RIG_SLOT_ADDRESS, 0))],
                   "expect": {"current_bank": 40, "current_rig_slot": 0,
                              "current_rig_index": 200}})
-    # 10. An extended address the state tree does not track changes nothing —
-    #     102405 is the free-running counter the device pushes every second.
+    # 10. An extended address the state tree does not track changes nothing.
+    #     (102405, the once-a-second session counter, *is* tracked; 102406 is
+    #     the neighbouring address nothing routes.)
     cases.append({"name": "position ignores an untracked extended address",
                   "messages": [hx(ext_param(0x02, 0x00, CURRENT_BANK_ADDRESS, 24)),
-                               hx(ext_param(0x02, 0x00, 102405, 31))],
+                               hx(ext_param(0x02, 0x00, 102406, 31))],
                   "expect": {"current_bank": 24, "current_rig_slot": None,
                              "current_rig_index": None}})
     return cases
@@ -736,6 +737,7 @@ _EVENT_NAMES = frozenset({
     "string_tag", "rig_changed", "bank_preview", "effect_changed", "param_changed",
     "status", "beat_pulse", "tempo_bpm", "morph_changed", "morph_button",
     "tuner_deviance", "tuner_note", "rendered_string", "current_position",
+    "session_counter",
 })
 _STEP_KINDS = frozenset({"midi3", "cbor", "cbor_text", "cbor_dump", "cbor_dump_text",
                          "dump_begin", "dump_end"})
@@ -773,8 +775,14 @@ STEP_DUMP_END = {"dump_end": True}
 
 
 def _steps_case(name: str, steps: list[dict], events: list[str], slow_steps: int,
-                positions: list[int] | None = None, **tree) -> dict:
-    """One transport-tagged case; the tree keys are whatever the loaders assert."""
+                positions: list[int] | None = None, stream_open: bool = False,
+                **tree) -> dict:
+    """One transport-tagged case; the tree keys are whatever the loaders assert.
+
+    ``stream_open`` opens the tree's stream channel before the steps run. It is
+    what rule 3 turns on: a ``stream`` row refuses the control channel's copy
+    only while a stream is there to supply the better one.
+    """
     for s in steps:
         assert len(s) == 1 and next(iter(s)) in _STEP_KINDS, s
     unknown = set(events) - _EVENT_NAMES
@@ -784,7 +792,10 @@ def _steps_case(name: str, steps: list[dict], events: list[str], slow_steps: int
     if positions is not None:
         assert all(isinstance(i, int) and 0 <= i <= 0xFFFF for i in positions), name
         expect["positions"] = positions
-    return {"name": name, "steps": steps, "expect": expect}
+    case = {"name": name, "steps": steps, "expect": expect}
+    if stream_open:
+        case["stream_open"] = True
+    return case
 
 
 def _state_step_cases():
@@ -932,25 +943,56 @@ def _state_step_cases():
                     [], 0,
                     rig_name=None),
         _steps_case("rule 2: an untracked extended address on the stream is silent",
-                    [step_midi3(ext_param(0x02, 0x00, 102405, 31))],
+                    [step_midi3(ext_param(0x02, 0x00, 102406, 31))],
                     [], 0,
                     current_bank=None),
-        # --- Rule 3: a stream-only row ignores the control channel's copy.
-        _steps_case("rule 3: the control copy of the meter block is dropped",
+        # --- Rule 3: a stream row *prefers* the stream. While a stream is open
+        #     the control channel's coarser copy is refused; with no stream it
+        #     is the only source there is and is taken. Both halves are pinned.
+        _steps_case("rule 3: with a stream open, the control copy of the meter block is dropped",
                     [step_cbor(meter_base_addr + 3, 1234)],
-                    [], 0,
+                    [], 0, stream_open=True,
                     status_raw=fresh_status),
-        _steps_case("rule 3: the control copy of the beat pulse is dropped",
+        _steps_case("rule 3: with a stream open, the control copy of the beat pulse is dropped",
                     [step_cbor(beat_pulse_addr, 16383)],
-                    [], 0,
+                    [], 0, stream_open=True,
                     status_raw=fresh_status),
-        _steps_case("rule 3: the control copy of the tuner note is dropped",
+        _steps_case("rule 3: with a stream open, the control copy of the tuner note is dropped",
                     [step_cbor(tuner_note_addr, 9)],
-                    [], 0),
-        _steps_case("rule 3: the control copy of the morph button is dropped",
+                    [], 0, stream_open=True),
+        _steps_case("rule 3: with a stream open, the control copy of the morph button is dropped",
                     [step_cbor(morph_button_addr, 1)],
-                    [], 0,
+                    [], 0, stream_open=True,
                     morph=None),
+        # The strobe is the whole point: it is the one meter value the control
+        # channel carries, so a control-only tree must land it.
+        _steps_case("rule 3: with no stream, the control copy of the strobe phase lands",
+                    [step_cbor(meter_base_addr + 3, 1234)],
+                    ["status"], 0,
+                    status_raw=[0, 0, 0, 1234, 0, 0, 0, 0, 0, 0, 0]),
+        _steps_case("rule 3: with no stream, the control copy of the beat pulse lands",
+                    [step_cbor(beat_pulse_addr, 16383)],
+                    ["beat_pulse"], 0,
+                    status_raw=fresh_status),
+        _steps_case("rule 3: with no stream, the control copy of the tuner note lands",
+                    [step_cbor(tuner_note_addr, 9)],
+                    ["tuner_note"], 1,
+                    tuner_note=9),
+        # The session counter: FAST, so it raises its event and never
+        # republishes the snapshot, and it lands from either wire.
+        _steps_case("the session counter lands from the control channel",
+                    [step_cbor(WK["session_counter_address"], 4242)],
+                    ["session_counter"], 0,
+                    session_counter=4242),
+        _steps_case("the session counter lands from the stream",
+                    [step_midi3(ext_param(0x02, 0x00, WK["session_counter_address"], 7))],
+                    ["session_counter"], 0,
+                    session_counter=7),
+        _steps_case("the session counter never dedupes: every tick is a tick",
+                    [step_cbor(WK["session_counter_address"], 9),
+                     step_cbor(WK["session_counter_address"], 9)],
+                    ["session_counter", "session_counter"], 0,
+                    session_counter=9),
         # --- Rule 4: page 0 is dual-use, so a row accepts one face only. A
         #     mismatch is "no route", which on the stream means the generic
         #     fallback and on the control channel means silence.

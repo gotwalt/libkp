@@ -17,6 +17,7 @@ from libkp.nav import Dropped, NavAction, NavigatorState, Send, Settled, StartSe
 from libkp.state import (
     ApplyOutcome,
     Channel,
+    ChannelState,
     DeviceEvent,
     DeviceState,
     Num,
@@ -31,7 +32,7 @@ from libkp.state import (
 
 
 def test_spec_version_matches():
-    assert gen.SPEC_VERSION == "0.9.0"
+    assert gen.SPEC_VERSION == "0.10.0"
 
 
 def test_every_vector_file_is_covered():
@@ -340,6 +341,8 @@ def _assert_state_expectations(state: DeviceState, expect: dict) -> None:
         assert state.current_rig_slot == expect["current_rig_slot"]
     if "current_rig_index" in expect:
         assert state.current_rig_index == expect["current_rig_index"]
+    if "session_counter" in expect:
+        assert state.session_counter == expect["session_counter"]
     if "main_volume" in expect:
         assert state.output.main_volume == expect["main_volume"]
     if "headphone_volume" in expect:
@@ -415,6 +418,10 @@ def test_state_apply(case):
     else:
         steps = case["steps"]
     state = DeviceState()
+    if case.get("stream_open"):
+        # Rule 3 refuses the control copy of a stream row only while a stream
+        # is open to supply the better one.
+        state.channels.stream = ChannelState.OPEN
     outcomes = [_run_step(state, step) for step in steps]
     expect = case["expect"]
     _assert_state_expectations(state, expect)

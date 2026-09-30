@@ -3,7 +3,7 @@
 import Foundation
 
 public enum Generated {
-    public static let specVersion: String = "0.9.0"
+    public static let specVersion: String = "0.10.0"
     public static let port: UInt16 = 5727
     public static let connectTimeoutSecs: UInt64 = 5
     public static let socketTimeoutSecs: UInt64 = 15
@@ -111,6 +111,7 @@ public enum Generated {
     public static let meterCount: Int = 11
     public static let currentBankAddress: UInt32 = 100701
     public static let currentRigSlotAddress: UInt32 = 100702
+    public static let sessionCounterAddress: UInt32 = 102405
     public static let stringRigAuthor: UInt8 = 0x02
     public static let stringRigDate: UInt8 = 0x03
     public static let stringRigComment: UInt8 = 0x04
@@ -522,6 +523,7 @@ public enum Generated {
         Route(address: 19214, field: .bankCabinetName, slot: 4, kind: .text, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .bank),
         Route(address: 100701, field: .currentBank, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .position),
         Route(address: 100702, field: .currentRigSlot, slot: nil, kind: .u16, lane: .slow, wire: .both, dedupe: true, request: true, refresh: .position),
+        Route(address: 102405, field: .sessionCounter, slot: nil, kind: .u35, lane: .fast, wire: .both, dedupe: false, request: false, refresh: nil),
     ]
 }
 
@@ -577,6 +579,7 @@ public struct Route: Hashable, Sendable {
         case bankCabinetName = "bank_cabinet_name"
         case currentBank = "current_bank"
         case currentRigSlot = "current_rig_slot"
+        case sessionCounter = "session_counter"
     }
 
     /// How a routed value decodes before it is stored.
@@ -584,6 +587,7 @@ public struct Route: Hashable, Sendable {
         case u14 = "u14"
         case u16 = "u16"
         case u7 = "u7"
+        case u35 = "u35"
         case bool = "bool"
         case text = "text"
         case bpm = "bpm"

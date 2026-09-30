@@ -34,6 +34,8 @@ enum Stored: Equatable {
     case text(String)
     /// The meter block, decoded as one unit (`multi`).
     case frame([UInt16])
+    /// A `u35`: the full width the 5x7-bit extended encoding can express.
+    case wide(UInt64)
 
     /// Decode a wire value the way the row's `kind` says (rule 5). `nil` is a
     /// value the row refuses: past 14 bits for a `u14`/`bpm` row, past 16 for a
@@ -49,6 +51,14 @@ enum Stored: Equatable {
         case (.u16, .num(let v)):
             guard let n = UInt16(exactly: v) else { return nil }
             self = .num(n)
+        case (.u35, .num(let v)):
+            // The extended encoding's full 35 bits; wider is a garbled read.
+            guard v <= 0x7_FFFF_FFFF else { return nil }
+            self = .wide(UInt64(v))
+        case (.multi, .num(let v)):
+            // One element of the meter block, range-checked like the frame's.
+            guard v <= 16383 else { return nil }
+            self = .num(UInt16(v))
         case (.u7, .num(let v)):
             self = .num(UInt16(v & 0x7F))
         case (.bool, .num(let v)):
@@ -81,16 +91,28 @@ enum Stored: Equatable {
         if case .text(let t) = self { return t }
         return nil
     }
+    var wide: UInt64? {
+        if case .wide(let v) = self { return v }
+        return nil
+    }
 }
 
 extension Route.Kind {
     /// Whether a value of this shape is what the row stores (rule 4). Page 0 is
     /// dual-use, so a numeric at a `text` row, or a text at a numeric one, is
-    /// not this row's value at all. The meter block matches only as a block.
+    /// not this row's value at all.
+    ///
+    /// A numeric is accepted at a `multi` row as well, where it writes the one
+    /// element the row's `slot` names: the eleven meters are ordinary
+    /// parameters at consecutive addresses (`docs/07`), so they also arrive
+    /// singly — from a `$41` read, and from the control channel, which carries
+    /// the strobe phase alone and never the whole frame.
     fileprivate func accepts(_ decoded: Decoded) -> Bool {
         switch (self, decoded) {
         case (.text, .text), (.multi, .block): return true
-        case (.u14, .num), (.u16, .num), (.u7, .num), (.bool, .num), (.bpm, .num): return true
+        case (.u14, .num), (.u16, .num), (.u7, .num), (.u35, .num), (.bool, .num),
+            (.bpm, .num), (.multi, .num):
+            return true
         default: return false
         }
     }
@@ -111,10 +133,14 @@ extension DeviceState {
     /// 2. **No route**: a numeric off the stream at a paged address is still a
     ///    generic ``DeviceEvent/paramChanged(page:number:value:)`` (FAST, no
     ///    state); anything else untracked is silent.
-    /// 3. **Wire authority**: a `stream`-only row drops the control channel's
-    ///    copy (the realtime feeds and momentaries it carries as a different,
-    ///    unwanted feed). A `control`-only row still accepts the stream: the
-    ///    morph position never appears there, but if it did it would be real.
+    /// 3. **Wire authority**: a `stream` row *prefers* the stream, so it drops
+    ///    the control channel's coarser copy only while ``channels``' stream is
+    ///    `.open` to supply the better one. With no stream there is nothing
+    ///    better, and the control copy is taken — which is what lets a
+    ///    control-only client watch the tuner strobe, the one meter value that
+    ///    channel carries, without the stream's ~20 Hz meter frame. A
+    ///    `control`-only row still accepts the stream: the morph position never
+    ///    appears there, but if it did it would be real.
     /// 4. **Kind mismatch** — a text at a numeric row or the reverse — is
     ///    untracked, exactly as if there were no row.
     /// 5. **Range / decode** per the row's `kind`; an out-of-range value is
@@ -148,7 +174,12 @@ extension DeviceState {
         // 2. No route.
         guard let route else { return untracked(update) }
         // 3. Wire authority.
-        if route.wire == .stream && update.source == .control { return .empty }
+        // Rule 3 refuses the control copy of a `stream` row only while a
+        // stream is open to supply the better one; with none, that copy is the
+        // sole source there is and is taken.
+        if route.wire == .stream && update.source == .control && channels.stream == .open {
+            return .empty
+        }
         // 4. Kind mismatch.
         guard route.kind.accepts(update.decoded) else { return untracked(update) }
         // 5. Range / decode.
@@ -239,9 +270,20 @@ extension DeviceState {
         case .bankCabinetName: return Self.write(&bank.slots[index].cabinetName, value.text)
         case .currentBank: return Self.write(&currentBank, value.num)
         case .currentRigSlot: return Self.write(&currentRigSlot, value.num)
+        case .sessionCounter: return Self.write(&sessionCounter, value.wide)
         case .status:
-            guard case .frame(let raw) = value else { return false }
-            let changed = status.raw != raw
+            // A whole frame replaces the block; a single meter value replaces
+            // just its own element, leaving the ten the control channel never
+            // sends untouched.
+            if case .frame(let raw) = value {
+                let changed = status.raw != raw
+                status = RealtimeStatus(raw: raw)
+                return changed
+            }
+            guard let v = value.num else { return false }
+            var raw = status.raw
+            let changed = raw[index] != v
+            raw[index] = v
             status = RealtimeStatus(raw: raw)
             return changed
         case .morphButton, .beatPulse:
@@ -278,6 +320,8 @@ extension DeviceState {
             return [.effectChanged(slot: Int(route.slot ?? 0))]
         case .currentBank, .currentRigSlot:
             return [.currentPosition(bank: currentBank, slot: currentRigSlot)]
+        case .sessionCounter:
+            return [.sessionCounter]
         case .morphPosition:
             return [.morphChanged(value.num ?? 0)]
         case .morphButton:

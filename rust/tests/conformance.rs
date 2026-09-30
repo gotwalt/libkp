@@ -21,7 +21,7 @@ use libkp::model::{ApplyOutcome, DeviceEvent, NavAction, NavigatorState, Realtim
 use libkp::nrpn::{self, NrpnHeader};
 use libkp::params;
 use libkp::protocol::{TagStream, build_poll_request};
-use libkp::state::{Channel, Decoded, DeviceState, Phase, Update};
+use libkp::state::{Channel, ChannelState, Decoded, DeviceState, Phase, Update};
 use libkp::{PORT, generated};
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ fn opt_str(v: &Value) -> Option<&str> {
 
 #[test]
 fn spec_version_matches() {
-    assert_eq!(generated::SPEC_VERSION, "0.9.0");
+    assert_eq!(generated::SPEC_VERSION, "0.10.0");
     assert_eq!(libkp::SPEC_VERSION, generated::SPEC_VERSION);
     assert_eq!(PORT, 5727);
 }
@@ -485,6 +485,7 @@ fn event_name(event: &DeviceEvent) -> &'static str {
         DeviceEvent::TunerNote(_) => "tuner_note",
         DeviceEvent::RenderedString { .. } => "rendered_string",
         DeviceEvent::CurrentPosition { .. } => "current_position",
+        DeviceEvent::SessionCounter => "session_counter",
         DeviceEvent::Connected => "connected",
         DeviceEvent::Disconnected => "disconnected",
         other => panic!("no vector name for {other:?}"),
@@ -562,6 +563,11 @@ fn state_apply_vectors() {
     for c in cases(&doc, "cases") {
         let name = str_of(c, "name");
         let mut state = DeviceState::new();
+        // Rule 3 refuses the control copy of a stream row only while a stream
+        // is open to supply the better one.
+        if c.get("stream_open").and_then(|v| v.as_bool()) == Some(true) {
+            state.channels.stream = ChannelState::Open;
+        }
         // A case is either the old form — unframed MIDI3 messages, each through
         // `apply` — or the new one, steps that name the entry point they drive.
         // Both run against one fresh state; only the new form pins the events

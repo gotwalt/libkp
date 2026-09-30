@@ -98,7 +98,9 @@ def read(state: DeviceState, route: Route) -> object:
     if field is Field.TUNER_DEVIANCE:
         return state.tuner.deviance
     if field is Field.STATUS:
-        return state.status
+        # Never deduped, so this is only read by the field walk; report the
+        # element a per-slot write would replace.
+        return state.status.raw[slot] if slot is not None else state.status
     if field is Field.TUNER_NOTE:
         return state.tuner.note
     if field is Field.MAIN_VOLUME:
@@ -117,6 +119,8 @@ def read(state: DeviceState, route: Route) -> object:
         return state.current_bank
     if field is Field.CURRENT_RIG_SLOT:
         return state.current_rig_slot
+    if field is Field.SESSION_COUNTER:
+        return state.session_counter
     raise ValueError(f"no read for {field}")
 
 
@@ -166,7 +170,14 @@ def write(state: DeviceState, route: Route, value: object) -> None:
     elif field is Field.TUNER_DEVIANCE:
         state.tuner.deviance = value
     elif field is Field.STATUS:
-        state.status = value
+        # A whole frame replaces the block; a single meter value replaces just
+        # its own element, leaving the ten the control channel never sends.
+        if isinstance(value, int):
+            raw = list(state.status.raw)
+            raw[slot] = value
+            state.status = type(state.status)(raw=tuple(raw))
+        else:
+            state.status = value
     elif field is Field.TUNER_NOTE:
         state.tuner.note = value
     elif field is Field.MAIN_VOLUME:
@@ -185,5 +196,7 @@ def write(state: DeviceState, route: Route, value: object) -> None:
         state.current_bank = value
     elif field is Field.CURRENT_RIG_SLOT:
         state.current_rig_slot = value
+    elif field is Field.SESSION_COUNTER:
+        state.session_counter = value
     else:
         raise ValueError(f"no write for {field}")

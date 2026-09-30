@@ -2,7 +2,7 @@
 #![allow(clippy::all)]
 #![cfg_attr(rustfmt, rustfmt::skip)]
 
-pub const SPEC_VERSION: &str = "0.9.0";
+pub const SPEC_VERSION: &str = "0.10.0";
 
 // Transport
 pub const PORT: u16 = 5727;
@@ -132,6 +132,7 @@ pub const TUNER_IN_TUNE_WINDOW: u16 = 350;
 pub const METER_COUNT: usize = 11;
 pub const CURRENT_BANK_ADDRESS: u32 = 100701;
 pub const CURRENT_RIG_SLOT_ADDRESS: u32 = 100702;
+pub const SESSION_COUNTER_ADDRESS: u32 = 102405;
 pub const STRING_RIG_AUTHOR: u8 = 0x02;
 pub const STRING_RIG_DATE: u8 = 0x03;
 pub const STRING_RIG_COMMENT: u8 = 0x04;
@@ -723,6 +724,7 @@ pub enum Field {
     BankCabinetName,
     CurrentBank,
     CurrentRigSlot,
+    SessionCounter,
 }
 
 /// How a routed value decodes before it is stored.
@@ -731,6 +733,7 @@ pub enum Kind {
     U14,
     U16,
     U7,
+    U35,
     Bool,
     Text,
     Bpm,
@@ -851,5 +854,6 @@ pub static STATE_ROUTES: &[Route] = &[
     Route { address: 19214, field: Field::BankCabinetName, slot: Some(4), kind: Kind::Text, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true, refresh: Some(Refresh::Bank) },
     Route { address: 100701, field: Field::CurrentBank, slot: None, kind: Kind::U16, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true, refresh: Some(Refresh::Position) },
     Route { address: 100702, field: Field::CurrentRigSlot, slot: None, kind: Kind::U16, lane: Lane::Slow, wire: Wire::Both, dedupe: true, request: true, refresh: Some(Refresh::Position) },
+    Route { address: 102405, field: Field::SessionCounter, slot: None, kind: Kind::U35, lane: Lane::Fast, wire: Wire::Both, dedupe: false, request: false, refresh: None },
 ];
 

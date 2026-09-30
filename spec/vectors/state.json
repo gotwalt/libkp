@@ -139,7 +139,7 @@
       "name": "position ignores an untracked extended address",
       "messages": [
         "f000203302000600000006125d0000000018f7",
-        "f0002033020006000000062005000000001ff7"
+        "f0002033020006000000062006000000001ff7"
       ],
       "expect": {
         "current_bank": 24,
@@ -657,7 +657,7 @@
       "name": "rule 2: an untracked extended address on the stream is silent",
       "steps": [
         {
-          "midi3": "f0002033020006000000062005000000001ff7"
+          "midi3": "f0002033020006000000062006000000001ff7"
         }
       ],
       "expect": {
@@ -667,7 +667,7 @@
       }
     },
     {
-      "name": "rule 3: the control copy of the meter block is dropped",
+      "name": "rule 3: with a stream open, the control copy of the meter block is dropped",
       "steps": [
         {
           "cbor": [
@@ -692,10 +692,11 @@
         ],
         "events": [],
         "slow_steps": 0
-      }
+      },
+      "stream_open": true
     },
     {
-      "name": "rule 3: the control copy of the beat pulse is dropped",
+      "name": "rule 3: with a stream open, the control copy of the beat pulse is dropped",
       "steps": [
         {
           "cbor": [
@@ -720,10 +721,11 @@
         ],
         "events": [],
         "slow_steps": 0
-      }
+      },
+      "stream_open": true
     },
     {
-      "name": "rule 3: the control copy of the tuner note is dropped",
+      "name": "rule 3: with a stream open, the control copy of the tuner note is dropped",
       "steps": [
         {
           "cbor": [
@@ -735,10 +737,11 @@
       "expect": {
         "events": [],
         "slow_steps": 0
-      }
+      },
+      "stream_open": true
     },
     {
-      "name": "rule 3: the control copy of the morph button is dropped",
+      "name": "rule 3: with a stream open, the control copy of the morph button is dropped",
       "steps": [
         {
           "cbor": [
@@ -750,6 +753,143 @@
       "expect": {
         "morph": null,
         "events": [],
+        "slow_steps": 0
+      },
+      "stream_open": true
+    },
+    {
+      "name": "rule 3: with no stream, the control copy of the strobe phase lands",
+      "steps": [
+        {
+          "cbor": [
+            15953,
+            1234
+          ]
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          0,
+          0,
+          0,
+          1234,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "events": [
+          "status"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 3: with no stream, the control copy of the beat pulse lands",
+      "steps": [
+        {
+          "cbor": [
+            15872,
+            16383
+          ]
+        }
+      ],
+      "expect": {
+        "status_raw": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "events": [
+          "beat_pulse"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "rule 3: with no stream, the control copy of the tuner note lands",
+      "steps": [
+        {
+          "cbor": [
+            16084,
+            9
+          ]
+        }
+      ],
+      "expect": {
+        "tuner_note": 9,
+        "events": [
+          "tuner_note"
+        ],
+        "slow_steps": 1
+      }
+    },
+    {
+      "name": "the session counter lands from the control channel",
+      "steps": [
+        {
+          "cbor": [
+            102405,
+            4242
+          ]
+        }
+      ],
+      "expect": {
+        "session_counter": 4242,
+        "events": [
+          "session_counter"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "the session counter lands from the stream",
+      "steps": [
+        {
+          "midi3": "f00020330200060000000620050000000007f7"
+        }
+      ],
+      "expect": {
+        "session_counter": 7,
+        "events": [
+          "session_counter"
+        ],
+        "slow_steps": 0
+      }
+    },
+    {
+      "name": "the session counter never dedupes: every tick is a tick",
+      "steps": [
+        {
+          "cbor": [
+            102405,
+            9
+          ]
+        },
+        {
+          "cbor": [
+            102405,
+            9
+          ]
+        }
+      ],
+      "expect": {
+        "session_counter": 9,
+        "events": [
+          "session_counter",
+          "session_counter"
+        ],
         "slow_steps": 0
       }
     },

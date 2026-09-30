@@ -58,7 +58,7 @@ enum Log {
     /// moved), so the raw stream is ``verbose``-only.
     static func describe(_ event: DeviceEvent) -> String? {
         switch event {
-        case .status, .beatPulse, .tunerDeviance, .tunerNote:
+        case .status, .beatPulse, .tunerDeviance, .tunerNote, .sessionCounter:
             return verbose ? "\(event)" : nil
         case let .stringTag(number):
             return verbose ? "stringTag \(number)" : nil

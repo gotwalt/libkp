@@ -1023,7 +1023,8 @@ final class StateTests: XCTestCase {
         // An unchanged value is not a change, and an unknown address is ignored.
         XCTAssertEqual(
             state.applyCbor(address: Generated.morphAddress, value: 8192), ApplyOutcome())
-        XCTAssertEqual(state.applyCbor(address: 102_405, value: 31), ApplyOutcome())
+        // 102405 is the session counter and tracked; 102406 is its free neighbour.
+        XCTAssertEqual(state.applyCbor(address: 102_406, value: 31), ApplyOutcome())
         // A value too wide for the field is dropped, not truncated — and so is
         // a negative one, which nothing in the tree could hold.
         XCTAssertEqual(
@@ -1050,15 +1051,36 @@ final class StateTests: XCTestCase {
         XCTAssertEqual(state.rig.name, "AC30")
     }
 
-    /// The control channel's copies of the stream-only rows are a different,
-    /// unwanted feed: a CBOR value at the meter block never writes `status`.
+    /// While a stream is open it is the better source for those rows, so the
+    /// control channel's coarser copies are silent: a CBOR value at the meter
+    /// block never writes `status`.
     func testApplyCborDropsStreamOnlyRows() {
         var state = DeviceState()
+        state.channels.stream = .open
         let base = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.meterBlockNumber)
         XCTAssertEqual(state.applyCbor(address: base + 3, value: 1234), ApplyOutcome())
         XCTAssertEqual(state.status, RealtimeStatus())
         let pulse = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.beatPulseNumber)
         XCTAssertEqual(state.applyCbor(address: pulse, value: 1), ApplyOutcome())
+    }
+
+    /// The other half of rule 3, and the reason it exists: a control-only tree
+    /// must land the tuner strobe, the one meter value that channel carries.
+    func testControlCopiesLandWhenNoStreamIsOpen() {
+        var state = DeviceState()
+        XCTAssertEqual(state.channels.stream, .closed)
+        let strobe = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.meterBlockNumber) + 3
+        XCTAssertNotEqual(state.applyCbor(address: strobe, value: 1234), ApplyOutcome())
+        XCTAssertEqual(state.status.raw[3], 1234)
+        // The ten the control channel never sends are untouched.
+        for (i, v) in state.status.raw.enumerated() where i != 3 {
+            XCTAssertEqual(v, 0)
+        }
+
+        // Once a stream is open it wins again, and the strobe keeps its value.
+        state.channels.stream = .open
+        XCTAssertEqual(state.applyCbor(address: strobe, value: 9999), ApplyOutcome())
+        XCTAssertEqual(state.status.raw[3], 1234)
     }
 
     /// While the state dump streams, a live push outranks the dump's copy of
@@ -1115,9 +1137,23 @@ final class StateTests: XCTestCase {
         case .bankCabinetName: return text(state.bank.slots[index].cabinetName)
         case .currentBank: return num(state.currentBank)
         case .currentRigSlot: return num(state.currentRigSlot)
-        case .status: return state.status == RealtimeStatus() ? nil : .frame(state.status.raw)
+        case .sessionCounter: return state.sessionCounter.map { .wide($0) }
+        // Never deduped, so this is only read by the exhaustive route walk;
+        // report the element a per-slot write would replace.
+        case .status: return num(state.status.raw[index])
         case .morphButton, .beatPulse: return nil
         }
+    }
+
+    /// The per-element write must not have cost the block form: a frame at the
+    /// base still lands whole.
+    func testAWholeFrameStillReplacesTheBlock() {
+        let base = UInt32(Generated.pageRealtime) * 128 + UInt32(Generated.meterBlockNumber)
+        var state = DeviceState()
+        let raw = (0..<Generated.meterCount).map { UInt16($0) }
+        _ = state.applyUpdate(
+            Update(source: .stream, phase: .live, address: base, decoded: .block(raw)))
+        XCTAssertEqual(state.status.raw, raw)
     }
 
     /// Every row's `kind` fits its `field`: a value decoded by the row
@@ -1125,12 +1161,12 @@ final class StateTests: XCTestCase {
     /// two momentaries, which hold nothing and leave the tree untouched.
     func testEveryRouteStoresAndReadsBack() {
         for route in Generated.stateRoutes {
-            // A `multi` row is written by its base as one frame.
-            if route.kind == .multi && route.slot != 0 { continue }
+            // A `multi` row takes a scalar into the slot it names, which is
+            // what a `$41` read and the control channel's lone strobe deliver;
+            // the whole-frame form has its own test below.
             let decoded: Decoded
             switch route.kind {
             case .text: decoded = .text("x")
-            case .multi: decoded = .block([UInt16](repeating: 7, count: Generated.meterCount))
             default: decoded = .num(1)
             }
             guard let stored = Stored(decoded, as: route.kind, at: route.address) else {
@@ -1163,7 +1199,8 @@ final class StateTests: XCTestCase {
             XCTAssertEqual(Routes.lookup(route.address)?.address, route.address)
             XCTAssertEqual(Routes.lookup(route.address)?.field, route.field)
         }
-        XCTAssertNil(Routes.lookup(102_405))
+        // 102405 is the session counter and tracked; 102406 is its free neighbour.
+        XCTAssertNil(Routes.lookup(102_406))
     }
 
     /// A `$02` block off the meter base is a run of singles at consecutive

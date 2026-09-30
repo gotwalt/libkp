@@ -62,7 +62,7 @@ as plain addresses on CBOR. One parameter universe, two encodings of it.
 | Rig / amp / cabinet name strings | yes (`$03`, `$07`) | yes |
 | Bank preview (page `$96`, 15 strings) | yes (`$07`) | yes, in the dump |
 | Amplifier page (`$0A`) | yes | yes — 24 numbers in the dump |
-| A 1 Hz counter (102405) | yes, as `$06` | yes |
+| A 1 Hz counter (102405) — session-scoped, tracked as `session_counter` | yes, as `$06` | yes |
 | Whole-state read | no — assembled from the 46-request burst | yes: one non-mutating write returns the dump (below) |
 | Device-supplied parameter names | no | yes |
 | Program Change / Note On/Off inbound | inert — never emitted | n/a |
@@ -165,17 +165,25 @@ and eight rules applied in a fixed order:
 2. **No route.** A numeric on the stream at a page/number address is still
    reported as a fast `ParamChanged`; anything else untracked is silent — a
    control-channel value, a string, an extended address.
-3. **Wire authority.** A `stream` row refuses the control channel: its copies
-   of the strobe, the beat pulse and the momentaries are a different, unwanted
-   feed, so CBOR 15953 never writes `status`. A `control` row (the morph
-   position) accepts the stream, because if the value ever appeared there it
-   would be real. Everything else is `both`, last writer wins — measured
+3. **Wire authority.** A `stream` row *prefers* the stream: it refuses the
+   control channel's copies of the strobe, the beat pulse and the momentaries
+   — a coarser feed — but only while the tree's stream channel is open to
+   supply the better one, so CBOR 15953 never writes `status` beside a live
+   stream. **With no stream open the control copy is the only source there is
+   and is taken**, which is what lets a control-only client watch the tuner
+   strobe (idle 12 values/sec) rather than the stream's ~20 Hz × 11 meter
+   frame. A `control` row (the morph position) accepts the stream, because if
+   the value ever appeared there it would be real. Everything else is `both`, last writer wins — measured
    identical on both wires for every shared address (rig volume, amp on, gain,
    the output volumes), so no disagreement handling exists.
 4. **Kind mismatch** — text at a numeric row, or the reverse — is untracked.
-5. **Range / decode.** A `u14` value past 16383 or a `u16` past 65535 is
-   dropped, not truncated; `u7` keeps the low seven bits; a sensitive address
-   stores the redaction placeholder.
+5. **Range / decode.** A `u14` value past 16383, a `u16` past 65535 or a `u35`
+   past the extended encoding's 35 bits is dropped, not truncated; `u7` keeps
+   the low seven bits; a sensitive address stores the redaction placeholder. A
+   numeric at a `multi` row writes the one element the row's `slot` names —
+   the eleven meters are ordinary parameters at consecutive addresses, so they
+   arrive singly from a `$41` read and from the control channel, which sends
+   the strobe phase alone and never the frame.
 6. **Live beats dump.** Between the trigger and the dump's end, a live update
    from either wire marks its address; a dump item for a marked address is
    dropped, because the dump's copy predates the push. Outside a dump, a dump

@@ -9,7 +9,7 @@ final class ConformanceTests: XCTestCase {
     // MARK: - Suite bookkeeping
 
     func testSpecVersionMatches() {
-        XCTAssertEqual(Generated.specVersion, "0.9.0")
+        XCTAssertEqual(Generated.specVersion, "0.10.0")
     }
 
     /// Every vector file must be covered by a test in this class, so a new file
@@ -354,6 +354,11 @@ final class ConformanceTests: XCTestCase {
         for entry in cases {
             let name = entry.string("name")
             var state = DeviceState()
+            // Rule 3 refuses the control copy of a stream row only while a
+            // stream is open to supply the better one.
+            if entry.optionalBool("stream_open") {
+                state.channels.stream = .open
+            }
             var outcomes: [ApplyOutcome] = []
             for messageHex in (entry["messages"] as? [String]) ?? [] {
                 outcomes.append(state.apply(try hex(messageHex)))
@@ -450,6 +455,7 @@ final class ConformanceTests: XCTestCase {
         case .effectChanged: return "effect_changed"
         case .paramChanged: return "param_changed"
         case .status: return "status"
+        case .sessionCounter: return "session_counter"
         case .beatPulse: return "beat_pulse"
         case .tempoBpm: return "tempo_bpm"
         case .morphChanged: return "morph_changed"
