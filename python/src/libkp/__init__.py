@@ -181,6 +181,7 @@ from .state import (
     RequestTimedOut,
     Rig,
     RigChanged,
+    SessionCounter,
     SessionRecycled,
     Status,
     StringTag,
@@ -193,7 +194,7 @@ from .state import (
     Update,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "SPEC_VERSION",
@@ -285,6 +286,7 @@ __all__ = [
     "TunerNote",
     "RenderedString",
     "CurrentPosition",
+    "SessionCounter",
     "NavigationSettled",
     "NavigationDropped",
     "Connected",

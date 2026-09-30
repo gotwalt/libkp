@@ -13,6 +13,7 @@ from libkp.state import (
     BeatPulse,
     Block,
     Channel,
+    ChannelState,
     Connection,
     CurrentPosition,
     DeviceState,
@@ -386,8 +387,9 @@ def test_apply_cbor_routes_the_same_as_the_stream():
     assert state.current_rig_index == 19
 
     # An unchanged value is not a change, and an unknown address is ignored.
+    # (102405 is the session counter and tracked; 102406 is its free neighbour.)
     assert state.apply_cbor(gen.MORPH_ADDRESS, 8192) == ApplyOutcome.empty()
-    assert state.apply_cbor(102_405, 31) == ApplyOutcome.empty()
+    assert state.apply_cbor(102_406, 31) == ApplyOutcome.empty()
     # A value too wide for the field is dropped, not truncated.
     assert state.apply_cbor(gen.MORPH_ADDRESS, 70_000) == ApplyOutcome.empty()
     assert state.morph == 8192
@@ -401,11 +403,12 @@ def test_apply_cbor_routes_the_same_as_the_stream():
 _SAMPLE_BY_KIND = {
     gen.Kind.U14: 1234,
     gen.Kind.U16: 40000,
+    gen.Kind.U35: 0x1234ABCD,
     gen.Kind.U7: 9,
     gen.Kind.BOOL: True,
     gen.Kind.TEXT: "sample",
     gen.Kind.BPM: 120,
-    gen.Kind.MULTI: RealtimeStatus(raw=tuple(range(gen.METER_COUNT))),
+    gen.Kind.MULTI: 1234,
 }
 #: Rows the tree deliberately has no field for: they are events and nothing more.
 _MOMENTARY_FIELDS = {gen.Field.MORPH_BUTTON, gen.Field.BEAT_PULSE}
@@ -431,10 +434,20 @@ def test_every_field_is_settable(field):
             assert state != DeviceState()
 
 
+def test_a_whole_frame_still_replaces_the_block():
+    """The per-element write must not have cost the block form: a frame at the
+    base still lands whole."""
+    route = _routes.lookup(gen.PAGE_REALTIME * 128 + gen.METER_BLOCK_NUMBER)
+    state = DeviceState()
+    frame = RealtimeStatus(raw=tuple(range(gen.METER_COUNT)))
+    _routes.write(state, route, frame)
+    assert state.status == frame
+
+
 def test_every_route_address_is_found_by_lookup():
     for route in gen.STATE_ROUTES:
         assert _routes.lookup(route.address) is route
-    assert _routes.lookup(102_405) is None
+    assert _routes.lookup(102_406) is None
 
 
 def test_apply_cbor_text_lands_the_same_as_a_stream_tag():
@@ -455,9 +468,11 @@ def test_apply_cbor_text_lands_the_same_as_a_stream_tag():
 
 
 def test_control_channel_copies_of_stream_rows_are_dropped():
-    """The control channel carries its own meter, beat and tuner feeds at the
-    stream's addresses; those rows are the stream's, so the copies are silent."""
+    """While a stream is open it is the better source for those rows, so the
+    control channel's coarser copies of the meter, beat and tuner feeds are
+    silent. With no stream open they land instead -- see the test below."""
     state = DeviceState()
+    state.channels.stream = ChannelState.OPEN
     fresh = state.snapshot()
     for address in (
         gen.PAGE_REALTIME * 128 + gen.METER_BLOCK_NUMBER + 3,
@@ -472,6 +487,27 @@ def test_control_channel_copies_of_stream_rows_are_dropped():
     assert state.apply_cbor(0x09 * 128 + 3, 5000) == ApplyOutcome.empty()
     # A negative value is not a parameter value and never reaches the table.
     assert state.apply_cbor(gen.MORPH_ADDRESS, -1) == ApplyOutcome.empty()
+
+
+def test_control_copies_land_when_no_stream_is_open():
+    """The other half of rule 3, and the reason it exists: a control-only tree
+    must land the tuner strobe -- the one meter value that channel carries --
+    without the stream's ~20 Hz meter frame."""
+    strobe = gen.PAGE_REALTIME * 128 + gen.METER_BLOCK_NUMBER + 3
+    beat = gen.PAGE_REALTIME * 128 + gen.BEAT_PULSE_NUMBER
+    state = DeviceState()
+    assert state.channels.stream is ChannelState.CLOSED
+
+    assert state.apply_cbor(strobe, 1234) != ApplyOutcome.empty()
+    assert state.status.raw[3] == 1234
+    # The ten the control channel never sends are untouched by a lone element.
+    assert [v for i, v in enumerate(state.status.raw) if i != 3] == [0] * (gen.METER_COUNT - 1)
+    assert state.apply_cbor(beat, 1) != ApplyOutcome.empty()
+
+    # Once a stream is open it wins again, and the strobe keeps its old value.
+    state.channels.stream = ChannelState.OPEN
+    assert state.apply_cbor(strobe, 9999) == ApplyOutcome.empty()
+    assert state.status.raw[3] == 1234
 
 
 def test_tracked_rows_dedupe_on_the_decoded_value():
@@ -564,9 +600,9 @@ def test_sensitive_text_is_redacted_before_it_is_stored():
 
 
 def test_wire_authority_refuses_only_the_control_copy():
-    """Rule 3 as a table: a ``stream`` row drops the control channel's copy and
-    nothing else is refused -- a ``control`` row takes the stream's value, and
-    a ``both`` row takes either wire's."""
+    """Rule 3 as a table: with a stream open, a ``stream`` row drops the control
+    channel's copy and nothing else is refused -- a ``control`` row takes the
+    stream's value, and a ``both`` row takes either wire's."""
     beat = gen.PAGE_REALTIME * 128 + gen.BEAT_PULSE_NUMBER
     tempo = gen.PAGE_RIG_SETTINGS * 128 + gen.TEMPO_NUMBER
     assert _routes.lookup(beat).wire is gen.Wire.STREAM
@@ -582,5 +618,11 @@ def test_wire_authority_refuses_only_the_control_copy():
     ]
     for address, source, refused in cases:
         state = DeviceState()
+        state.channels.stream = ChannelState.OPEN
         out = state.apply_update(Update(source, Phase.LIVE, address, Num(1)))
         assert (out == ApplyOutcome.empty()) is refused, (address, source)
+        # With no stream there is nothing better, so nothing is refused at all.
+        bare = DeviceState()
+        assert bare.apply_update(Update(source, Phase.LIVE, address, Num(1))) != (
+            ApplyOutcome.empty()
+        ), (address, source)

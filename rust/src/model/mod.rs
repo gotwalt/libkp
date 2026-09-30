@@ -304,6 +304,12 @@ pub enum DeviceEvent {
         /// Current rig slot within the bank, 0-based, once known.
         slot: Option<u16>,
     },
+    /// The device's once-a-second counter ticked. Session-scoped, not device
+    /// uptime: it restarts with each session, so it reads as the current
+    /// session's age in seconds. FAST, so it raises this and never republishes
+    /// the snapshot — a value nothing renders must not wake every subscriber
+    /// once a second. Read [`DeviceState::session_counter`] for the value.
+    SessionCounter,
     /// The model connected to a device: the stream is open. Raised alongside
     /// [`ConnectionChanged`](Self::ConnectionChanged) whenever the connection
     /// comes up, on the first connect and on every reconnect.

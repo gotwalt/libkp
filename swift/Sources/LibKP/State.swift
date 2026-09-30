@@ -279,6 +279,12 @@ public enum DeviceEvent: Sendable, Equatable {
     /// for the new values (both 0-based); a `nil` here is a half not yet known,
     /// not a cleared one.
     case currentPosition(bank: UInt16?, slot: UInt16?)
+    /// The device's once-a-second counter ticked. Session-scoped, not device
+    /// uptime: it restarts with each session, so it reads as the current
+    /// session's age in seconds. FAST, so it raises this and never republishes
+    /// the snapshot — a value nothing renders must not wake every subscriber
+    /// once a second. Read ``DeviceState/sessionCounter`` for the value.
+    case sessionCounter
     /// The stream came up: at connect, and again after a reconnect. Kept
     /// alongside ``connectionChanged(_:)`` for callers that only care about the
     /// two ends of the life.
@@ -479,6 +485,10 @@ public struct DeviceState: Sendable, Equatable {
     /// ``currentBank``, at ``Generated/currentRigSlotAddress``; slot 0 is rig
     /// slot 1.
     public var currentRigSlot: UInt16?
+    /// The device's once-a-second counter, or `nil` before the first tick.
+    /// Session-scoped — it restarts with each session, so it reads as this
+    /// session's age in seconds, *not* the time since the device powered on.
+    public var sessionCounter: UInt64?
     /// The flat, 0-based rig index — `currentBank * bankSlots + currentRigSlot`
     /// — once both halves are known. This is the device's own numbering, and the
     /// only address that can name a rig outside the current bank.

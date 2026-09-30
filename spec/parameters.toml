@@ -441,3 +441,10 @@ bank_cabinet_name_base = 0x0A
 # state dump (docs/06), which is how a client learns them before a session opens.
 current_bank_address = 100701      # 0x1895D
 current_rig_slot_address = 100702  # 0x1895E
+# A free-running counter the device pushes once a second on both wires. It is
+# **session-scoped**, not device uptime: two sessions twenty seconds apart were
+# measured reading 46 and then 10, so it restarts with each session and counts
+# that session's age in seconds. Its value is carried in the 5x7-bit extended
+# encoding, so it outlives the 16 bits a `u16` row would hold (a session past
+# 18.2 hours exceeds 65535) and the row is `u35`.
+session_counter_address = 102405   # 0x19005

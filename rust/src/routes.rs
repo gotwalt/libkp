@@ -16,7 +16,7 @@
 use crate::cbor::is_sensitive;
 use crate::generated::{self, Field, Kind, Lane, Route, STATE_ROUTES, Wire};
 use crate::model::{ApplyOutcome, DeviceEvent, RealtimeStatus};
-use crate::state::{Channel, Decoded, DeviceState, Phase, Update};
+use crate::state::{Channel, ChannelState, Decoded, DeviceState, Phase, Update};
 
 /// The largest 14-bit value: what a `$01` can carry, and the range of a `u14`
 /// row whichever wire the value came in on.
@@ -68,6 +68,8 @@ enum Value {
     Text(String),
     /// A `multi` block decoded as one unit: the meter frame.
     Frame(RealtimeStatus),
+    /// A `u35`: the full width the 5x7-bit extended encoding can express.
+    Wide(u64),
 }
 
 impl Value {
@@ -92,9 +94,9 @@ impl Value {
         }
     }
 
-    fn frame(&self) -> Option<RealtimeStatus> {
+    fn wide(&self) -> Option<u64> {
         match self {
-            Value::Frame(f) => Some(*f),
+            Value::Wide(v) => Some(*v),
             _ => None,
         }
     }
@@ -106,6 +108,7 @@ impl Value {
         match self {
             Value::Num(v) => *v,
             Value::Flag(on) => u16::from(*on),
+            Value::Wide(v) => u16::try_from(*v).unwrap_or(0),
             Value::Text(_) | Value::Frame(_) => 0,
         }
     }
@@ -114,11 +117,16 @@ impl Value {
 /// Does a row's `kind` accept this shape of payload? Page 0 is dual-use — the
 /// same numbers are string tags via `$03` and numerics via `$01` — so a row
 /// says which face it is, and the other face is untracked.
+/// A numeric is accepted at a `multi` row as well, where it writes the one
+/// element the row's `slot` names: the eleven meters are ordinary parameters at
+/// consecutive addresses (`docs/07`), so they also arrive singly — from a `$41`
+/// read, and from the control channel, which carries the strobe phase alone and
+/// never the whole frame.
 fn accepts(kind: Kind, decoded: &Decoded) -> bool {
     matches!(
         (kind, decoded),
         (
-            Kind::U14 | Kind::U16 | Kind::U7 | Kind::Bool | Kind::Bpm,
+            Kind::U14 | Kind::U16 | Kind::U7 | Kind::U35 | Kind::Bool | Kind::Bpm | Kind::Multi,
             Decoded::Num(_)
         ) | (Kind::Text, Decoded::Text(_))
             | (Kind::Multi, Decoded::Block(_))
@@ -136,6 +144,14 @@ fn decode(route: &Route, address: u32, decoded: &Decoded) -> Option<Value> {
                 .filter(|v| u64::from(*v) <= U14_MAX)?,
         ),
         (Kind::U16, Decoded::Num(v)) => Value::Num(u16::try_from(*v).ok()?),
+        // The extended encoding's full 35 bits; wider is a garbled read.
+        (Kind::U35, Decoded::Num(v)) => Value::Wide(Some(*v).filter(|v| *v <= 0x7_FFFF_FFFF)?),
+        // One element of the meter block, range-checked like the frame's own.
+        (Kind::Multi, Decoded::Num(v)) => Value::Num(
+            u16::try_from(*v)
+                .ok()
+                .filter(|v| u64::from(*v) <= U14_MAX)?,
+        ),
         (Kind::U7, Decoded::Num(v)) => Value::Num((*v & 0x7F) as u16),
         (Kind::Bool, Decoded::Num(v)) => Value::Flag(*v != 0),
         (Kind::Bpm, Decoded::Num(v)) => {
@@ -208,7 +224,10 @@ impl DeviceState {
         // 2. No route, and 4. a mismatch, both fall through to the generic
         // stream event; 3. the wire check sits between them so a control-channel
         // copy of a stream row is refused before its shape is even examined.
-        let Some(route) = found.filter(|r| !refuses(r.wire, u.source)) else {
+        // Rule 3 needs to know whether a stream is there to supply the better
+        // copy of a `stream` row; with none, the control channel's is taken.
+        let stream_open = self.channels.stream == ChannelState::Open;
+        let Some(route) = found.filter(|r| !refuses(r.wire, u.source, stream_open)) else {
             return self.untracked(u);
         };
         if !accepts(route.kind, &u.decoded) {
@@ -341,7 +360,9 @@ impl DeviceState {
             Field::EffectOn => effect(|e| e.on.map(Value::Flag)),
             Field::EffectMix => effect(|e| e.mix.map(Value::Num)),
             Field::TunerDeviance => self.tuner.deviance.map(Value::Num),
-            Field::Status => Some(Value::Frame(self.status)),
+            // Never deduped, so this is only read by the exhaustive route walk;
+            // report the element a per-slot write would replace.
+            Field::Status => self.status.raw.get(slot).copied().map(Value::Num),
             Field::TunerNote => self.tuner.note.map(|n| Value::Num(u16::from(n))),
             Field::MainVolume => self.output.main_volume.map(Value::Num),
             Field::HeadphoneVolume => self.output.headphone_volume.map(Value::Num),
@@ -351,6 +372,7 @@ impl DeviceState {
             Field::BankCabinetName => bank(|b| b.cabinet_name.clone().map(Value::Text)),
             Field::CurrentBank => self.current_bank.map(Value::Num),
             Field::CurrentRigSlot => self.current_rig_slot.map(Value::Num),
+            Field::SessionCounter => self.session_counter.map(Value::Wide),
         }
     }
 
@@ -449,7 +471,16 @@ impl DeviceState {
                 vec![DeviceEvent::TunerDeviance(v)]
             }
             Field::Status => {
-                self.status = value.frame()?;
+                // A whole frame replaces the block; a single meter value
+                // replaces just its own element, leaving the ten the control
+                // channel never sends untouched.
+                match value {
+                    Value::Frame(f) => self.status = f,
+                    _ => {
+                        let i = usize::from(route.slot?);
+                        self.status.raw[i] = value.num()?;
+                    }
+                }
                 vec![DeviceEvent::Status(self.status)]
             }
             Field::TunerNote => {
@@ -491,6 +522,10 @@ impl DeviceState {
                 self.current_rig_slot = Some(value.num()?);
                 vec![self.current_position()]
             }
+            Field::SessionCounter => {
+                self.session_counter = Some(value.wide()?);
+                vec![DeviceEvent::SessionCounter]
+            }
         };
         Some(events)
     }
@@ -503,12 +538,14 @@ impl DeviceState {
     }
 }
 
-/// Rule 3: does a row's `wire` refuse this channel? Only a `stream` row
-/// refuses anything — the control channel's copy of it. A `control` row takes
-/// the stream too: the morph position never appears there, but if it did it
-/// would be real.
-fn refuses(wire: Wire, source: Channel) -> bool {
-    matches!((wire, source), (Wire::Stream, Channel::Control))
+/// Rule 3: does a row's `wire` refuse this channel? Only a `stream` row refuses
+/// anything, and only the control channel's copy of it, and only while a stream
+/// is open to supply the better one — with no stream that copy is the sole
+/// source there is and is taken, which is what lets a control-only tree watch
+/// the tuner strobe. A `control` row takes the stream too: the morph position
+/// never appears there, but if it did it would be real.
+fn refuses(wire: Wire, source: Channel, stream_open: bool) -> bool {
+    stream_open && matches!((wire, source), (Wire::Stream, Channel::Control))
 }
 
 #[cfg(test)]
@@ -527,7 +564,8 @@ mod tests {
             route(generated::CURRENT_BANK_ADDRESS).map(|r| r.field),
             Some(Field::CurrentBank)
         );
-        assert!(route(102_405).is_none());
+        // 102405 is the session counter and tracked; 102406 is its free neighbour.
+        assert!(route(102_406).is_none());
     }
 
     /// The meter row spans the eleven meter values, and nothing else is a
@@ -550,19 +588,34 @@ mod tests {
         );
     }
 
+    /// The per-element write must not have cost the block form: a frame at the
+    /// base still lands whole.
+    #[test]
+    fn a_whole_frame_still_replaces_the_block() {
+        let base = route(
+            u32::from(generated::PAGE_REALTIME) * 128 + u32::from(generated::METER_BLOCK_NUMBER),
+        )
+        .expect("meter base row");
+        let decoded = Decoded::Block((0..generated::METER_COUNT as u16).collect());
+        let value = decode(base, base.address, &decoded).expect("frame decodes");
+        let mut st = DeviceState::new();
+        st.write(base, 0, value, 0).expect("frame stores");
+        for (i, v) in st.status.raw.iter().enumerate() {
+            assert_eq!(usize::from(*v), i);
+        }
+    }
+
     /// Every row's `kind` fits its `field`: a value decoded by the row stores,
     /// reads back equal, and raises at least one event. This is what lets
     /// [`DeviceState::write`] treat a shape mismatch as impossible.
     #[test]
     fn every_route_stores_and_reads_back() {
         for r in STATE_ROUTES {
-            // A `multi` row is written by its base as one frame.
-            if r.kind == Kind::Multi && r.slot != Some(0) {
-                continue;
-            }
+            // A `multi` row takes a scalar into the slot it names, which is
+            // what a `$41` read and the control channel's lone strobe deliver;
+            // the whole-frame form has its own test below.
             let decoded = match r.kind {
                 Kind::Text => Decoded::Text("x".into()),
-                Kind::Multi => Decoded::Block(vec![7; span(r)]),
                 _ => Decoded::Num(1),
             };
             let value = decode(r, r.address, &decoded)
@@ -587,15 +640,45 @@ mod tests {
         }
     }
 
-    /// Only a `stream` row refuses a channel; `both` and `control` take either.
+    /// With a stream open, only a `stream` row refuses a channel, and only the
+    /// control channel's copy; `both` and `control` take either. With no stream
+    /// there is nothing better to prefer, so nothing is refused at all.
     #[test]
     fn wire_authority_refuses_only_the_control_copy() {
-        assert!(refuses(Wire::Stream, Channel::Control));
-        assert!(!refuses(Wire::Stream, Channel::Stream));
-        assert!(!refuses(Wire::Control, Channel::Stream));
-        assert!(!refuses(Wire::Control, Channel::Control));
-        assert!(!refuses(Wire::Both, Channel::Stream));
-        assert!(!refuses(Wire::Both, Channel::Control));
+        assert!(refuses(Wire::Stream, Channel::Control, true));
+        assert!(!refuses(Wire::Stream, Channel::Stream, true));
+        assert!(!refuses(Wire::Control, Channel::Stream, true));
+        assert!(!refuses(Wire::Control, Channel::Control, true));
+        assert!(!refuses(Wire::Both, Channel::Stream, true));
+        assert!(!refuses(Wire::Both, Channel::Control, true));
+
+        for wire in [Wire::Stream, Wire::Control, Wire::Both] {
+            for source in [Channel::Stream, Channel::Control] {
+                assert!(!refuses(wire, source, false), "{wire:?} {source:?}");
+            }
+        }
+    }
+
+    /// The other half of rule 3, and the reason it exists: a control-only tree
+    /// must land the tuner strobe, the one meter value that channel carries.
+    #[test]
+    fn control_copies_land_when_no_stream_is_open() {
+        let strobe = u32::from(generated::PAGE_REALTIME) * 128
+            + u32::from(generated::METER_BLOCK_NUMBER)
+            + 3;
+        let mut st = DeviceState::new();
+        assert_eq!(st.channels.stream, ChannelState::Closed);
+        assert!(!st.apply_cbor(strobe, 1234).events.is_empty());
+        assert_eq!(st.status.raw[3], 1234);
+        // The ten the control channel never sends are untouched.
+        for (i, v) in st.status.raw.iter().enumerate() {
+            assert_eq!(*v, if i == 3 { 1234 } else { 0 });
+        }
+
+        // Once a stream is open it wins again, and the strobe keeps its value.
+        st.channels.stream = ChannelState::Open;
+        assert!(st.apply_cbor(strobe, 9999).events.is_empty());
+        assert_eq!(st.status.raw[3], 1234);
     }
 
     /// The rules run in their stated order. A value dropped by range (rule 5)

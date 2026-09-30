@@ -86,6 +86,11 @@ extension Dictionary where Key == String, Value == Any {
         self[key] as? String
     }
 
+    /// A flag a case carries only when it is true, so absence is not a failure.
+    func optionalBool(_ key: String) -> Bool {
+        (self[key] as? NSNumber)?.boolValue ?? false
+    }
+
     func u8(_ key: String, file: StaticString = #filePath, line: UInt = #line) -> UInt8 {
         UInt8(truncatingIfNeeded: int(key, file: file, line: line))
     }

@@ -92,7 +92,7 @@ address field spans the full extended range rather than just the 14-bit part.
 | 19200 … 19214 | `$96` × 128 + 0…14 | the bank's five-slot name preview |
 | 100701 | ≥ 16384, extended | **current bank**, 0-based (see below) |
 | 100702 | ≥ 16384, extended | **current rig slot** in the bank, 0-based |
-| 102405 | ≥ 16384, extended | a free-running counter, pushed once a second |
+| 102405 | ≥ 16384, extended | a free-running counter, pushed once a second. **Session-scoped, not device uptime**: two sessions twenty seconds apart were measured reading 46 and then 10, so it restarts with each session and counts that session's age in seconds. Tracked as `session_counter` |
 
 ## The state dump — and how to ask for it
 
@@ -254,9 +254,30 @@ Measured with both channels open across the same gestures:
 So a CBOR-only client can drive a tuner strobe but not a level meter, and a
 MIDI3-only client can show everything except where the morph fader sits. The
 routing table's `wire` column keeps the two apart where they must be: the
-control channel's copies of the strobe and the beat pulse are refused, because
-the stream's meter frame is the one the tree wants, while the morph position is
-the control channel's alone ([Channels and data paths](11-channels-and-data-paths.md#the-fold)).
+control channel's copies of the strobe and the beat pulse are refused **while a
+stream is open**, because the stream's meter frame is the better source; with
+no stream they are the only source there is and are taken. The morph position
+is the control channel's alone
+([Channels and data paths](11-channels-and-data-paths.md#the-fold)).
+
+### What this channel costs while idle
+
+Measured over 60 s against a Player, with and without anyone playing:
+
+| address | | idle | playing |
+|---|---|---|---|
+| 15953 | tuner strobe phase | 7.00/sec | 7.00/sec |
+| 15872 | beat pulse | 4.00/sec | 4.00/sec |
+| 102405 | session counter | 1.00/sec | 1.00/sec |
+| 102404 | uncharacterized | once | once |
+| | **total** | **12.00/sec** | **12.02/sec** |
+
+Those four are the whole live set: playing adds no address and does not change
+the rate. The strobe is what distinguishes the two — idle, all 420 arrivals
+read zero (one distinct value); playing, 417 of 420 are non-zero across 371
+distinct values, because `docs/07`'s strobe group parks at zero on a silent
+input. So **zero versus non-zero is a usable "someone is playing" edge on this
+channel alone**, at 12 values/sec against the stream's ~220.
 
 In an idle session, most of what this channel pushes is a re-encoding of events
 the device also broadcasts as MIDI3-framed SysEx. One event universe, two wire

@@ -74,6 +74,7 @@ __all__ = [
     "TunerNote",
     "RenderedString",
     "CurrentPosition",
+    "SessionCounter",
     "NavigationSettled",
     "NavigationDropped",
     "Connected",
@@ -404,6 +405,18 @@ class Bank:
 @dataclass(frozen=True, slots=True)
 class DeviceEvent:
     """Base class for a typed change emitted by :meth:`DeviceState.apply`."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCounter(DeviceEvent):
+    """The device's once-a-second counter ticked.
+
+    Session-scoped, not device uptime: it restarts with each session, so it
+    reads as the current session's age in seconds. FAST, so it raises this
+    event and never republishes the snapshot -- a value nothing renders must
+    not wake every subscriber once a second. Read
+    :attr:`DeviceState.session_counter` for the value.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,6 +792,10 @@ class DeviceState:
     tuner: Tuner = field(default_factory=Tuner)
     #: The global output volumes.
     output: Output = field(default_factory=Output)
+    #: The device's once-a-second counter, or ``None`` before the first tick.
+    #: Session-scoped -- it restarts with each session, so it reads as this
+    #: session's age in seconds, *not* the time since the device powered on.
+    session_counter: int | None = None
     #: The loaded bank's five-slot name preview (page ``0x96``).
     bank: Bank = field(default_factory=Bank)
     #: Current bank, 0-based, once known. Kept live by the ``$06`` Extended
@@ -933,9 +950,13 @@ class DeviceState:
            still reports a numeric in the page/number space as a generic
            :class:`ParamChanged`; a control-channel value, a string, or an
            extended address is silent.
-        3. The row's ``wire``: a ``stream`` row drops the control channel's copy
-           (its meter, beat, tuner and momentary feeds are a different, unwanted
-           stream). A ``control`` row accepts the stream anyway -- the morph
+        3. The row's ``wire``: a ``stream`` row *prefers* the stream, so it drops
+           the control channel's copy only while :attr:`channels`' stream is
+           :attr:`ChannelState.OPEN` to supply the better one. With no stream
+           there is nothing better, and the control copy is taken -- which is
+           what lets a control-only client watch the tuner strobe, the one
+           meter value that channel carries, without the stream's ~20 Hz meter
+           frame. A ``control`` row accepts the stream anyway -- the morph
            position never appears there, but if it did it would be real.
         4. Decode and range-check by ``kind``: ``u14`` and ``bpm`` drop anything
            past 16383, ``u16`` past 65535 (dropped, never truncated); ``u7``
@@ -956,7 +977,11 @@ class DeviceState:
         elif route is None or not _accepts(route.kind, u.decoded):
             return self._untracked(u)
 
-        if route.wire is gen.Wire.STREAM and u.source is Channel.CONTROL:
+        if (
+            route.wire is gen.Wire.STREAM
+            and u.source is Channel.CONTROL
+            and self.channels.stream is ChannelState.OPEN
+        ):
             return ApplyOutcome.empty()
 
         value = _decode(route.kind, u.decoded, u.address)
@@ -1054,6 +1079,8 @@ class DeviceState:
             return [TunerNote(note=value)]
         if f in (gen.Field.CURRENT_BANK, gen.Field.CURRENT_RIG_SLOT):
             return [CurrentPosition(bank=self.current_bank, slot=self.current_rig_slot)]
+        if f is gen.Field.SESSION_COUNTER:
+            return [SessionCounter()]
         raise ValueError(f"no event for {f}")
 
 
@@ -1091,11 +1118,17 @@ def _accepts(kind: gen.Kind, decoded: Decoded) -> bool:
     the same numbers are string tags via ``$03`` and numerics via ``$01`` -- so
     the row's kind says which face it stores; the other is untracked. A block
     is never accepted here: the meter frame is matched before this, and any
-    other block has already been split into its elements."""
+    other block has already been split into its elements.
+
+    A numeric *is* accepted at a ``multi`` row, where it writes the one element
+    the row's ``slot`` names. The eleven meters are ordinary parameters at
+    consecutive addresses (``docs/07``) -- the block is only the efficient push
+    form -- so they also arrive singly, from a ``$41`` read and from the control
+    channel, which carries the strobe phase alone and never the whole frame."""
     if isinstance(decoded, Text):
         return kind is gen.Kind.TEXT
     if isinstance(decoded, Num):
-        return kind not in (gen.Kind.TEXT, gen.Kind.MULTI)
+        return kind is not gen.Kind.TEXT
     return False
 
 
@@ -1117,10 +1150,16 @@ def _decode(kind: gen.Kind, decoded: Decoded, address: int) -> object | None:
             return gen.REDACTED_PLACEHOLDER
         return decoded.text
     value = decoded.value
+    if kind is gen.Kind.MULTI:
+        # One element of the meter block, range-checked like the frame's own.
+        return value if value <= gen.FULL_SCALE else None
     if kind is gen.Kind.U14:
         return value if value <= gen.FULL_SCALE else None
     if kind is gen.Kind.U16:
         return value if value <= 0xFFFF else None
+    if kind is gen.Kind.U35:
+        # The 5x7-bit extended encoding's full width; wider is a garbled read.
+        return value if value <= 0x7FFFFFFFF else None
     if kind is gen.Kind.U7:
         return value & 0x7F
     if kind is gen.Kind.BOOL:

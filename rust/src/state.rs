@@ -381,6 +381,10 @@ pub struct DeviceState {
     /// [`current_bank`](Self::current_bank), at
     /// [`generated::CURRENT_RIG_SLOT_ADDRESS`]; slot 0 is rig slot 1.
     pub current_rig_slot: Option<u16>,
+    /// The device's once-a-second counter, or `None` before the first tick.
+    /// Session-scoped — it restarts with each session, so it reads as this
+    /// session's age in seconds, *not* the time since the device powered on.
+    pub session_counter: Option<u64>,
     /// Latest morph position (0 = base, 16383 = fully morphed), once seen (NRPN
     /// `0x00/0x77`).
     ///
@@ -440,6 +444,7 @@ impl DeviceState {
         DeviceState {
             connection: Connection::Disconnected,
             channels: Channels::default(),
+            session_counter: None,
             rig: Rig::default(),
             amp: Amp::default(),
             cabinet: Cabinet::default(),
@@ -1206,7 +1211,8 @@ mod tests {
             st.apply_cbor(generated::MORPH_ADDRESS, 8192),
             ApplyOutcome::empty()
         );
-        assert_eq!(st.apply_cbor(102_405, 31), ApplyOutcome::empty());
+        // 102405 is the session counter and tracked; 102406 is its free neighbour.
+        assert_eq!(st.apply_cbor(102_406, 31), ApplyOutcome::empty());
         // A value too wide for the row is dropped, not truncated — and so is a
         // negative one, which no tracked row can hold.
         assert_eq!(
@@ -1400,10 +1406,12 @@ mod tests {
 
     #[test]
     fn control_channel_copies_of_stream_rows_are_dropped() {
-        // The control channel carries its own meter, beat and tuner feeds at
-        // the stream's addresses; those rows are the stream's, so the copies
-        // are silent.
+        // While a stream is open it is the better source for those rows, so
+        // the control channel's coarser copies of the meter, beat and tuner
+        // feeds are silent. With no stream they land instead — see
+        // `control_copies_land_when_no_stream_is_open` in routes.rs.
         let mut st = DeviceState::new();
+        st.channels.stream = ChannelState::Open;
         let fresh = st.clone();
         for address in [
             u32::from(PAGE_REALTIME) * 128 + u32::from(METER_BLOCK_NUMBER) + 3,

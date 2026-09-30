@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import NamedTuple
 
-SPEC_VERSION = "0.9.0"
+SPEC_VERSION = "0.10.0"
 
 PORT = 5727
 CONNECT_TIMEOUT_SECS = 5
@@ -122,6 +122,7 @@ TUNER_IN_TUNE_WINDOW = 350
 METER_COUNT = 11
 CURRENT_BANK_ADDRESS = 100701
 CURRENT_RIG_SLOT_ADDRESS = 100702
+SESSION_COUNTER_ADDRESS = 102405
 STRING_RIG_AUTHOR = 0x02
 STRING_RIG_DATE = 0x03
 STRING_RIG_COMMENT = 0x04
@@ -508,6 +509,7 @@ class Field(Enum):
     BANK_CABINET_NAME = "bank_cabinet_name"
     CURRENT_BANK = "current_bank"
     CURRENT_RIG_SLOT = "current_rig_slot"
+    SESSION_COUNTER = "session_counter"
 
 
 class Kind(Enum):
@@ -516,6 +518,7 @@ class Kind(Enum):
     U14 = "u14"
     U16 = "u16"
     U7 = "u7"
+    U35 = "u35"
     BOOL = "bool"
     TEXT = "text"
     BPM = "bpm"
@@ -635,5 +638,6 @@ STATE_ROUTES: tuple[Route, ...] = (
     Route(19214, Field.BANK_CABINET_NAME, 4, Kind.TEXT, Lane.SLOW, Wire.BOTH, True, True, Refresh.BANK),
     Route(100701, Field.CURRENT_BANK, None, Kind.U16, Lane.SLOW, Wire.BOTH, True, True, Refresh.POSITION),
     Route(100702, Field.CURRENT_RIG_SLOT, None, Kind.U16, Lane.SLOW, Wire.BOTH, True, True, Refresh.POSITION),
+    Route(102405, Field.SESSION_COUNTER, None, Kind.U35, Lane.FAST, Wire.BOTH, False, False, None),
 )
 
